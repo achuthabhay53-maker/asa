@@ -1,0 +1,186 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1900 1440" font-family="Inter, Segoe UI, Arial, sans-serif">
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#374151"/></marker>
+    <marker id="arGreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#059669"/></marker>
+    <marker id="arPurple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#7C3AED"/></marker>
+    <filter id="sh" x="-10%" y="-10%" width="120%" height="120%"><feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#0f172a" flood-opacity="0.10"/></filter>
+  </defs>
+  <rect width="1900" height="1440" fill="#FFFFFF"/>
+
+  <text x="60" y="55" font-size="30" font-weight="700" fill="#0F172A">AImpact Content Agent — Code Architecture</text>
+  <text x="60" y="82" font-size="15" fill="#6B7280">Repo layout and module dependency map. One directional flow: API → Orchestrator → Agents → Tools → External SaaS. Models &amp; DB are cross-cutting.</text>
+
+  <g transform="translate(1370,45)" font-size="12" fill="#374151">
+    <rect x="0" y="0" width="500" height="60" rx="6" fill="#F9FAFB" stroke="#E5E7EB"/>
+    <line x1="14" y1="18" x2="44" y2="18" stroke="#374151" stroke-width="2.4" marker-end="url(#ar)"/><text x="52" y="22">imports / calls</text>
+    <line x1="180" y1="18" x2="210" y2="18" stroke="#7C3AED" stroke-width="2.4" marker-end="url(#arPurple)"/><text x="218" y="22">reads/writes DB</text>
+    <line x1="330" y1="18" x2="360" y2="18" stroke="#059669" stroke-width="2.4" marker-end="url(#arGreen)"/><text x="368" y="22">egress to SaaS</text>
+    <rect x="180" y="35" width="14" height="14" fill="#F5F3FF" stroke="#7C3AED"/><text x="200" y="46">ACA module</text>
+    <rect x="330" y="35" width="14" height="14" fill="#EEF4FF" stroke="#2C6BED"/><text x="350" y="46">Frontend / AImpact</text>
+  </g>
+
+  <!-- LEFT: REPO TREE -->
+  <g transform="translate(50,130)">
+    <rect width="520" height="1240" rx="12" fill="#0F172A"/>
+    <text x="20" y="34" font-size="14" font-weight="700" fill="#38BDF8" font-family="Consolas, monospace">aca/  (Python repo · FastAPI + LangGraph)</text>
+    <g font-family="Consolas, Menlo, monospace" font-size="13" fill="#E5E7EB">
+      <text x="20" y="70">├── main.py                  <tspan fill="#94A3B8"># FastAPI entrypoint</tspan></text>
+      <text x="20" y="94">├── config.py                <tspan fill="#94A3B8"># pydantic-settings</tspan></text>
+      <text x="20" y="118">│</text>
+      <text x="20" y="142">├── api/                     <tspan fill="#FBBF24">— HTTP surface</tspan></text>
+      <text x="20" y="166">│   ├── deps.py</text>
+      <text x="20" y="190">│   ├── jobs.py              drafts.py</text>
+      <text x="20" y="214">│   ├── publications.py      tenants.py</text>
+      <text x="20" y="238">│</text>
+      <text x="20" y="262">├── orchestrator/            <tspan fill="#FBBF24">— workflow engine</tspan></text>
+      <text x="20" y="286">│   ├── state.py             <tspan fill="#94A3B8"># WorkflowState</tspan></text>
+      <text x="20" y="310">│   ├── graph.py             <tspan fill="#94A3B8"># LangGraph nodes+edges</tspan></text>
+      <text x="20" y="334">│   ├── runner.py            <tspan fill="#94A3B8"># async runner · retries</tspan></text>
+      <text x="20" y="358">│   └── checkpoints.py</text>
+      <text x="20" y="382">│</text>
+      <text x="20" y="406">├── agents/                  <tspan fill="#FBBF24">— five agents</tspan></text>
+      <text x="20" y="430">│   ├── base.py              <tspan fill="#94A3B8"># Agent protocol</tspan></text>
+      <text x="20" y="454">│   ├── analyzer.py          <tspan fill="#94A3B8"># Source Analyzer · Haiku</tspan></text>
+      <text x="20" y="478">│   ├── brief.py             <tspan fill="#94A3B8"># Sonnet</tspan></text>
+      <text x="20" y="502">│   ├── writer.py            <tspan fill="#94A3B8"># Sonnet</tspan></text>
+      <text x="20" y="526">│   ├── reviewer.py          <tspan fill="#94A3B8"># Sonnet + rubric</tspan></text>
+      <text x="20" y="550">│   └── publisher.py         <tspan fill="#94A3B8"># WordPress push</tspan></text>
+      <text x="20" y="574">│</text>
+      <text x="20" y="598">├── tools/                   <tspan fill="#FBBF24">— external clients</tspan></text>
+      <text x="20" y="622">│   ├── aimpact.py           <tspan fill="#94A3B8"># REST client</tspan></text>
+      <text x="20" y="646">│   ├── claude.py            <tspan fill="#94A3B8"># Anthropic SDK</tspan></text>
+      <text x="20" y="670">│   ├── wordpress.py         <tspan fill="#94A3B8"># WP REST client</tspan></text>
+      <text x="20" y="694">│   └── langfuse.py          <tspan fill="#94A3B8"># tracer</tspan></text>
+      <text x="20" y="718">│</text>
+      <text x="20" y="742">├── models/                  <tspan fill="#FBBF24">— SQLAlchemy ORM (7 tables)</tspan></text>
+      <text x="20" y="766">│   ├── base.py</text>
+      <text x="20" y="790">│   ├── tenant.py            job.py</text>
+      <text x="20" y="814">│   ├── gap.py               brief.py</text>
+      <text x="20" y="838">│   ├── draft.py             publication.py</text>
+      <text x="20" y="862">│   └── trace.py</text>
+      <text x="20" y="886">│</text>
+      <text x="20" y="910">├── db/</text>
+      <text x="20" y="934">│   ├── session.py</text>
+      <text x="20" y="958">│   └── migrations/          <tspan fill="#94A3B8"># alembic</tspan></text>
+      <text x="20" y="982">│</text>
+      <text x="20" y="1006">├── workers/</text>
+      <text x="20" y="1030">│   ├── scheduler.py         <tspan fill="#94A3B8"># nightly picker</tspan></text>
+      <text x="20" y="1054">│   └── feedback.py          <tspan fill="#94A3B8"># day-7 / day-30 re-audit</tspan></text>
+      <text x="20" y="1078">│</text>
+      <text x="20" y="1102">├── security/</text>
+      <text x="20" y="1126">│   ├── auth.py              <tspan fill="#94A3B8"># at_… tokens</tspan></text>
+      <text x="20" y="1150">│   └── secrets.py           <tspan fill="#94A3B8"># KMS envelope</tspan></text>
+      <text x="20" y="1174">│</text>
+      <text x="20" y="1198">├── observability/telemetry.py</text>
+      <text x="20" y="1222">└── tests/ · apprunner.yaml · pyproject.toml</text>
+    </g>
+  </g>
+
+  <!-- RIGHT: DEPENDENCY MAP -->
+  <g transform="translate(620,130)">
+    <text x="0" y="20" font-size="18" font-weight="700" fill="#0F172A">Module dependency map</text>
+    <text x="0" y="42" font-size="12" fill="#6B7280">Layers flow top-down. No layer imports the one above it. Models &amp; DB are shared.</text>
+
+    <g transform="translate(0,60)" filter="url(#sh)">
+      <rect width="1230" height="70" rx="10" fill="#EEF4FF" stroke="#2C6BED"/>
+      <text x="16" y="26" font-size="13" font-weight="700" fill="#2C6BED">FRONTEND — AImpact Next.js app (external to this repo)</text>
+      <text x="16" y="46" font-size="12" fill="#2C6BED">/content route · lib/api.js → fetch('/api/aca/…') with httpOnly cookie</text>
+      <text x="16" y="62" font-size="11" fill="#4B5563">Also: server-to-server clients hitting /api/aca/* with Bearer at_…</text>
+    </g>
+
+    <g transform="translate(0,150)" filter="url(#sh)">
+      <rect width="1230" height="100" rx="10" fill="#F5F3FF" stroke="#7C3AED" stroke-width="1.5"/>
+      <text x="16" y="26" font-size="13" font-weight="700" fill="#5B21B6">API LAYER · aca/api/</text>
+      <g font-size="12" fill="#0F172A">
+        <g transform="translate(20,42)"><rect width="230" height="46" rx="6" fill="#FFFFFF" stroke="#C4B5FD"/><text x="12" y="20" font-weight="700">api/jobs.py</text><text x="12" y="38" font-size="11" fill="#4B5563">POST /aca/jobs · GET status</text></g>
+        <g transform="translate(260,42)"><rect width="230" height="46" rx="6" fill="#FFFFFF" stroke="#C4B5FD"/><text x="12" y="20" font-weight="700">api/drafts.py</text><text x="12" y="38" font-size="11" fill="#4B5563">approve · edit · artifacts</text></g>
+        <g transform="translate(500,42)"><rect width="230" height="46" rx="6" fill="#FFFFFF" stroke="#C4B5FD"/><text x="12" y="20" font-weight="700">api/publications.py</text><text x="12" y="38" font-size="11" fill="#4B5563">measure lift</text></g>
+        <g transform="translate(740,42)"><rect width="230" height="46" rx="6" fill="#FFFFFF" stroke="#C4B5FD"/><text x="12" y="20" font-weight="700">api/tenants.py</text><text x="12" y="38" font-size="11" fill="#4B5563">WP link settings</text></g>
+        <g transform="translate(980,42)"><rect width="230" height="46" rx="6" fill="#FFFFFF" stroke="#C4B5FD"/><text x="12" y="20" font-weight="700">api/deps.py</text><text x="12" y="38" font-size="11" fill="#4B5563">Depends(auth · session)</text></g>
+      </g>
+    </g>
+
+    <g transform="translate(0,270)" filter="url(#sh)">
+      <rect width="1230" height="110" rx="10" fill="#F5F3FF" stroke="#7C3AED" stroke-width="1.5"/>
+      <text x="16" y="26" font-size="13" font-weight="700" fill="#5B21B6">ORCHESTRATOR + WORKERS · aca/orchestrator/ · aca/workers/</text>
+      <g font-size="12" fill="#0F172A">
+        <g transform="translate(20,42)"><rect width="270" height="56" rx="6" fill="#FFFFFF" stroke="#C4B5FD"/><text x="12" y="20" font-weight="700">orchestrator/graph.py</text><text x="12" y="38" font-size="11" fill="#4B5563">LangGraph state machine</text><text x="12" y="52" font-size="11" fill="#4B5563">SourceAnalyzer → … → Publisher</text></g>
+        <g transform="translate(300,42)"><rect width="220" height="56" rx="6" fill="#FFFFFF" stroke="#C4B5FD"/><text x="12" y="20" font-weight="700">orchestrator/state.py</text><text x="12" y="38" font-size="11" fill="#4B5563">WorkflowState</text><text x="12" y="52" font-size="11" fill="#4B5563">pydantic model</text></g>
+        <g transform="translate(530,42)"><rect width="220" height="56" rx="6" fill="#FFFFFF" stroke="#C4B5FD"/><text x="12" y="20" font-weight="700">orchestrator/runner.py</text><text x="12" y="38" font-size="11" fill="#4B5563">async runner · retries</text><text x="12" y="52" font-size="11" fill="#4B5563">timeout · circuit-breaker</text></g>
+        <g transform="translate(760,42)"><rect width="220" height="56" rx="6" fill="#FFFFFF" stroke="#C4B5FD"/><text x="12" y="20" font-weight="700">orchestrator/checkpoints.py</text><text x="12" y="38" font-size="11" fill="#4B5563">persists after every hop</text><text x="12" y="52" font-size="11" fill="#4B5563">→ aca_jobs</text></g>
+        <g transform="translate(990,42)"><rect width="220" height="56" rx="6" fill="#FFFFFF" stroke="#C4B5FD"/><text x="12" y="20" font-weight="700">workers/scheduler.py</text><text x="12" y="38" font-size="11" fill="#4B5563">APScheduler · nightly</text><text x="12" y="52" font-size="11" fill="#4B5563">workers/feedback.py (7/30d)</text></g>
+      </g>
+    </g>
+
+    <g transform="translate(0,400)" filter="url(#sh)">
+      <rect width="1230" height="110" rx="10" fill="#F5F3FF" stroke="#7C3AED" stroke-width="1.5"/>
+      <text x="16" y="26" font-size="13" font-weight="700" fill="#5B21B6">AGENTS · aca/agents/  —  five agents · input schema → output schema · stateless</text>
+      <g font-size="12" fill="#0F172A">
+        <g transform="translate(20,42)"><rect width="220" height="56" rx="6" fill="#FFFFFF" stroke="#C4B5FD"/><text x="12" y="20" font-weight="700">analyzer.py</text><text x="12" y="38" font-size="11" fill="#4B5563">Source Analyzer · Haiku</text><text x="12" y="52" font-size="11" fill="#4B5563">uses: aimpact, claude → ContentGap</text></g>
+        <g transform="translate(250,42)"><rect width="220" height="56" rx="6" fill="#FFFFFF" stroke="#C4B5FD"/><text x="12" y="20" font-weight="700">brief.py</text><text x="12" y="38" font-size="11" fill="#4B5563">Sonnet</text><text x="12" y="52" font-size="11" fill="#4B5563">uses: claude → Brief</text></g>
+        <g transform="translate(480,42)"><rect width="220" height="56" rx="6" fill="#FFFFFF" stroke="#C4B5FD"/><text x="12" y="20" font-weight="700">writer.py</text><text x="12" y="38" font-size="11" fill="#4B5563">Sonnet</text><text x="12" y="52" font-size="11" fill="#4B5563">uses: claude → Draft</text></g>
+        <g transform="translate(710,42)"><rect width="220" height="56" rx="6" fill="#FFFFFF" stroke="#C4B5FD"/><text x="12" y="20" font-weight="700">reviewer.py</text><text x="12" y="38" font-size="11" fill="#4B5563">Sonnet + rubric</text><text x="12" y="52" font-size="11" fill="#4B5563">uses: claude → Verdict</text></g>
+        <g transform="translate(940,42)"><rect width="270" height="56" rx="6" fill="#FFFFFF" stroke="#C4B5FD"/><text x="12" y="20" font-weight="700">publisher.py</text><text x="12" y="38" font-size="11" fill="#4B5563">uses: wordpress (per-tenant secrets)</text><text x="12" y="52" font-size="11" fill="#4B5563">→ Publication</text></g>
+      </g>
+    </g>
+
+    <g transform="translate(0,530)" filter="url(#sh)">
+      <rect width="1230" height="110" rx="10" fill="#F5F3FF" stroke="#7C3AED" stroke-width="1.5"/>
+      <text x="16" y="26" font-size="13" font-weight="700" fill="#5B21B6">TOOLS · aca/tools/  —  one file per external SaaS · retry · rate-limit</text>
+      <g font-size="12" fill="#0F172A">
+        <g transform="translate(20,42)"><rect width="280" height="56" rx="6" fill="#FFFFFF" stroke="#C4B5FD"/><text x="12" y="20" font-weight="700">tools/aimpact.py</text><text x="12" y="38" font-size="11" fill="#4B5563">httpx · Bearer at_…</text><text x="12" y="52" font-size="11" fill="#4B5563">endpoint contracts</text></g>
+        <g transform="translate(310,42)"><rect width="280" height="56" rx="6" fill="#FFFFFF" stroke="#C4B5FD"/><text x="12" y="20" font-weight="700">tools/claude.py</text><text x="12" y="38" font-size="11" fill="#4B5563">anthropic SDK · prompt-cache</text><text x="12" y="52" font-size="11" fill="#4B5563">token accounting · USD cap</text></g>
+        <g transform="translate(600,42)"><rect width="280" height="56" rx="6" fill="#FFFFFF" stroke="#C4B5FD"/><text x="12" y="20" font-weight="700">tools/wordpress.py</text><text x="12" y="38" font-size="11" fill="#4B5563">httpx · Application Password</text><text x="12" y="52" font-size="11" fill="#4B5563">decrypt secrets per call</text></g>
+        <g transform="translate(890,42)"><rect width="320" height="56" rx="6" fill="#FFFFFF" stroke="#C4B5FD"/><text x="12" y="20" font-weight="700">tools/langfuse.py</text><text x="12" y="38" font-size="11" fill="#4B5563">tracer wrapper</text><text x="12" y="52" font-size="11" fill="#4B5563">one span per agent hop</text></g>
+      </g>
+    </g>
+
+    <g transform="translate(0,660)" filter="url(#sh)">
+      <rect width="1230" height="90" rx="10" fill="#F5F3FF" stroke="#7C3AED" stroke-width="1.5"/>
+      <text x="16" y="26" font-size="13" font-weight="700" fill="#5B21B6">CROSS-CUTTING · aca/models/ · aca/db/ · aca/security/ · aca/observability/ · aca/config.py</text>
+      <g font-size="12" fill="#0F172A">
+        <g transform="translate(20,40)"><rect width="220" height="42" rx="6" fill="#FFFFFF" stroke="#C4B5FD"/><text x="12" y="18" font-weight="700">models/*.py</text><text x="12" y="34" font-size="11" fill="#4B5563">SQLAlchemy · 7 tables</text></g>
+        <g transform="translate(250,40)"><rect width="220" height="42" rx="6" fill="#FFFFFF" stroke="#C4B5FD"/><text x="12" y="18" font-weight="700">db/session.py + migrations</text><text x="12" y="34" font-size="11" fill="#4B5563">alembic</text></g>
+        <g transform="translate(480,40)"><rect width="220" height="42" rx="6" fill="#FFFFFF" stroke="#C4B5FD"/><text x="12" y="18" font-weight="700">security/auth.py</text><text x="12" y="34" font-size="11" fill="#4B5563">at_… verify + scope</text></g>
+        <g transform="translate(710,40)"><rect width="220" height="42" rx="6" fill="#FFFFFF" stroke="#C4B5FD"/><text x="12" y="18" font-weight="700">security/secrets.py</text><text x="12" y="34" font-size="11" fill="#4B5563">KMS envelope for WP</text></g>
+        <g transform="translate(940,40)"><rect width="270" height="42" rx="6" fill="#FFFFFF" stroke="#C4B5FD"/><text x="12" y="18" font-weight="700">observability/telemetry.py · config.py</text><text x="12" y="34" font-size="11" fill="#4B5563">OTel · pydantic-settings</text></g>
+      </g>
+    </g>
+
+    <g transform="translate(0,770)" filter="url(#sh)">
+      <rect width="1230" height="90" rx="10" fill="#ECFEFF" stroke="#059669"/>
+      <text x="16" y="26" font-size="13" font-weight="700" fill="#059669">EXTERNAL SaaS (targets of tools/*)</text>
+      <g font-size="12" fill="#0F172A">
+        <g transform="translate(20,40)"><rect width="270" height="42" rx="6" fill="#FFFFFF" stroke="#059669"/><text x="12" y="18" font-weight="700">AImpact REST API</text><text x="12" y="34" font-size="11" fill="#4B5563">Bearer at_…</text></g>
+        <g transform="translate(300,40)"><rect width="270" height="42" rx="6" fill="#FFFFFF" stroke="#059669"/><text x="12" y="18" font-weight="700">Anthropic Claude</text><text x="12" y="34" font-size="11" fill="#4B5563">Haiku + Sonnet</text></g>
+        <g transform="translate(580,40)"><rect width="270" height="42" rx="6" fill="#FFFFFF" stroke="#059669"/><text x="12" y="18" font-weight="700">WordPress site (per tenant)</text><text x="12" y="34" font-size="11" fill="#4B5563">Application Password</text></g>
+        <g transform="translate(860,40)"><rect width="350" height="42" rx="6" fill="#FFFFFF" stroke="#059669"/><text x="12" y="18" font-weight="700">Langfuse</text><text x="12" y="34" font-size="11" fill="#4B5563">tracer · optional</text></g>
+      </g>
+    </g>
+
+    <g transform="translate(0,880)" filter="url(#sh)">
+      <rect width="1230" height="120" rx="10" fill="#F1F5F9" stroke="#334155"/>
+      <text x="16" y="26" font-size="13" font-weight="700" fill="#0F172A">DATA (touched by models/ + tools/aimpact.py)</text>
+      <g font-size="12" fill="#0F172A">
+        <g transform="translate(20,42)"><rect width="380" height="60" rx="6" fill="#F5F3FF" stroke="#7C3AED"/><text x="12" y="22" font-weight="700" fill="#5B21B6">ACA Postgres (aca_* tables)</text><text x="12" y="40" font-size="11" fill="#5B21B6">tenants · jobs · gaps · briefs · drafts</text><text x="12" y="54" font-size="11" fill="#5B21B6">publications · agent_traces</text></g>
+        <g transform="translate(410,42)"><rect width="380" height="60" rx="6" fill="#EEF4FF" stroke="#2C6BED"/><text x="12" y="22" font-weight="700" fill="#2C6BED">AImpact Postgres (read via REST)</text><text x="12" y="40" font-size="11" fill="#2C6BED">projects · campaigns · prompts · audit_scores.sources</text><text x="12" y="54" font-size="11" fill="#2C6BED">NEVER direct-write from ACA</text></g>
+        <g transform="translate(800,42)"><rect width="410" height="60" rx="6" fill="#FFFFFF" stroke="#94A3B8"/><text x="12" y="22" font-weight="700">S3 + KMS + Secrets Manager</text><text x="12" y="40" font-size="11" fill="#4B5563">Large draft artifacts · WP application passwords</text><text x="12" y="54" font-size="11" fill="#4B5563">API keys</text></g>
+      </g>
+    </g>
+
+    <!-- arrows -->
+    <line x1="615" y1="130" x2="615" y2="150" stroke="#374151" stroke-width="2.2" marker-end="url(#ar)"/>
+    <line x1="615" y1="250" x2="615" y2="270" stroke="#374151" stroke-width="2.2" marker-end="url(#ar)"/>
+    <line x1="615" y1="380" x2="615" y2="400" stroke="#374151" stroke-width="2.2" marker-end="url(#ar)"/>
+    <line x1="615" y1="510" x2="615" y2="530" stroke="#374151" stroke-width="2.2" marker-end="url(#ar)"/>
+    <line x1="615" y1="750" x2="615" y2="770" stroke="#059669" stroke-width="2.4" marker-end="url(#arGreen)"/>
+
+    <path d="M 1230,200 C 1300,200 1300,660 1230,660" fill="none" stroke="#7C3AED" stroke-width="2" stroke-dasharray="6,4" marker-end="url(#arPurple)"/>
+    <path d="M 1230,320 C 1300,320 1300,700 1230,700" fill="none" stroke="#7C3AED" stroke-width="2" stroke-dasharray="6,4" marker-end="url(#arPurple)"/>
+    <path d="M 1230,450 C 1300,450 1300,740 1230,740" fill="none" stroke="#7C3AED" stroke-width="2" stroke-dasharray="6,4" marker-end="url(#arPurple)"/>
+
+    <line x1="615" y1="860" x2="615" y2="880" stroke="#7C3AED" stroke-width="2.2" marker-end="url(#arPurple)"/>
+  </g>
+
+  <text x="60" y="1410" font-size="11" fill="#9CA3AF">AImpact Content Agent · code architecture · v0.2 (source-driven) · Aditya Pasare · 2026-09-29</text>
+</svg>

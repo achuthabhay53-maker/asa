@@ -1,0 +1,164 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1800 1420" font-family="Inter, Segoe UI, Arial, sans-serif">
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#374151"/></marker>
+    <marker id="arBlue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2C6BED"/></marker>
+    <marker id="arGreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#059669"/></marker>
+    <marker id="arAmber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#D97706"/></marker>
+    <filter id="sh" x="-10%" y="-10%" width="120%" height="120%"><feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#0f172a" flood-opacity="0.10"/></filter>
+  </defs>
+  <rect width="1800" height="1420" fill="#FFFFFF"/>
+
+  <text x="60" y="55" font-size="30" font-weight="700" fill="#0F172A">AImpact Content Agent — Runtime Coordination</text>
+  <text x="60" y="82" font-size="15" fill="#6B7280">One job, read top-to-bottom. Every hop is persisted to ACA Postgres and traced in Langfuse.</text>
+
+  <!-- Legend -->
+  <g transform="translate(1180,40)" font-size="12" fill="#374151">
+    <rect x="0" y="0" width="580" height="52" rx="6" fill="#F9FAFB" stroke="#E5E7EB"/>
+    <line x1="14" y1="18" x2="44" y2="18" stroke="#2C6BED" stroke-width="2.4" marker-end="url(#arBlue)"/><text x="52" y="22">AImpact call</text>
+    <line x1="150" y1="18" x2="180" y2="18" stroke="#374151" stroke-width="2.4" marker-end="url(#ar)"/><text x="188" y="22">Agent message</text>
+    <line x1="300" y1="18" x2="330" y2="18" stroke="#059669" stroke-width="2.4" marker-end="url(#arGreen)"/><text x="338" y="22">Publish / feedback</text>
+    <line x1="450" y1="18" x2="480" y2="18" stroke="#D97706" stroke-width="2.4" stroke-dasharray="6,4" marker-end="url(#arAmber)"/><text x="488" y="22">Revise loop</text>
+    <rect x="14" y="32" width="14" height="14" fill="#FEF3C7" stroke="#D97706"/><text x="34" y="42">Human checkpoint</text>
+    <rect x="200" y="32" width="14" height="14" fill="#F5F3FF" stroke="#7C3AED"/><text x="220" y="42">State persisted</text>
+  </g>
+
+  <!-- Lane headers: AImpact, Orchestrator, Source Analyzer, Brief, Writer, Reviewer, Human+Publisher, WordPress -->
+  <!-- x centers: 130, 320, 500, 700, 900, 1100, 1330, 1620 -->
+  <g font-size="14" font-weight="700" fill="#FFFFFF">
+    <g transform="translate(50,110)"><rect width="160" height="46" rx="8" fill="#2C6BED"/><text x="80" y="30" text-anchor="middle">AImpact</text></g>
+    <g transform="translate(230,110)"><rect width="180" height="46" rx="8" fill="#0F172A"/><text x="90" y="30" text-anchor="middle">Orchestrator</text></g>
+    <g transform="translate(420,110)"><rect width="180" height="46" rx="8" fill="#334155"/><text x="90" y="20" text-anchor="middle">1 · Source Analyzer</text><text x="90" y="38" text-anchor="middle" font-size="11" font-weight="500">Haiku 4.5</text></g>
+    <g transform="translate(620,110)"><rect width="180" height="46" rx="8" fill="#334155"/><text x="90" y="20" text-anchor="middle">2 · Brief</text><text x="90" y="38" text-anchor="middle" font-size="11" font-weight="500">Sonnet</text></g>
+    <g transform="translate(820,110)"><rect width="180" height="46" rx="8" fill="#334155"/><text x="90" y="20" text-anchor="middle">3 · Writer</text><text x="90" y="38" text-anchor="middle" font-size="11" font-weight="500">Sonnet</text></g>
+    <g transform="translate(1020,110)"><rect width="180" height="46" rx="8" fill="#334155"/><text x="90" y="20" text-anchor="middle">4 · Reviewer</text><text x="90" y="38" text-anchor="middle" font-size="11" font-weight="500">Sonnet + rubric</text></g>
+    <g transform="translate(1220,110)"><rect width="260" height="46" rx="8" fill="#7C2D12"/><text x="130" y="20" text-anchor="middle">Human + 5 · Publisher</text><text x="130" y="38" text-anchor="middle" font-size="11" font-weight="500">Content Studio (AImpact UI)</text></g>
+    <g transform="translate(1520,110)"><rect width="220" height="46" rx="8" fill="#059669"/><text x="110" y="20" text-anchor="middle">WordPress site</text><text x="110" y="38" text-anchor="middle" font-size="11" font-weight="500">REST API</text></g>
+  </g>
+
+  <!-- Lifelines -->
+  <g stroke="#CBD5E1" stroke-width="1.2" stroke-dasharray="4,4">
+    <line x1="130" y1="160" x2="130" y2="1340"/>
+    <line x1="320" y1="160" x2="320" y2="1340"/>
+    <line x1="510" y1="160" x2="510" y2="1340"/>
+    <line x1="710" y1="160" x2="710" y2="1340"/>
+    <line x1="910" y1="160" x2="910" y2="1340"/>
+    <line x1="1110" y1="160" x2="1110" y2="1340"/>
+    <line x1="1350" y1="160" x2="1350" y2="1340"/>
+    <line x1="1630" y1="160" x2="1630" y2="1340"/>
+  </g>
+
+  <!-- Phase bands -->
+  <g opacity="0.55">
+    <rect x="30" y="175" width="1740" height="240" fill="#EEF4FF"/>
+    <rect x="30" y="420" width="1740" height="230" fill="#ECFEFF"/>
+    <rect x="30" y="655" width="1740" height="240" fill="#FEF3C7"/>
+    <rect x="30" y="900" width="1740" height="210" fill="#DCFCE7"/>
+    <rect x="30" y="1115" width="1740" height="220" fill="#F1F5F9"/>
+  </g>
+  <g font-size="12" font-weight="700" fill="#475569">
+    <text x="40" y="195">PHASE A · SOURCE ANALYSIS + GAP</text>
+    <text x="40" y="440">PHASE B · BRIEF + DRAFT</text>
+    <text x="40" y="675">PHASE C · REVIEW (auto)</text>
+    <text x="40" y="920">PHASE D · HUMAN APPROVE + PUBLISH</text>
+    <text x="40" y="1135">PHASE E · MEASURE (day 7 &amp; 30)</text>
+  </g>
+
+  <!-- ===== PHASE A ===== -->
+  <g font-size="12" fill="#0F172A">
+    <line x1="60" y1="230" x2="315" y2="230" stroke="#374151" stroke-width="2" marker-end="url(#ar)"/>
+    <text x="80" y="222">1 · trigger: nightly cron or POST /aca/jobs</text>
+
+    <line x1="320" y1="265" x2="130" y2="265" stroke="#2C6BED" stroke-width="2" marker-end="url(#arBlue)"/>
+    <text x="140" y="257" fill="#2C6BED">2 · GET /campaigns/{id}/audit-results?include=sources  (Bearer at_…)</text>
+
+    <line x1="130" y1="298" x2="320" y2="298" stroke="#2C6BED" stroke-width="2" marker-end="url(#arBlue)"/>
+    <text x="140" y="290" fill="#2C6BED">3 · low-scoring prompts + per-model responses + cited sources JSON</text>
+
+    <line x1="320" y1="335" x2="505" y2="335" stroke="#374151" stroke-width="2" marker-end="url(#ar)"/>
+    <text x="330" y="327">4 · analyzeSources(prompts, cited_sources)</text>
+
+    <text x="530" y="360" font-size="11" fill="#4B5563">reads competitor URLs · groups by theme</text>
+    <text x="530" y="376" font-size="11" fill="#4B5563">identifies what THEY explain and WE don't</text>
+
+    <line x1="510" y1="395" x2="325" y2="395" stroke="#374151" stroke-width="2" marker-end="url(#ar)"/>
+    <text x="330" y="387">5 · ContentGap {cited_sources, themes[], target_angle, hypothesis}</text>
+  </g>
+
+  <!-- ===== PHASE B ===== -->
+  <g font-size="12" fill="#0F172A">
+    <line x1="320" y1="480" x2="705" y2="480" stroke="#374151" stroke-width="2" marker-end="url(#ar)"/>
+    <text x="330" y="472">6 · buildBrief(gap)   — no keyword step; angle drives the outline</text>
+
+    <line x1="710" y1="515" x2="325" y2="515" stroke="#374151" stroke-width="2" marker-end="url(#ar)"/>
+    <text x="330" y="507">7 · brief JSON  {title, slug, meta, outline[], faqs[], internal_links[]}</text>
+
+    <line x1="320" y1="555" x2="905" y2="555" stroke="#374151" stroke-width="2" marker-end="url(#ar)"/>
+    <text x="330" y="547">8 · writeDraft(brief)</text>
+
+    <line x1="910" y1="590" x2="325" y2="590" stroke="#374151" stroke-width="2" marker-end="url(#ar)"/>
+    <text x="330" y="582">9 · Markdown draft v1 (1.2–2k words) + schema.org FAQ JSON-LD</text>
+
+    <g transform="translate(1490,470)">
+      <rect width="270" height="160" rx="8" fill="#F5F3FF" stroke="#7C3AED"/>
+      <text x="14" y="22" font-size="12" font-weight="700" fill="#5B21B6">Persisted after every hop</text>
+      <text x="14" y="42" font-size="11" fill="#5B21B6">aca_jobs.status = current agent</text>
+      <text x="14" y="58" font-size="11" fill="#5B21B6">aca_gaps (sources · themes · angle)</text>
+      <text x="14" y="74" font-size="11" fill="#5B21B6">aca_briefs · aca_drafts (versioned)</text>
+      <text x="14" y="90" font-size="11" fill="#5B21B6">aca_agent_traces (tokens · cost · ms)</text>
+      <text x="14" y="112" font-size="11" fill="#5B21B6">→ mirrored to Langfuse for eval</text>
+      <text x="14" y="134" font-size="11" fill="#5B21B6">Jobs are resumable from any hop.</text>
+    </g>
+  </g>
+
+  <!-- ===== PHASE C ===== -->
+  <g font-size="12" fill="#0F172A">
+    <line x1="320" y1="710" x2="1105" y2="710" stroke="#374151" stroke-width="2" marker-end="url(#ar)"/>
+    <text x="330" y="702">10 · review(draft, brief, brand-voice rubric)</text>
+
+    <line x1="1110" y1="745" x2="325" y2="745" stroke="#374151" stroke-width="2" marker-end="url(#ar)"/>
+    <text x="330" y="737">11 · verdict {approve | revise | reject} + inline notes + factuality flags</text>
+
+    <path d="M 1110,775 C 1110,815 910,815 910,775" fill="none" stroke="#D97706" stroke-width="2" stroke-dasharray="6,4" marker-end="url(#arAmber)"/>
+    <text x="930" y="830" font-size="11" fill="#B45309">12 · if revise → back to Writer (max 2 loops, else escalate to human)</text>
+
+    <line x1="320" y1="865" x2="1345" y2="865" stroke="#374151" stroke-width="2" marker-end="url(#ar)"/>
+    <text x="330" y="857">13 · on approve → hand off to Content Studio (brief + draft artifacts)</text>
+  </g>
+
+  <!-- ===== PHASE D ===== -->
+  <g font-size="12" fill="#0F172A">
+    <g transform="translate(1230,940)">
+      <rect width="240" height="90" rx="10" fill="#FEF3C7" stroke="#D97706"/>
+      <text x="16" y="24" font-size="13" font-weight="700" fill="#7C2D12">HUMAN CHECKPOINT</text>
+      <text x="16" y="44" font-size="11" fill="#7C2D12">Editor opens Content Studio</text>
+      <text x="16" y="60" font-size="11" fill="#7C2D12">reviews brief + draft side-by-side</text>
+      <text x="16" y="76" font-size="11" fill="#7C2D12">inline edits · pick schedule · Approve</text>
+    </g>
+
+    <line x1="1345" y1="1050" x2="325" y2="1050" stroke="#374151" stroke-width="2" marker-end="url(#ar)"/>
+    <text x="330" y="1042">14 · POST /aca/drafts/{id}/approve  {schedule_at}</text>
+
+    <line x1="320" y1="1085" x2="1345" y2="1085" stroke="#374151" stroke-width="2" marker-end="url(#ar)"/>
+    <text x="330" y="1077">15 · publish(draft, schedule_at)</text>
+
+    <line x1="1470" y1="1085" x2="1625" y2="1085" stroke="#059669" stroke-width="2.4" marker-end="url(#arGreen)"/>
+    <text x="1478" y="1077" fill="#059669">16 · POST /wp/v2/posts (status=future + date)</text>
+  </g>
+
+  <!-- ===== PHASE E ===== -->
+  <g font-size="12" fill="#0F172A">
+    <line x1="1630" y1="1155" x2="1475" y2="1155" stroke="#059669" stroke-width="2.4" marker-end="url(#arGreen)"/>
+    <text x="1290" y="1147" fill="#059669">17 · post_id + permalink</text>
+
+    <line x1="320" y1="1195" x2="130" y2="1195" stroke="#059669" stroke-width="2.4" marker-end="url(#arGreen)"/>
+    <text x="140" y="1187" fill="#059669">18 · day 7 &amp; 30 · POST /audit-campaign/start (re-score covered prompts)</text>
+
+    <line x1="130" y1="1230" x2="320" y2="1230" stroke="#059669" stroke-width="2.4" marker-end="url(#arGreen)"/>
+    <text x="140" y="1222" fill="#059669">19 · new scores → attribute lift → aca_publications.lift_7d / lift_30d</text>
+
+    <line x1="320" y1="1270" x2="130" y2="1270" stroke="#2C6BED" stroke-width="2" marker-end="url(#arBlue)"/>
+    <text x="140" y="1262" fill="#2C6BED">20 · usage_events: content_published, content_lift_measured (append-only)</text>
+  </g>
+
+  <text x="60" y="1395" font-size="11" fill="#9CA3AF">AImpact Content Agent · runtime coordination · v0.2 (source-driven) · Aditya Pasare · 2026-09-29</text>
+</svg>
