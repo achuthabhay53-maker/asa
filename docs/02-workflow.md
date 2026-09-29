@@ -61,24 +61,36 @@ await analyzer.run(state)   # state.prompts populated
 Analyzer processes prompts in batches of ~5 per Haiku call. Each batch is one LLM turn.
 
 ### 5 · Source Analyzer → Orchestrator
-Returns `ContentGap[]` — one per input prompt. Each item:
+Returns a `ContentGap` for the current prompt. Source analysis has two internal stages: candidate analysis from AImpact evidence, then page fetching and verification inside the same Source Analyzer. Candidate themes are not treated as verified unless page evidence supports them with a quote found in the fetched text. Each gap reports `candidate_themes`, verified `themes`, per-source verification status/evidence, overall `verification_status`, and a cautious hypothesis. A cited page does not prove that the target company's own site lacks the topic.
+
+Example shape:
 ```json
 {
   "prompt_id": "cp_9182",
   "prompt_text": "best HIPAA-compliant patient intake software",
   "cited_sources": [
     {"model":"chatgpt", "url":"https://acme.io/hipaa-checklist", "domain":"acme.io", "competitor":"Acme",
-     "excerpt":"Acme's compliance checklist ..."},
+      "excerpt":"Acme's compliance checklist ...",
+      "contribution":"Supports the answer's explanation of BAA scope with a compliance checklist."},
     {"model":"claude",  "url":"https://betaflow.com/soc2-blog",  "domain":"betaflow.com", "competitor":"BetaFlow",
-     "excerpt":"..."}
+      "excerpt":"...", "contribution":"The supplied evidence does not establish this source's specific contribution."}
   ],
-  "themes": [
+  "candidate_themes": [
     "BAA scope for form vendors",
     "audit-log requirements",
     "e-signature + PHI retention"
   ],
-  "target_angle": "Show what an auditor actually checks for HIPAA intake, using our product as the worked example — the four cited competitors talk about it abstractly, none walk through a real form flow.",
-  "hypothesis": "We're losing this query because every cited source is a compliance checklist page. We have no page that walks through a real HIPAA-compliant intake form flow end to end."
+  "themes": ["BAA scope for form vendors", "audit-log requirements"],
+  "theme_evidence": [{"theme":"BAA scope for form vendors", "source_id":"chatgpt:0", "source_url":"https://acme.io/hipaa-checklist", "evidence_quote":"Exact text from the fetched source page."}],
+  "theme_assessments": [{"theme":"BAA scope for form vendors", "status":"verified", "source_ids":["chatgpt:0"], "cited_by":["chatgpt"], "competitors":["Acme"], "target_site_coverage":"unknown", "content_gap_status":"not_established", "opportunity":"Investigate whether the target company already has content explaining BAA scope."}],
+  "verification_status": "partially_verified",
+  "verification_summary": "Verified 2 of 3 candidate themes against fetched page text. Target-site coverage remains unknown.",
+  "candidate_target_angle": "Stage 1 editorial angle suggestion.",
+  "target_angle": "Compare the target company's existing coverage of BAA scope against the verified source evidence. Do not treat this as a content gap until the target-site inventory has been checked.",
+  "target_site_coverage": "unknown",
+  "content_gap_status": "not_established",
+  "opportunity": "Investigate whether the target company already covers BAA scope and audit-log requirements. Compare the site inventory before establishing a content gap.",
+  "hypothesis": "Fetched cited pages support BAA scope and audit-log themes. The target company's content inventory was not supplied, so a gap on its site is not established."
 }
 ```
 

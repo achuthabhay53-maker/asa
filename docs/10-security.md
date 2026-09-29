@@ -96,7 +96,7 @@ The Analyzer reads competitor citation snippets from AImpact. Those snippets com
 
 - **Snippets are wrapped in a fixed delimiter block** in the prompt (`<<<COMPETITOR_SNIPPET_START>>> … <<<COMPETITOR_SNIPPET_END>>>`) with an explicit instruction to treat the contents as **data**, not instructions.
 - **Structured output only.** Analyzer's output schema is a pydantic model, so free-form model text that doesn't fit the schema is rejected.
-- **No tool access from Analyzer.** It cannot call the AImpact API, cannot spawn shell commands, cannot fetch URLs. Its only side effect is returning a JSON blob.
+- **Cited-page fetches are constrained.** The Source Analyzer uses `tools/source_fetcher.py`; it only fetches HTTP(S), rejects credentials/non-standard ports/private or reserved destination addresses, revalidates redirects, disables environment proxies, caps redirects/bytes/concurrency, and accepts HTML/plain text only. Fetched page text is treated as untrusted data, never instructions. Verification requires evidence quotes that the application checks against the fetched text.
 - **Reviewer runs the same rubric regardless of what's in the draft.** If Writer somehow produces an "ignore previous instructions" section, Reviewer flags it (rubric explicitly checks for prompt-leakage markers).
 
 We do not consider ACA fully hardened against sophisticated prompt injection; we consider it low-risk because the outputs pass a human before any external action.

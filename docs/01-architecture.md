@@ -41,7 +41,7 @@ This is the only inbound signal ACA needs. The whole pipeline is derived from it
 
 The gray container is the ACA orchestrator — a **LangGraph state machine** running inside the ACA FastAPI service. It advances a typed `WorkflowState` through five agents in sequence.
 
-- **1 · Source Analyzer** (Haiku 4.5) — reads the prompt, the model responses, and the cited URLs. Groups the citations by theme, identifies what competitors are covering that we're not, and emits a `ContentGap` with three fields: the `cited_sources` (annotated), the recurring `themes[]`, and a one-line `target_angle` for the blog. Also carries a natural-language `hypothesis`.
+- **1 · Source Analyzer** (Haiku 4.5) — first analyzes AImpact answers/citations, then fetches cited public pages and verifies candidate claims/themes against page text. It emits candidate themes separately from quote-verified themes, per-source verification status, and a cautious editorial angle. Without the target site's page inventory, verified competitor pages do not establish a content gap on that site.
 - **2 · Brief** (Sonnet) — turns the gap and angle into a structured JSON brief: title, slug, meta, H2 outline, 4–6 FAQs, internal-link targets. No keyword step; the editorial angle drives the outline.
 - **3 · Writer** (Sonnet) — expands the brief into a 1,200–2,000-word Markdown draft with an inline `schema.org` `FAQPage` JSON-LD block.
 - **4 · Reviewer** (Sonnet + rubric) — scores the draft against factual grounding (must trace back to the cited sources or a brand source doc), brand voice, and structural completeness. Verdict: `approve | revise | reject`.
@@ -52,7 +52,7 @@ The **dashed amber arc** from Reviewer to Writer is the auto-revise loop. Up to 
 ### Why source analysis and not keyword research
 
 - **Sources are already in AImpact**, at no additional cost or quota. Keyword Planner needs OAuth, a developer token, and per-tenant onboarding.
-- **The citations are the ground truth of why we're losing.** If ChatGPT keeps citing a competitor's compliance checklist, that page is our target — not a keyword abstraction of it.
+- **Citations are evidence to inspect, not proof by themselves.** The Analyzer checks source page text before treating a claim or theme as verified. Citations do not reveal the model's hidden selection reason or prove the target site's content is missing.
 - **The angle is more actionable than a keyword.** "Contrast our intake flow with HIPAA-audited competitors" produces a better brief than "hipaa patient intake, volume 6600".
 - **Cost drops.** No third-party quota, no OAuth complexity, no separate cache layer.
 

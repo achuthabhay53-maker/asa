@@ -13,11 +13,18 @@ Design tenets (apply to every agent):
 ## 1 · Source Analyzer
 
 **Model:** Claude Haiku 4.5.
-**Job:** Read the low-scoring prompt, the four model responses, and the URLs each response cites. Group the citations by theme. Identify what those sources cover that our own site does not. Emit a `ContentGap` with a one-line editorial angle.
+**Job:** Read the low-scoring prompt, model responses, and citations; then, within this same agent, fetch the cited public pages and verify candidate claims/themes against their actual text. Emit a `ContentGap` that distinguishes candidate themes from quote-verified themes. The target site's content coverage remains unknown unless a site inventory is supplied.
 
 **Input:** `state.prompts: list[PromptWithSources]` (from `tools/aimpact.get_audit_results(include=sources)`).
 
-**Output:** `state.gaps: list[ContentGap]`.
+**Output:** `state.gap: ContentGap` for the current single-prompt workflow.
+
+### Two-stage source analysis
+
+1. **Analyze AImpact evidence.** Produce candidate source contributions, one or more factual claims per source to check, candidate themes, and a candidate angle.
+2. **Verify cited pages.** The Analyzer calls `tools/source_fetcher.py` for bounded public HTTP(S) page fetches. It follows only a limited number of redirects, checks each destination resolves publicly, limits size and concurrency, and extracts readable HTML/plain-text content. The verifier treats page text as untrusted input. Stage 1 maps source-specific claims to candidate themes; a mapped theme becomes verified only when a claim check has a supported verdict and its evidence quote is found in that same source's fetched page text.
+
+`ContentGap.themes` contains only verified themes; `candidate_themes` retains Stage 1 suggestions. `theme_evidence` maps each verified theme to a fetched URL and quote. Each source reports its original URL, resolved domain/URL when fetched, candidate and verified competitor labels, verification status, and claim evidence. Unavailable pages and unsupported claims stay explicitly unverified. The final angle is assembled only from verified themes; `candidate_target_angle` retains the Stage 1 suggestion. A verified citation proves what that page contains, not that the target company's site is missing the topic.
 
 **Prompt shape** (batched, ~5 prompts per call, CACHED prefix in **bold**):
 
@@ -31,10 +38,11 @@ Return a strict JSON array matching this schema: {CONTENT_GAP_SCHEMA}.
 User (per batch):
 For each user query below, read the four model answers and the URLs each model cited.
 Identify:
-  1. THEMES the cited sources cover (concrete concepts, not just topics)
-  2. What of those themes we do NOT already have a page for (compare with our taxonomy)
-  3. A one-line EDITORIAL ANGLE for a blog that would win this query back
-  4. A natural-language HYPOTHESIS explaining why we're losing today
+  1. Candidate THEMES present in the supplied answers/citations
+  2. One to three factual claims per source to check against its page
+  3. Competitor identities only when the supplied evidence supports them
+  4. A candidate editorial angle, without asserting target-site content is missing
+  5. An observed AI visibility hypothesis, not a claim about why the model selected a source
 
 Prompts:
 1. {prompt.text}
@@ -52,13 +60,27 @@ Prompts:
   "prompt_id": "cp_9182",
   "prompt_text": "...",
   "cited_sources": [
-    {"model":"chatgpt", "url":"...", "domain":"...", "competitor":"...", "excerpt":"..."}
+    {"model":"chatgpt", "url":"...", "domain":"...", "competitor":"...", "excerpt":"...",
+      "candidate_competitor":"Acme", "contribution":"Supports the answer's comparison of BAA scope.",
+      "verification_status":"verified", "verified_url":"https://acme.io/hipaa-checklist",
+      "verification_evidence":["Exact text from the fetched page that supports the claim."]}
   ],
-  "themes": ["BAA scope", "audit-log requirements", "e-signature + PHI retention"],
-  "target_angle": "Show what an auditor actually checks, using our product as the worked example.",
-  "hypothesis": "Every cited source is a compliance checklist page. We have no walk-through of a real HIPAA-compliant intake form flow."
+  "candidate_themes": ["BAA scope", "audit-log requirements"],
+  "themes": ["BAA scope"],
+  "theme_evidence": [{"theme":"BAA scope", "source_id":"chatgpt:0", "source_url":"https://acme.io/hipaa-checklist", "evidence_quote":"Exact text from the fetched page."}],
+  "theme_assessments": [{"theme":"BAA scope", "status":"verified", "candidate_source_ids":["chatgpt:0"], "candidate_cited_by":["chatgpt"], "candidate_competitors":["Acme"], "source_ids":["chatgpt:0"], "cited_by":["chatgpt"], "competitors":["Acme"], "target_site_coverage":"unknown", "content_gap_status":"not_established", "opportunity":"Investigate whether the target company already has content explaining BAA scope."}],
+  "verification_status": "partially_verified",
+  "verification_summary": "Verified 1 of 2 candidate themes against fetched page text. Target-site coverage remains unknown.",
+  "candidate_target_angle": "Stage 1 editorial angle suggestion.",
+  "target_angle": "Explore a practical guide to BAA scope and audit-log checks for HIPAA intake; target-site coverage has not been assessed.",
+  "target_site_coverage":"unknown",
+  "content_gap_status":"not_established",
+  "opportunity":"Investigate whether the target company already covers BAA scope. Compare the site inventory before establishing a content gap.",
+  "hypothesis": "Fetched cited pages support BAA scope and audit-log themes. The target company's content inventory was not supplied, so a gap on its site is not established."
 }
 ```
+
+Each analyzed source includes individual `verified_claims`, a `verification_status`, and `competitor_verification_status`. Theme assessments identify supporting sources/models and exact evidence quotes. `target_site_coverage` remains `unknown` and `content_gap_status` remains `not_established` until a first-party site inventory is supplied and compared. The `opportunity` asks whether relevant target-site content already exists; it does not assert a gap.
 
 **Cost target:** ~$0.004 per 5-prompt batch (Haiku). ~30 batches for 150 prompts = ~$0.12 per campaign.
 

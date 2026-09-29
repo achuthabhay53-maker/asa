@@ -92,8 +92,17 @@ Source Analyzer output. One row per prompt covered by a job.
 | `baseline_score` | `NUMERIC(5,2)` | at time of analysis |
 | `cited_sources` | `JSONB` | `[{model, url, domain, competitor, excerpt}, ...]` |
 | `themes` | `JSONB` | `[str, ...]` — recurring topics competitors cover |
+| `candidate_themes` | `JSONB` | Stage 1 themes before page verification |
+| `theme_evidence` | `JSONB` | Verified themes with source ID, fetched URL, and exact evidence quote |
+| `theme_assessments` | `JSONB` | Per-theme verification status, sources, models, competitors, and opportunity |
+| `candidate_target_angle` | `TEXT` | Stage 1 angle suggestion, not treated as verified |
 | `target_angle` | `TEXT` | one-line editorial angle |
 | `hypothesis` | `TEXT` | natural-language gap statement |
+| `target_site_coverage` | `TEXT` | `unknown` until a target-site inventory is compared |
+| `content_gap_status` | `TEXT` | `not_established` until first-party coverage is assessed |
+| `opportunity` | `TEXT` | Investigation prompt; not a claim that a gap exists |
+| `verification_status` | `TEXT` | verified / partially_verified / unverified / unavailable |
+| `verification_summary` | `TEXT` | concise summary of page-verification coverage |
 | `created_at` | `TIMESTAMPTZ DEFAULT now()` | |
 
 Index: `(job_id)`.

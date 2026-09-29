@@ -119,6 +119,7 @@ External SaaS clients. One file per service. Each has:
 | `tools/claude.py` | `anthropic` SDK | Prompt caching for brand-voice rubric. Enforces the per-tenant daily USD cap before every call. |
 | `tools/wordpress.py` | `httpx.AsyncClient` | Basic auth with app password decrypted per call via `security/secrets.py`. |
 | `tools/langfuse.py` | `langfuse` SDK | One trace per job, one span per agent hop. |
+| `tools/source_fetcher.py` | `httpx.AsyncClient` | Bounded public-page fetches for the Source Analyzer verification stage; revalidates redirect destinations and response limits. |
 
 ---
 
