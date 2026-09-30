@@ -38,7 +38,7 @@ from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from langchain_anthropic import ChatAnthropic
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from aca.orchestrator.state import (
     AnalyzedSource,
@@ -135,6 +135,11 @@ class ThemeCheck(BaseModel):
 
     evidence_quote: str | None = None
 
+    @field_validator("theme", mode="before")
+    @classmethod
+    def _empty_missing_theme(cls, value):
+        return value.strip() if isinstance(value, str) else ""
+
 
 class SourceVerificationOutput(BaseModel):
     """Second-pass verification output."""
@@ -146,7 +151,7 @@ class SourceVerificationOutput(BaseModel):
 
     theme_checks: list[ThemeCheck] = Field(
         default_factory=list,
-        max_length=100,
+        max_length=800,
     )
 
 
@@ -326,6 +331,22 @@ def _quote_is_present(
     return normalized_quote.lower() in normalized_page.lower()
 
 
+def _claim_quote_is_valid(
+    check: ClaimCheck,
+    page: FetchedPage | None,
+) -> bool:
+    return bool(
+        check.verdict == "supported"
+        and check.evidence_quote
+        and page is not None
+        and page.success
+        and _quote_is_present(
+            check.evidence_quote,
+            page.content,
+        )
+    )
+
+
 def _normalize_whitespace(value: str) -> str:
     return re.sub(
         r"\s+",
@@ -492,7 +513,7 @@ def _build_verified_contribution(
     supported = [
         check.claim
         for check in claim_checks
-        if check.verdict == "supported"
+        if _claim_quote_is_valid(check, page)
     ]
 
     contradicted = [
@@ -643,6 +664,119 @@ def _verification_summary(
     )
 
     return summary
+
+
+def _complete_theme_checks(
+    *,
+    analyses: list[SourceAnalysis],
+    fetched_pages: dict[str, FetchedPage],
+    returned_checks: list[ThemeCheck],
+) -> list[ThemeCheck]:
+    """Return one evidence-validated result for every expected source/theme pair."""
+
+    expected: dict[tuple[str, str], str] = {}
+    for analysis in analyses:
+        for theme in analysis.themes:
+            key = _theme_key(theme)
+            if key:
+                expected.setdefault(
+                    (analysis.source_id, key),
+                    theme.strip(),
+                )
+
+    returned: dict[tuple[str, str], list[ThemeCheck]] = {}
+    for check in returned_checks:
+        key = _theme_key(check.theme)
+        if not key:
+            continue
+        pair = (check.source_id, key)
+        if pair in expected:
+            returned.setdefault(pair, []).append(check)
+
+    completed: list[ThemeCheck] = []
+    for (source_id, theme_key), theme in expected.items():
+        page = fetched_pages.get(source_id)
+        if page is None or not page.success:
+            completed.append(
+                ThemeCheck(
+                    source_id=source_id,
+                    theme=theme,
+                    verdict="unavailable",
+                )
+            )
+            continue
+
+        checks = returned.get((source_id, theme_key), [])
+        supported = next(
+            (
+                check
+                for check in checks
+                if check.verdict == "supported"
+                and check.evidence_quote
+                and _quote_is_present(
+                    check.evidence_quote,
+                    page.content,
+                )
+            ),
+            None,
+        )
+        if supported is not None:
+            completed.append(
+                ThemeCheck(
+                    source_id=source_id,
+                    theme=theme,
+                    verdict="supported",
+                    evidence_quote=supported.evidence_quote,
+                )
+            )
+            continue
+
+        contradicted = next(
+            (
+                check
+                for check in checks
+                if check.verdict == "contradicted"
+                and check.evidence_quote
+                and _quote_is_present(
+                    check.evidence_quote,
+                    page.content,
+                )
+            ),
+            None,
+        )
+        if contradicted is not None:
+            completed.append(
+                ThemeCheck(
+                    source_id=source_id,
+                    theme=theme,
+                    verdict="contradicted",
+                    evidence_quote=contradicted.evidence_quote,
+                )
+            )
+            continue
+
+        non_support_result = next(
+            (
+                check
+                for check in checks
+                if check.verdict
+                not in {"supported", "contradicted", "unavailable"}
+            ),
+            None,
+        )
+        completed.append(
+            ThemeCheck(
+                source_id=source_id,
+                theme=theme,
+                verdict=(
+                    non_support_result.verdict
+                    if non_support_result is not None
+                    else "inconclusive"
+                ),
+            )
+        )
+
+    return completed
 
 
 # ---------------------------------------------------------------------------
@@ -809,7 +943,8 @@ inference.
         analyses: list[SourceAnalysis],
         fetched_pages: dict[str, FetchedPage],
     ) -> SourceVerificationOutput:
-        verification_items: list[str] = []
+        claim_items: list[str] = []
+        theme_items: list[str] = []
 
         analysis_by_source = {
             analysis.source_id: analysis
@@ -818,129 +953,102 @@ inference.
 
         for source_id, analysis in analysis_by_source.items():
             page = fetched_pages.get(source_id)
-
             if page is None:
-                verification_items.append(
-                    f"""
-SOURCE {source_id}
-STATUS: unavailable
-
-CANDIDATE CLAIMS:
-{chr(10).join(f"- {claim}" for claim in analysis.claims_to_verify)}
-
-CANDIDATE THEMES:
-{chr(10).join(f"- {theme}" for theme in analysis.themes)}
-""".strip()
+                page_context = "STATUS: unavailable"
+            else:
+                fetch_status = "success" if page.success else "failed"
+                page_context = (
+                    f"URL: {page.url}\n"
+                    f"FETCH STATUS: {fetch_status}"
                 )
-                continue
+                if page.success:
+                    page_context += (
+                        f"\nFETCHED PAGE TEXT:\n{page.content[:30000]}"
+                    )
 
-            verification_items.append(
-                f"""
-SOURCE {source_id}
-URL: {page.url}
-FETCH STATUS: {"success" if page.success else "failed"}
-
-CANDIDATE CLAIMS:
-{chr(10).join(f"- {claim}" for claim in analysis.claims_to_verify)}
-
-CANDIDATE THEMES:
-{chr(10).join(f"- {theme}" for theme in analysis.themes)}
-
-FETCHED PAGE TEXT:
-{page.content[:30000]}
-""".strip()
+            claim_items.append(
+                f"SOURCE {source_id}\n{page_context}\n"
+                "CANDIDATE CLAIMS:\n"
+                + "\n".join(
+                    f"- {claim}"
+                    for claim in analysis.claims_to_verify
+                )
+            )
+            theme_items.append(
+                f"SOURCE {source_id}\n{page_context}\n"
+                "CANDIDATE THEMES:\n"
+                + "\n".join(
+                    f"- {theme}"
+                    for theme in analysis.themes
+                )
             )
 
-        joined = "\n\n".join(verification_items)
-
-        system_prompt = """
-You are the verification stage of an evidence-grounded Source Analyzer.
-
-Verify ONLY the supplied candidate claims and candidate themes.
-
-Do not add new claims.
-Do not add new themes.
-Do not use outside knowledge.
-Do not infer that a theme is supported merely because one word from
-the theme appears on the page.
-
-CLAIM VERIFICATION
-------------------
-supported:
-    The page directly supports the claim.
-
-contradicted:
-    The page directly conflicts with the claim.
-
-not_found:
-    The page was fetched successfully but the claim could not be found.
-
-inconclusive:
-    The page contains related material but does not establish the
-    supplied claim clearly enough.
-
-unavailable:
-    The page could not be fetched.
-
-THEME VERIFICATION
-------------------
-A theme is supported only when the fetched page directly represents
-that subject as a meaningful part of its content.
-
-For example, a page discussing:
-    "multiplex immunoassays for neurobiology and neuroscience research"
-
-can support:
-    "Neurology biomarker panels"
-
-if the evidence clearly describes those applications.
-
-But a generic mention of "technology" does not support:
-    "Luminex-based multiplex platforms"
-
-unless the page actually discusses that platform/application.
-
-EVIDENCE QUOTES
----------------
-For every supported or contradicted claim/theme, provide a SHORT,
-VERBATIM quote copied from the fetched page.
-
-Never paraphrase the quote.
-
-For not_found and inconclusive:
-    evidence_quote may be null.
-
-For unavailable:
-    evidence_quote must be null.
-
-Do not invent evidence.
-"""
-
-        user_prompt = f"""
-PROMPT
-{prompt_evidence.prompt_text}
-
-SOURCE VERIFICATION MATERIAL
-{joined}
-
-Return structured claim checks and theme checks.
-"""
+        joined_claims = "\n\n".join(claim_items)
+        joined_themes = "\n\n".join(theme_items)
 
         structured = self.model.with_structured_output(
             SourceVerificationOutput
         )
 
-        return structured.invoke(
+        claim_result = structured.invoke(
             [
                 (
                     "system",
-                    system_prompt,
+                    """Verify only the candidate claims against their corresponding
+fetched source pages. Do not add claims or use outside knowledge. A claim
+is supported only when the page directly supports it. For supported or
+contradicted claims, return a short verbatim quote from that page. Do not
+paraphrase or invent quotes. Return claim_checks only; leave theme_checks
+empty.""",
                 ),
                 (
                     "human",
-                    user_prompt,
+                    f"""PROMPT
+{prompt_evidence.prompt_text}
+
+SOURCE CLAIM VERIFICATION MATERIAL
+{joined_claims}
+
+Return one claim check for each supplied candidate claim.
+""",
                 ),
             ]
+        )
+
+        theme_result = structured.invoke(
+            [
+                (
+                    "system",
+                    """Verify only the listed candidate source-theme pairs against
+their corresponding fetched pages. Return exactly one ThemeCheck for
+every listed pair, preserving its source_id and theme. Do not add themes
+or use outside knowledge. A theme is supported only when the page
+directly represents it as a meaningful subject. A page about multiplex
+immunoassays for neuroscience can support a neurology biomarker-panel
+theme when the passage establishes that application; a generic mention
+of technology cannot support a specific platform theme. For supported
+or contradicted results, include a short verbatim quote from that source
+page. For inconclusive or not_found, a quote may be null. Never invent
+or paraphrase evidence.""",
+                ),
+                (
+                    "human",
+                    f"""PROMPT
+{prompt_evidence.prompt_text}
+
+SOURCE THEME VERIFICATION MATERIAL
+{joined_themes}
+
+Return one theme_check per candidate theme listed under each source.
+Do not omit a pair. If the page is unavailable, use verdict 'unavailable'.
+""",
+                ),
+            ]
+        )
+
+        return SourceVerificationOutput(
+            claim_checks=claim_result.claim_checks,
+            theme_checks=theme_result.theme_checks,
         )
 
     # ------------------------------------------------------------------
@@ -1071,6 +1179,15 @@ Return structured claim checks and theme checks.
             prompt_evidence=prompt_evidence,
             analyses=first_pass.source_analyses,
             fetched_pages=fetched_pages,
+        )
+
+        verification = SourceVerificationOutput(
+            claim_checks=verification.claim_checks,
+            theme_checks=_complete_theme_checks(
+                analyses=first_pass.source_analyses,
+                fetched_pages=fetched_pages,
+                returned_checks=verification.theme_checks,
+            ),
         )
 
         analyses_by_source = {
@@ -1379,30 +1496,32 @@ Return structured claim checks and theme checks.
             ] = []
 
             for check in source_claim_checks:
+                quote_valid = _claim_quote_is_valid(
+                    check,
+                    page,
+                )
                 source_claims.append(
                     SourceClaimAssessment(
                         claim=check.claim,
                         status=(
                             "verified"
+                            if quote_valid
+                            else "model_supported"
                             if check.verdict == "supported"
                             else check.verdict
                         ),
-                        evidence_quote=check.evidence_quote,
+                        evidence_quote=(
+                            check.evidence_quote
+                            if quote_valid
+                            or check.verdict != "supported"
+                            else None
+                        ),
                     )
 )
             supported_claims = [
                 check
                 for check in source_claim_checks
-                if (
-                    check.verdict == "supported"
-                    and check.evidence_quote
-                    and page is not None
-                    and page.success
-                    and _quote_is_present(
-                        check.evidence_quote,
-                        page.content,
-                    )
-                )
+                if _claim_quote_is_valid(check, page)
             ]
 
             contradicted_claims = [

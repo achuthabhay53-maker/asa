@@ -56,6 +56,7 @@ class SourceClaimAssessment(BaseModel):
     claim: str
     status: Literal[
         "verified",
+        "model_supported",
         "contradicted",
         "not_found",
         "inconclusive",

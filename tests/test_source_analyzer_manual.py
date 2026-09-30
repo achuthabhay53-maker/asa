@@ -1,10 +1,44 @@
 import asyncio
+from urllib.parse import urlsplit
 
 from aca.agents.analyzer import run
 from aca.orchestrator.state import WorkflowState
 from aca.tools.aimpact import (
     get_source_analyzer_input,
 )
+
+
+def _section(title: str) -> None:
+    print()
+    print("=" * 78)
+    print(title)
+    print("=" * 78)
+
+
+def _display_url(url: str | None) -> str:
+    if not url:
+        return "URL unavailable"
+
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return url[:100] + ("..." if len(url) > 100 else "")
+
+    hostname = parsed.hostname or ""
+    if (
+        hostname.endswith("vertexaisearch.cloud.google.com")
+        and "grounding-api-redirect" in parsed.path
+    ):
+        return "Google Search grounding redirect (opaque citation URL)"
+
+    visible_url = f"{hostname}{parsed.path}"
+    if parsed.query:
+        visible_url += "?..."
+
+    if len(visible_url) > 110:
+        visible_url = visible_url[:107] + "..."
+
+    return visible_url or url[:110]
 
 
 async def main():
@@ -19,31 +53,21 @@ async def main():
         score_threshold=score_threshold,
     )
 
-    print()
-    print("=" * 70)
-    print("PROJECT")
-    print("=" * 70)
-    print(project)
-
-    print()
-    print("=" * 70)
-    print("UNDERPERFORMING PROMPTS")
-    print("=" * 70)
-
+    _section("SOURCE ANALYZER | INPUT")
     print(
-        f"Found {len(prompts)} prompts."
+        f"Project: {project.get('company_name', 'Unknown company')}  |  "
+        f"Region: {project.get('region', 'Unknown')}"
+    )
+    print(
+        f"Campaign: {campaign_id}  |  Score threshold: {score_threshold}  |  "
+        f"Underperforming prompts: {len(prompts)}"
     )
 
     for prompt in prompts:
-        print()
+        models = ", ".join(prompt.per_model.keys()) or "none"
         print(
-            f"Prompt ID: {prompt.prompt_id}"
-        )
-        print(
-            f"Prompt: {prompt.prompt_text}"
-        )
-        print(
-            f"Models: {list(prompt.per_model.keys())}"
+            f"  {prompt.prompt_id}: {prompt.prompt_text} "
+            f"(models: {models})"
         )
 
     if not prompts:
@@ -87,122 +111,91 @@ async def main():
         prompts=[target_prompt],
     )
 
-    print()
-    print("=" * 70)
-    print("RUNNING SOURCE ANALYZER")
-    print("=" * 70)
+    _section(f"ANALYZING PROMPT {target_prompt.prompt_id}")
+    print(target_prompt.prompt_text)
 
     state = await run(state)
-
-    print()
-    print("=" * 70)
-    print("CONTENT GAP")
-    print("=" * 70)
 
     if state.gap is None:
         raise RuntimeError(
             "Source Analyzer did not produce a ContentGap."
         )
 
-    print()
-    print("VERIFICATION STATUS:")
-    print(state.gap.verification_status)
-    print(state.gap.verification_summary)
-    print("Target-site coverage:", state.gap.target_site_coverage)
-    print("Content-gap status:", state.gap.content_gap_status)
-    print("Opportunity:", state.gap.opportunity)
+    gap = state.gap
+    assessments = {
+        assessment.theme: assessment
+        for assessment in gap.theme_assessments
+    }
 
-    print()
-    print("Prompt ID:")
-    print(state.gap.prompt_id)
+    _section("ANALYSIS SUMMARY")
+    print(f"Prompt: {gap.prompt_id} | {gap.prompt_text}")
+    print(f"Verification: {gap.verification_status}")
+    print(gap.verification_summary)
+    print(
+        f"Target-site coverage: {gap.target_site_coverage}  |  "
+        f"Content gap: {gap.content_gap_status}"
+    )
 
-    print()
-    print("Prompt:")
-    print(state.gap.prompt_text)
-
-    print()
-    print("1. SOURCES CITED:")
-    for index, source in enumerate(
-        state.gap.cited_sources,
-        start=1,
-    ):
-        print(
-            f"{index}. Model={source.model}; URL={source.url}; "
-            f"Domain={source.domain}; "
-            f"Source verification={source.verification_status}; "
-            f"Competitor verification={source.competitor_verification_status}"
-        )
-        if source.verified_url:
-            print("   Fetched URL:", source.verified_url)
-        if source.verification_note:
-            print("   Note:", source.verification_note)
-        for evidence_quote in source.verification_evidence:
-            print("   Evidence:", evidence_quote)
-        for claim in source.verified_claims:
+    _section(f"VERIFIED THEMES ({len(gap.themes)})")
+    if not gap.themes:
+        print("No themes met the evidence threshold.")
+    for theme in gap.themes:
+        assessment = assessments.get(theme)
+        print(f"\n{theme}")
+        if assessment is not None:
             print(
-                f"   Claim [{claim.status}]: {claim.claim}"
+                f"  Sources: {', '.join(assessment.source_ids) or 'none'}  |  "
+                f"Cited by: {', '.join(assessment.cited_by) or 'none'}  |  "
+                f"Competitors: {', '.join(assessment.competitors) or 'none'}"
             )
+            for evidence in assessment.evidence:
+                print(
+                    f"  Evidence [{evidence.source_id}] "
+                    f"({_display_url(evidence.source_url)}):"
+                )
+                print(f'    "{evidence.evidence_quote}"')
 
-    print()
-    print("2. COMPETITORS REPRESENTED:")
-    for source in state.gap.cited_sources:
+    _section(f"CANDIDATE THEMES ({len(gap.candidate_themes)})")
+    if not gap.candidate_themes:
+        print("None.")
+    for theme in gap.candidate_themes:
+        assessment = assessments.get(theme)
+        if assessment is None:
+            print(f"- {theme}")
+            continue
         print(
-            f"- Verified: {source.competitor or 'Not identified'}; "
-            f"Candidate: {source.candidate_competitor or 'Not identified'} "
-            f"(source: {source.url or source.domain or 'unknown'})"
+            f"- {theme} | sources: "
+            f"{', '.join(assessment.candidate_source_ids) or 'none'} | "
+            f"cited by: {', '.join(assessment.candidate_cited_by) or 'none'}"
         )
 
-    print()
-    print("3. SOURCE CONTRIBUTIONS TO THE ANSWERS:")
-    for source in state.gap.cited_sources:
+    _section(f"CITED SOURCES ({len(gap.cited_sources)})")
+    for source in gap.cited_sources:
+        source_id = source.source_id or "?"
         print(
-            f"- {source.url or source.domain or 'Unknown source'} "
-            f"[{source.model}]: {source.contribution}"
+            f"\n[{source_id}] {source.model} | "
+            f"page: {source.verification_status} | "
+            f"competitor: {source.competitor or 'not verified'}"
         )
+        print(f"  URL: {_display_url(source.verified_url or source.url)}")
+        if source.candidate_competitor:
+            print(f"  Competitor candidate: {source.candidate_competitor}")
+        if source.verification_note:
+            print(f"  Note: {source.verification_note}")
+        for claim in source.verified_claims:
+            print(f"  Claim [{claim.status}]: {claim.claim}")
+            if claim.evidence_quote:
+                print(f'    Evidence: "{claim.evidence_quote}"')
 
-    print()
-    print("4. VERIFIED THEMES:")
-    for theme in state.gap.themes:
-        print("-", theme)
-
-    print()
-    print("CANDIDATE THEMES:")
-    for theme in state.gap.candidate_themes:
-        print("-", theme)
-
-    print()
-    print("THEME EVIDENCE:")
-    for evidence in state.gap.theme_evidence:
-        print(
-            f"- {evidence.theme} [{evidence.source_id}] "
-            f"{evidence.source_url}: {evidence.evidence_quote}"
-        )
-
-    print()
-    print("THEME ASSESSMENTS:")
-    for assessment in state.gap.theme_assessments:
-        print(
-            f"- {assessment.theme}: {assessment.status}; "
-            f"verified AI usage={', '.join(assessment.cited_by) or 'none'}; "
-            f"verified competitors={', '.join(assessment.competitors) or 'none'}; "
-            f"candidate AI usage={', '.join(assessment.candidate_cited_by) or 'none'}; "
-            f"candidate competitors={', '.join(assessment.candidate_competitors) or 'none'}; "
-            f"target-site coverage={assessment.target_site_coverage}; "
-            f"content-gap status={assessment.content_gap_status}; "
-            f"opportunity={assessment.opportunity}"
-        )
-
-    print()
-    print("CANDIDATE ANGLE:")
-    print(state.gap.candidate_target_angle)
-
-    print()
-    print("5. CONTENT ANGLE:")
-    print(state.gap.target_angle)
-
-    print()
-    print("HYPOTHESIS:")
-    print(state.gap.hypothesis)
+    _section("OPPORTUNITY AND INTERPRETATION")
+    print("Opportunity:")
+    print(f"  {gap.opportunity}")
+    print("Content angle:")
+    print(f"  {gap.target_angle}")
+    print("Candidate angle:")
+    print(f"  {gap.candidate_target_angle or 'Not provided.'}")
+    print("Hypothesis:")
+    print(f"  {gap.hypothesis}")
 
 
 if __name__ == "__main__":

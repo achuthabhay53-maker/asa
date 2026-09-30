@@ -1,9 +1,11 @@
 from aca.agents.analyzer import (
+    ClaimCheck,
     SourceAnalysis,
     SourceAnalyzer,
     SourceAnalyzerOutput,
     SourceVerificationOutput,
     ThemeCheck,
+    _complete_theme_checks,
     _verify_competitor,
 )
 from aca.orchestrator.state import (
@@ -12,6 +14,38 @@ from aca.orchestrator.state import (
     PromptEvidence,
 )
 from aca.tools.source_fetcher import FetchedPage
+
+
+def test_null_theme_result_becomes_inconclusive_expected_check():
+    returned_check = ThemeCheck(
+        source_id="S1",
+        theme=None,
+        verdict="supported",
+        evidence_quote="The page mentions multiplex panels.",
+    )
+    analysis = SourceAnalysis(
+        source_id="S1",
+        contribution="The source discusses assay panels.",
+        themes=["Multiplex assay panels"],
+    )
+    page = FetchedPage(
+        source_id="S1",
+        url="https://example.com/panels",
+        content="The page mentions multiplex panels.",
+        success=True,
+    )
+
+    completed = _complete_theme_checks(
+        analyses=[analysis],
+        fetched_pages={"S1": page},
+        returned_checks=[returned_check],
+    )
+
+    assert returned_check.theme == ""
+    assert len(completed) == 1
+    assert completed[0].theme == "Multiplex assay panels"
+    assert completed[0].verdict == "inconclusive"
+    assert completed[0].evidence_quote is None
 
 
 class _FixedFetcher:
@@ -63,6 +97,14 @@ def test_analyzer_shortlists_themes_and_separates_verified_output():
         hypothesis="The company is absent, so it may lack content.",
     )
     verification = SourceVerificationOutput(
+        claim_checks=[
+            ClaimCheck(
+                source_id="S1",
+                claim="Bio-Techne offers multiplex assay solutions.",
+                verdict="supported",
+                evidence_quote="This quote is not present in the fetched page.",
+            )
+        ],
         theme_checks=[
             ThemeCheck(
                 source_id="S1",
@@ -125,8 +167,14 @@ def test_analyzer_shortlists_themes_and_separates_verified_output():
     assert len(gap.candidate_themes) <= 7
     assert gap.theme_evidence[0].evidence_quote == quote
     assert gap.theme_assessments[0].competitors == ["Olink"]
+    analyzed_source = gap.cited_sources[0]
+    assert analyzed_source.verification_status == "unsupported"
+    assert analyzed_source.verified_claims[0].status == "model_supported"
+    assert analyzed_source.verified_claims[0].evidence_quote is None
+    assert "Verified claims:" not in analyzed_source.contribution
     assert gap.target_site_coverage == "unknown"
     assert gap.content_gap_status == "not_established"
+    assert "1 of 8 candidate themes" in gap.verification_summary
     assert "not evidence of missing website content" in gap.hypothesis
     assert "absence of the company from these citations is not evidence" in (
         gap.hypothesis
