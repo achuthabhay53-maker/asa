@@ -12,6 +12,7 @@ class CitedSource(BaseModel):
     url: str | None = None
     domain: str | None = None
     competitor: str | None = None
+    title: str | None = None
     excerpt: str
     contribution: str | None = None
 
@@ -21,6 +22,12 @@ class AnalyzedSource(CitedSource):
 
     contribution: str
     source_id: str = ""
+    source_type: Literal[
+        "commercial",
+        "academic",
+        "educational",
+        "unknown",
+    ] = "unknown"
     candidate_competitor: str | None = None
     competitor_verification_status: Literal[
         "verified",
@@ -42,6 +49,7 @@ class AnalyzedSource(CitedSource):
         default_factory=list
     )
     verified_url: str | None = None
+    requested_url: str | None = None
     verification_note: str | None = None
 
 
@@ -50,6 +58,20 @@ class ThemeEvidence(BaseModel):
     source_id: str
     source_url: str
     evidence_quote: str
+
+
+class TargetSiteEvidence(BaseModel):
+    theme: str
+    source_url: str
+    evidence_quote: str
+    page_type: str = "unknown"
+
+
+class TargetSiteDiagnostic(BaseModel):
+    status: Literal["failed", "skipped"]
+    url: str
+    reason_category: str
+    reason: str
 
 
 class SourceClaimAssessment(BaseModel):
@@ -75,8 +97,18 @@ class ThemeAssessment(BaseModel):
     cited_by: list[str] = Field(default_factory=list)
     competitors: list[str] = Field(default_factory=list)
     evidence: list[ThemeEvidence] = Field(default_factory=list)
-    target_site_coverage: Literal["unknown"] = "unknown"
-    content_gap_status: Literal["not_established"] = "not_established"
+    target_site_coverage: Literal[
+        "unknown",
+        "covered",
+        "not_covered",
+    ] = "unknown"
+    target_site_evidence: list[TargetSiteEvidence] = Field(
+        default_factory=list
+    )
+    content_gap_status: Literal[
+        "not_established",
+        "established",
+    ] = "not_established"
     opportunity: str
 
 
@@ -140,9 +172,26 @@ class ContentGap(BaseModel):
 
     verification_summary: str = ""
 
-    target_site_coverage: Literal["unknown"] = "unknown"
+    target_site_url: str | None = None
+    target_site_coverage: Literal[
+        "unknown",
+        "partial",
+        "assessed",
+    ] = "unknown"
+    target_site_pages_discovered: int = 0
+    target_site_urls_discovered: int = 0
+    target_site_pages_attempted: int = 0
+    target_site_pages_fetched: int = 0
+    target_site_diagnostics: list[TargetSiteDiagnostic] = Field(
+        default_factory=list
+    )
+    target_site_inventory_complete: bool = False
+    target_site_note: str = ""
 
-    content_gap_status: Literal["not_established"] = "not_established"
+    content_gap_status: Literal[
+        "not_established",
+        "established",
+    ] = "not_established"
 
     opportunity: str = ""
 
@@ -182,6 +231,7 @@ class WorkflowState(BaseModel):
 
     # Target company / brand being analyzed.
     company_name: str
+    company_url: str | None = None
 
     # Input evidence supplied to Source Analyzer.
     prompts: list[PromptEvidence] = Field(

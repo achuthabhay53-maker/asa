@@ -1,0 +1,15 @@
+{
+  "website": "https://www.alamarbio.com/",
+  "root_host": "alamarbio.com",
+  "crawl_finished_at": "2026-10-01T10:22:51.192011+00:00",
+  "close_reason": "finished",
+  "pages_seen": 0,
+  "records": 0,
+  "successful": 0,
+  "failed": 0,
+  "blocked": 0,
+  "pdfs": 0,
+  "thin": 0,
+  "inventory": "complete",
+  "items": []
+}

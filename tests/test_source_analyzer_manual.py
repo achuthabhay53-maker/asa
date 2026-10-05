@@ -1,4 +1,5 @@
 import asyncio
+from collections import Counter
 from urllib.parse import urlsplit
 
 from aca.agents.analyzer import run
@@ -52,6 +53,7 @@ async def main():
         campaign_id=campaign_id,
         score_threshold=score_threshold,
     )
+    
 
     _section("SOURCE ANALYZER | INPUT")
     print(
@@ -69,6 +71,18 @@ async def main():
             f"  {prompt.prompt_id}: {prompt.prompt_text} "
             f"(models: {models})"
         )
+
+
+
+    entered_company_url = input(
+            "Company website URL "
+            f"[{project.get('company_url') or 'optional'}]: "
+        ).strip()
+    company_url = entered_company_url or project.get("company_url")
+    if not company_url:
+            print(
+                "No company URL provided; target-site coverage will remain unknown."
+            )
 
     if not prompts:
         print(
@@ -108,6 +122,7 @@ async def main():
         tenant_id=1,
         campaign_id=campaign_id,
         company_name=project["company_name"],
+        company_url=company_url,
         prompts=[target_prompt],
     )
 
@@ -135,6 +150,21 @@ async def main():
         f"Target-site coverage: {gap.target_site_coverage}  |  "
         f"Content gap: {gap.content_gap_status}"
     )
+    if gap.target_site_url:
+        print(
+            f"Target website: {_display_url(gap.target_site_url)}"
+        )
+        print(
+            f"Search-result URLs: {gap.target_site_urls_discovered}  |  "
+            f"Selected unique URLs: {gap.target_site_pages_discovered}  |  "
+            f"Fetch attempts: {gap.target_site_pages_attempted}  |  "
+            f"Fetched: {gap.target_site_pages_fetched}"
+        )
+        print(
+            "Site scan: targeted theme search (not a full sitemap crawl)"
+        )
+        if gap.target_site_note:
+            print(f"Fast-search note: {gap.target_site_note}")
 
     _section(f"VERIFIED THEMES ({len(gap.themes)})")
     if not gap.themes:
@@ -148,9 +178,19 @@ async def main():
                 f"Cited by: {', '.join(assessment.cited_by) or 'none'}  |  "
                 f"Competitors: {', '.join(assessment.competitors) or 'none'}"
             )
+            print(
+                f"  Target-site coverage: {assessment.target_site_coverage}  |  "
+                f"Content gap: {assessment.content_gap_status}"
+            )
             for evidence in assessment.evidence:
                 print(
                     f"  Evidence [{evidence.source_id}] "
+                    f"({_display_url(evidence.source_url)}):"
+                )
+                print(f'    "{evidence.evidence_quote}"')
+            for evidence in assessment.target_site_evidence:
+                print(
+                    f"  Target-site evidence [{evidence.page_type}] "
                     f"({_display_url(evidence.source_url)}):"
                 )
                 print(f'    "{evidence.evidence_quote}"')
@@ -174,9 +214,14 @@ async def main():
         source_id = source.source_id or "?"
         print(
             f"\n[{source_id}] {source.model} | "
+            f"type: {source.source_type} | "
             f"page: {source.verification_status} | "
             f"competitor: {source.competitor or 'not verified'}"
         )
+        if source.title:
+            print(f"  Title: {source.title}")
+        if source.requested_url and source.url != source.requested_url:
+            print(f"  Cited URL: {_display_url(source.requested_url)}")
         print(f"  URL: {_display_url(source.verified_url or source.url)}")
         if source.candidate_competitor:
             print(f"  Competitor candidate: {source.candidate_competitor}")

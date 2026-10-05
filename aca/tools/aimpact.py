@@ -102,6 +102,7 @@ def _normalize_sources(
         )
 
         domain = source.get("domain")
+        title = source.get("title")
 
         competitor = (
             source.get("competitor")
@@ -129,6 +130,7 @@ def _normalize_sources(
                 url=url,
                 domain=domain,
                 competitor=competitor,
+                title=str(title) if title else None,
                 excerpt=str(excerpt),
             )
         )

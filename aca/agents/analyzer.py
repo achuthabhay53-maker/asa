@@ -32,6 +32,7 @@ That is the Brief Agent's responsibility.
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Literal
 from urllib.parse import urlparse
@@ -46,11 +47,17 @@ from aca.orchestrator.state import (
     CitedSource,
     PromptEvidence,
     SourceClaimAssessment,
+    TargetSiteDiagnostic,
+    TargetSiteEvidence,
     ThemeAssessment,
     ThemeEvidence,
     WorkflowState,
 )
-from aca.tools.source_fetcher import FetchedPage, get_source_fetcher
+from aca.tools.source_fetcher import (
+    FetchedPage,
+    SiteSearchCandidates,
+    get_source_fetcher,
+)
 
 load_dotenv()
 
@@ -74,6 +81,7 @@ class SourceAnalysis(BaseModel):
         max_length=3,
     )
 
+    # Specific, checkable target-site coverage questions.
     themes: list[str] = Field(
         default_factory=list,
         max_length=5,
@@ -148,6 +156,15 @@ class SourceVerificationOutput(BaseModel):
         default_factory=list,
         max_length=100,
     )
+
+    theme_checks: list[ThemeCheck] = Field(
+        default_factory=list,
+        max_length=800,
+    )
+
+
+class TargetSiteVerificationOutput(BaseModel):
+    """Theme coverage checks against target-site pages."""
 
     theme_checks: list[ThemeCheck] = Field(
         default_factory=list,
@@ -282,6 +299,7 @@ def _build_hypothesis(
     company_name: str,
     verified_themes: list[str],
     candidate_themes: list[str],
+    target_site_observation: str | None = None,
 ) -> str:
     if verified_themes:
         citation_observation = (
@@ -300,11 +318,14 @@ def _build_hypothesis(
             "The cited-source evidence did not establish a verified theme."
         )
 
+    site_observation = target_site_observation or (
+        f"{company_name}'s actual site coverage has not been assessed."
+    )
+
     return (
         f"{citation_observation} This describes the sampled citation "
-        f"set only. {company_name}'s actual site coverage has not been "
-        "assessed, so the absence of the company from these citations "
-        "is not evidence of missing website content or a content gap."
+        f"set only. {site_observation} The absence of the company from "
+        "the citations alone is not evidence of missing website content."
     )
 
 
@@ -335,7 +356,7 @@ def _claim_quote_is_valid(
     check: ClaimCheck,
     page: FetchedPage | None,
 ) -> bool:
-    return bool(
+    if not (
         check.verdict == "supported"
         and check.evidence_quote
         and page is not None
@@ -344,7 +365,152 @@ def _claim_quote_is_valid(
             check.evidence_quote,
             page.content,
         )
+    ):
+        return False
+
+    claim = _normalize(check.claim)
+    quote = _normalize(check.evidence_quote)
+    claim_is_normative = any(
+        term in claim
+        for term in (
+            "standard",
+            "standards",
+            "guideline",
+            "guidelines",
+            "recommendation",
+            "recommendations",
+            "requirement",
+            "requirements",
+        )
     )
+    quote_only_states_aim = any(
+        phrase in quote
+        for phrase in (
+            "aim of this review",
+            "aim of the review",
+            "objective of this review",
+            "objective of the review",
+            "purpose of this review",
+            "purpose of the review",
+            "aim of this study",
+            "objective of this study",
+            "purpose of this study",
+        )
+    )
+    if claim_is_normative and quote_only_states_aim:
+        return False
+
+    named_entities = (
+        "thermo fisher scientific",
+        "thermo fisher",
+        "sigma aldrich",
+        "milliplex",
+        "bio techne",
+        "r&d systems",
+        "rd systems",
+        "bio rad",
+        "bio plex",
+        "meso scale discovery",
+        "mesoscale",
+        "raybiotech",
+        "creative proteomics",
+        "creative biomart",
+        "olink",
+        "luminex",
+        "xmap",
+        "u plex",
+        "s plex",
+        "nulisa",
+        "nulisa seq",
+        "abcam",
+    )
+    for entity in named_entities:
+        normalized_entity = _normalize(entity)
+        if normalized_entity in claim and normalized_entity not in quote:
+            return False
+
+    return True
+
+
+def _classify_target_fetch_failure(
+    page: FetchedPage,
+) -> str:
+    error = (page.error or "").lower()
+    path = urlparse(page.url).path.lower()
+
+    if any(
+        marker in error
+        for marker in (
+            "robots.txt",
+            "blocked by robots",
+            "robots exclusion",
+            "forbidden",
+            "access denied",
+            "status code 401",
+            "status code 403",
+            "http 401",
+            "http 403",
+        )
+    ):
+        return "robots/access restriction"
+
+    if any(
+        marker in error
+        for marker in (
+            "unsupported content type",
+            "application/pdf",
+            "image/",
+            "rss feed",
+            "atom feed",
+            "not html",
+        )
+    ) or path.endswith(
+        (
+            ".pdf",
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".gif",
+            ".webp",
+            ".svg",
+            ".rss",
+            ".atom",
+            ".xml",
+            ".mp4",
+        )
+    ):
+        return "non-HTML content"
+
+    if any(
+        marker in error
+        for marker in (
+            "redirect",
+            "timed out",
+            "timeout",
+            "connection",
+            "dns",
+            "tls",
+            "ssl",
+            "status code 3",
+            "status code 4",
+            "status code 5",
+            "http 3",
+            "http 4",
+            "http 5",
+        )
+    ):
+        return "HTTP/redirect failure"
+
+    if page.failure_stage == "tavily_batch":
+        return "Tavily batch/extraction behavior"
+
+    if page.failure_stage in {
+        "tavily_failed_result",
+        "tavily_empty_content",
+    }:
+        return "Tavily extraction failure"
+
+    return "other error"
 
 
 def _normalize_whitespace(value: str) -> str:
@@ -368,6 +534,138 @@ def _safe_domain(url: str | None) -> str | None:
         return None
 
     return hostname.lower()
+
+
+_KNOWN_DOMAIN_ENTITIES = {
+    "thermofisher.com": "Thermo Fisher Scientific",
+    "sigmaaldrich.com": "Sigma-Aldrich",
+    "bio-techne.com": "Bio-Techne",
+    "rndsystems.com": "Bio-Techne",
+    "biorad.com": "Bio-Rad",
+    "mesoscale.com": "Meso Scale Discovery",
+    "meso-scale.com": "Meso Scale Discovery",
+    "raybiotech.com": "RayBiotech",
+    "creative-proteomics.com": "Creative Proteomics",
+    "olink.com": "Olink",
+    "abcam.com": "Abcam",
+    "evotec.com": "Evotec",
+}
+
+
+def _entity_from_domain(url: str | None) -> str | None:
+    domain = _safe_domain(url)
+    if not domain:
+        return None
+
+    return next(
+        (
+            entity
+            for known_domain, entity in _KNOWN_DOMAIN_ENTITIES.items()
+            if domain == known_domain or domain.endswith(f".{known_domain}")
+        ),
+        None,
+    )
+
+
+def _classify_source_type(
+    *,
+    url: str | None,
+    title: str | None = None,
+) -> Literal["commercial", "academic", "educational", "unknown"]:
+    domain = _safe_domain(url) or ""
+    path = urlparse(url or "").path.lower()
+    normalized_title = _normalize(title or "")
+
+    if (
+        domain.endswith(".edu")
+        or domain.endswith(".gov")
+        or domain in {
+            "pubmed.ncbi.nlm.nih.gov",
+            "ncbi.nlm.nih.gov",
+            "pmc.ncbi.nlm.nih.gov",
+            "arxiv.org",
+            "doi.org",
+            "frontiersin.org",
+            "nature.com",
+            "jci.org",
+        }
+        or "/pmc/articles/" in path
+        or "journal" in path
+        or "review" in normalized_title
+    ):
+        return "academic"
+
+    if any(
+        marker in path
+        for marker in (
+            "/knowledge-center/",
+            "/technical-documents/",
+            "/education/",
+            "/learn/",
+            "/blog/",
+            "/publication/",
+            "/publications/",
+        )
+    ):
+        return "educational"
+
+    if _entity_from_domain(url) or any(
+        marker in path
+        for marker in (
+            "/products/",
+            "/product/",
+            "/services/",
+            "/solutions/",
+            "/assays/",
+            "/panels/",
+            "/platform/",
+            "/sciencepool/",
+        )
+    ):
+        return "commercial"
+
+    return "unknown"
+
+
+def _classify_target_page_type(
+    *,
+    url: str,
+    title: str | None,
+) -> str:
+    path = urlparse(url).path.lower()
+    normalized_title = _normalize(title or "")
+
+    if any(
+        marker in path
+        for marker in ("/publication/", "/publications/", "/papers/", "/journal/")
+    ) or any(
+        marker in normalized_title
+        for marker in ("clinical study", "research study", "published in", "journal article")
+    ):
+        return "publication"
+
+    if any(marker in path for marker in ("/blog/", "/news/", "/insights/")):
+        return "blog/news"
+
+    if any(
+        marker in path
+        for marker in (
+            "/product/",
+            "/products/",
+            "/service/",
+            "/services/",
+            "/technology/",
+            "/platform/",
+            "/assays/",
+            "/panels/",
+        )
+    ):
+        return "product/service/technology"
+
+    if any(marker in path for marker in ("/event/", "/events/", "/webinar/")):
+        return "event"
+
+    return "general page"
 
 
 # ---------------------------------------------------------------------------
@@ -437,6 +735,7 @@ def _verify_competitor(
     page: FetchedPage | None,
     company_name: str,
     relevant: bool,
+    source_type: str | None = None,
 ) -> tuple[
     str | None,
     Literal[
@@ -457,23 +756,30 @@ def _verify_competitor(
       - the domain is generally related to the candidate
     """
 
-    if not candidate:
+    if page is None:
+        return None, "unavailable"
+
+    if not page.success:
+        return None, "unavailable"
+
+    source_type = source_type or _classify_source_type(
+        url=page.url,
+        title=page.title,
+    )
+    if source_type != "commercial":
         return None, "not_identified"
 
-    candidate = candidate.strip()
-
+    candidate = (
+        candidate.strip()
+        if candidate and candidate.strip()
+        else _entity_from_domain(page.url)
+    )
     if not candidate:
         return None, "not_identified"
 
     # Do not classify the target company itself as a competitor.
     if _normalize(candidate) == _normalize(company_name):
         return None, "not_identified"
-
-    if page is None:
-        return None, "unavailable"
-
-    if not page.success:
-        return None, "unavailable"
 
     if not relevant:
         return None, "unverified"
@@ -861,23 +1167,29 @@ evidence alone.
 
 The target company website has NOT been inspected by this agent.
 
-Candidate themes should describe meaningful subject areas that are
-actually represented in the cited material.
+Candidate themes must be specific, checkable content-coverage questions
+grounded in the cited material. They are not broad subject labels.
 
-Keep themes concise and specific.
+Each question must be narrow enough that a target-site page can clearly
+answer it with evidence. Prefer a concrete application, audience need,
+comparison, workflow, or capability over a generic topic name.
 
-Examples:
-- Neurology biomarker panels
-- Immunology multiplex assays
-- Luminex-based multiplex platforms
-- Multiplex immunofluorescence
-- Proximity extension assay technology
+Good examples:
+- Does the site explain neurology biomarker panels for CSF or plasma?
+- Does the site compare NULISA with Luminex-based multiplex assays or Olink/PEA?
+- Does the site explain multiplex assay options for oncology immune profiling?
+- Does the site describe how multiplex panels are used for inflammatory biomarkers?
 
-Do not create generic themes such as:
-- scientific information
-- product information
-- research
-- useful sources
+Bad examples:
+- Multiplex protein assays
+- Immunology
+- Proteomics
+- Research
+- Scientific information
+
+Keep each question concise enough to use as a website search query.
+Do not invent facts about the target company; the question must come from
+the cited source evidence.
 
 For each source:
 - explain its contribution to the AI answer
@@ -910,6 +1222,11 @@ observation, not a confirmed website content gap.
 
 The editorial_angle should describe what a future content strategy
 could investigate based on the cited evidence.
+
+For the themes field, return a short list of specific, checkable
+content-coverage questions. Do not return broad topic labels. Each
+question must be grounded in the cited evidence and narrow enough that
+a target-site page can answer it with a yes/no-style evidence check.
 
 The hypothesis should clearly distinguish observed evidence from
 inference.
@@ -998,8 +1315,12 @@ inference.
 fetched source pages. Do not add claims or use outside knowledge. A claim
 is supported only when the page directly supports it. For supported or
 contradicted claims, return a short verbatim quote from that page. Do not
-paraphrase or invent quotes. Return claim_checks only; leave theme_checks
-empty.""",
+paraphrase or invent quotes. The quote must support the entire claim,
+not merely contain a related generic term. If a claim names a company,
+product, or platform, the quote must connect that entity to the claimed
+fact. A paper's stated aim or scope is not evidence that its intended
+result, standard, or recommendation exists. Return claim_checks only;
+leave theme_checks empty.""",
                 ),
                 (
                     "human",
@@ -1051,9 +1372,213 @@ Do not omit a pair. If the page is unavailable, use verdict 'unavailable'.
             theme_checks=theme_result.theme_checks,
         )
 
-    # ------------------------------------------------------------------
-    # Main analysis
-    # ------------------------------------------------------------------
+    def _verify_target_site_themes(
+        self,
+        *,
+        themes: list[str],
+        pages: dict[str, FetchedPage],
+    ) -> list[ThemeCheck]:
+        """Verify target-site theme coverage against the fetched sitemap inventory."""
+
+        if not themes or not pages:
+            return []
+
+        page_items = list(pages.items())
+        expected_themes = {
+            _theme_key(theme): theme
+            for theme in themes
+        }
+
+        returned_checks: list[ThemeCheck] = []
+        structured = self.model.with_structured_output(
+            TargetSiteVerificationOutput
+        )
+
+        # Keep each request bounded. Missing checks are handled below as
+        # inconclusive; they are never silently interpreted as not_found.
+        batch_size = 8
+
+        for start in range(0, len(page_items), batch_size):
+            batch = page_items[start:start + batch_size]
+            page_blocks: list[str] = []
+
+            for source_id, page in batch:
+                if page.success:
+                    page_status = "success"
+                    page_text = page.content[:10000]
+                else:
+                    page_status = "failed"
+                    page_text = ""
+
+                page_blocks.append(
+                    f"TARGET PAGE {source_id}\n"
+                    f"URL: {page.url}\n"
+                    f"TITLE: {page.title or 'unknown'}\n"
+                    f"PAGE TYPE: {_classify_target_page_type(url=page.url, title=page.title)}\n"
+                    f"FETCH STATUS: {page_status}\n"
+                    f"PAGE TEXT:\n{page_text}"
+                )
+
+            try:
+                result = structured.invoke(
+                    [
+                        (
+                            "system",
+                            """You are verifying whether specific, checkable content-coverage
+questions are answered by pages from a target company's website.
+
+For EVERY target page and EVERY listed coverage question, return exactly
+one theme_check.
+
+Rules:
+1. Preserve source_id exactly.
+2. Preserve the supplied coverage-question wording.
+3. Return exactly one check for every page/question pair.
+4. Use "supported" only when the page's main subject or a substantive
+   section directly answers the question. A passing mention is not enough.
+5. A product, service, or technology page is strong evidence when it
+   directly answers the question. A publication, event, poster, or PDF
+   is supporting evidence only when the page itself answers the question
+   substantively.
+6. A "supported" result MUST contain a short verbatim quote copied from
+   the supplied page text.
+7. Use "not_found" when the supplied page text does not answer the question.
+8. Use "inconclusive" when the page is tangential or the text is insufficient.
+9. Use "unavailable" when the page fetch status is failed.
+10. Do not infer from company name, URL alone, reputation, outside
+    knowledge, or other pages.
+11. Never invent or paraphrase evidence.
+12. Do not omit a page/question pair.
+
+The Python application independently verifies every supporting quote.
+""",
+                        ),
+                        (
+                            "human",
+                            f"""TARGET COMPANY WEBSITE
+
+VERIFIED SOURCE COVERAGE QUESTIONS:
+{chr(10).join(f'- {theme}' for theme in themes)}
+
+TARGET PAGES:
+{chr(10).join(page_blocks)}
+
+Return exactly one theme_check for every combination of:
+TARGET PAGE x VERIFIED SOURCE COVERAGE QUESTION
+
+For failed pages use "unavailable".
+For successful pages that do not substantively answer the question use
+"not_found". For insufficient text use "inconclusive". For supported
+questions provide a short verbatim evidence_quote that directly answers
+the question.""",
+                        ),
+                    ]
+                )
+                returned_checks.extend(result.theme_checks)
+
+            except Exception:
+                # A failed verification call is not evidence of absence.
+                for source_id, page in batch:
+                    for theme in themes:
+                        returned_checks.append(
+                            ThemeCheck(
+                                source_id=source_id,
+                                theme=theme,
+                                verdict=(
+                                    "unavailable"
+                                    if not page.success
+                                    else "inconclusive"
+                                ),
+                            )
+                        )
+
+        checks_by_pair: dict[tuple[str, str], list[ThemeCheck]] = {}
+
+        for check in returned_checks:
+            theme_key = _theme_key(check.theme)
+
+            if theme_key not in expected_themes:
+                continue
+
+            if check.source_id not in pages:
+                continue
+
+            checks_by_pair.setdefault(
+                (check.source_id, theme_key),
+                [],
+            ).append(check)
+
+        completed: list[ThemeCheck] = []
+
+        # Complete the expected page x theme matrix deterministically.
+        # Missing model output becomes inconclusive, never not_found.
+        for source_id, page in page_items:
+            for theme_key, theme in expected_themes.items():
+
+                if not page.success:
+                    completed.append(
+                        ThemeCheck(
+                            source_id=source_id,
+                            theme=theme,
+                            verdict="unavailable",
+                        )
+                    )
+                    continue
+
+                checks = checks_by_pair.get(
+                    (source_id, theme_key),
+                    [],
+                )
+
+                supported = next(
+                    (
+                        check
+                        for check in checks
+                        if (
+                            check.verdict == "supported"
+                            and check.evidence_quote
+                            and _quote_is_present(
+                                check.evidence_quote,
+                                page.content,
+                            )
+                        )
+                    ),
+                    None,
+                )
+
+                if supported is not None:
+                    completed.append(
+                        ThemeCheck(
+                            source_id=source_id,
+                            theme=theme,
+                            verdict="supported",
+                            evidence_quote=supported.evidence_quote,
+                        )
+                    )
+                    continue
+
+                if any(
+                    check.verdict == "not_found"
+                    for check in checks
+                ):
+                    completed.append(
+                        ThemeCheck(
+                            source_id=source_id,
+                            theme=theme,
+                            verdict="not_found",
+                        )
+                    )
+                    continue
+
+                completed.append(
+                    ThemeCheck(
+                        source_id=source_id,
+                        theme=theme,
+                        verdict="inconclusive",
+                    )
+                )
+
+        return completed
 
     def analyze(
         self,
@@ -1314,16 +1839,200 @@ Do not omit a pair. If the page is unavailable, use verdict 'unavailable'.
             }:
                 verified_theme_names.append(canonical)
 
-        assessed_theme_names = candidate_themes
+        target_site_url = project.get("company_url")
+        target_site_pages: dict[str, FetchedPage] = {}
+        target_site_pages_discovered = 0
+        target_site_urls_discovered = 0
+        target_site_pages_attempted = 0
+        target_site_pages_fetched = 0
+        target_site_diagnostics: list[TargetSiteDiagnostic] = []
+        target_site_inventory_complete = False
+        target_site_note = "No target company URL was provided."
+        target_theme_coverage: dict[str, str] = {}
+        target_theme_evidence: dict[str, list[TargetSiteEvidence]] = {}
+
+        if target_site_url:
+            try:
+                max_target_urls = int(
+                    os.getenv("ACA_TARGET_SITE_MAX_URLS", "15")
+                )
+                if max_target_urls < 1:
+                    max_target_urls = 1
+                pages_per_theme = int(
+                    os.getenv("ACA_TARGET_PAGES_PER_THEME", "3")
+                )
+                if pages_per_theme < 1:
+                    pages_per_theme = 1
+
+                site_inventory: SiteSearchCandidates = (
+                    self.fetcher.search_site_pages(
+                        target_site_url,
+                        verified_theme_names,
+                        per_theme_limit=pages_per_theme,
+                        total_limit=max_target_urls,
+                    )
+                )
+
+                target_site_pages_discovered = len(site_inventory.urls)
+                target_site_urls_discovered = (
+                    site_inventory.discovered_url_count
+                )
+
+                for skipped in site_inventory.skipped_urls or []:
+                    target_site_diagnostics.append(
+                        TargetSiteDiagnostic(
+                            status="skipped",
+                            url=skipped.url,
+                            reason_category=skipped.reason_category,
+                            reason=skipped.reason,
+                        )
+                    )
+
+                target_site_pages = self.fetcher.fetch_pages(
+                    {
+                        f"TARGET-{index}": url
+                        for index, url in enumerate(
+                            site_inventory.urls,
+                            start=1,
+                        )
+                    }
+                )
+
+                target_site_pages_attempted = len(target_site_pages)
+                target_site_pages_fetched = sum(
+                    1
+                    for page in target_site_pages.values()
+                    if page.success
+                )
+
+                for page in target_site_pages.values():
+                    if page.success:
+                        continue
+
+                    target_site_diagnostics.append(
+                        TargetSiteDiagnostic(
+                            status="failed",
+                            url=page.url,
+                            reason_category=_classify_target_fetch_failure(
+                                page
+                            ),
+                            reason=page.error or "No error detail returned.",
+                        )
+                    )
+
+                target_site_note = site_inventory.note or ""
+                target_site_note = (
+                    f"{target_site_note} Targeted search checked at most "
+                    f"{pages_per_theme} URLs per coverage question and "
+                    f"{max_target_urls} total. This is not an exhaustive "
+                    "site inventory, so unanswered questions are potential "
+                    "gap signals only."
+                ).strip()
+
+                if target_site_pages_fetched < target_site_pages_discovered:
+                    failed_count = (
+                        target_site_pages_discovered
+                        - target_site_pages_fetched
+                    )
+                    target_site_note = (
+                        f"{target_site_note} "
+                        f"{failed_count} target-site page(s) could not be "
+                        f"extracted. Negative coverage findings remain unknown."
+                    ).strip()
+
+                target_site_inventory_complete = False
+
+            except Exception as exc:
+                target_site_note = f"Target-site discovery failed: {exc}"
+                target_site_inventory_complete = False
+
+        target_site_coverage = (
+            "assessed"
+            if target_site_inventory_complete
+            else "partial"
+            if target_site_pages_fetched
+            else "unknown"
+        )
+
+        if verified_theme_names and target_site_pages:
+            target_checks = self._verify_target_site_themes(
+                themes=verified_theme_names,
+                pages=target_site_pages,
+            )
+
+            for theme in verified_theme_names:
+                theme_key = _theme_key(theme)
+                checks = [
+                    check
+                    for check in target_checks
+                    if _theme_key(check.theme) == theme_key
+                ]
+
+                evidence: list[TargetSiteEvidence] = []
+
+                for check in checks:
+                    if len(evidence) >= 3:
+                        break
+
+                    page = target_site_pages.get(check.source_id)
+
+                    if (
+                        check.verdict == "supported"
+                        and check.evidence_quote
+                        and page is not None
+                        and page.success
+                        and _quote_is_present(
+                            check.evidence_quote,
+                            page.content,
+                        )
+                    ):
+                        evidence.append(
+                            TargetSiteEvidence(
+                                theme=theme,
+                                source_url=page.url,
+                                evidence_quote=check.evidence_quote,
+                                page_type=_classify_target_page_type(
+                                    url=page.url,
+                                    title=page.title,
+                                ),
+                            )
+                        )
+
+                target_theme_evidence[theme_key] = evidence
+
+                if evidence:
+                    target_theme_coverage[theme_key] = "covered"
+
+                elif (
+                    target_site_inventory_complete
+                    and len(checks) == target_site_pages_discovered
+                    and all(
+                        check.verdict == "not_found"
+                        for check in checks
+                    )
+                ):
+                    target_theme_coverage[theme_key] = "not_covered"
+
+                else:
+                    target_theme_coverage[theme_key] = "unknown"
+
+        assessed_theme_names = list(candidate_themes)
+        original_candidate_theme_count = len(assessed_theme_names)
+
         verified_theme_keys = {
             _theme_key(theme)
             for theme in verified_theme_names
         }
-        candidate_themes = [
+
+        unresolved_candidate_themes = [
             theme
             for theme in assessed_theme_names
             if _theme_key(theme) not in verified_theme_keys
         ]
+
+        # Keep candidate_themes as unresolved themes for backwards
+        # compatibility with the existing ContentGap contract.
+        candidate_themes = unresolved_candidate_themes
 
         # --------------------------------------------------------------
         # Theme assessments.
@@ -1354,6 +2063,21 @@ Do not omit a pair. If the page is unavailable, use verdict 'unavailable'.
                 if source is None:
                     continue
 
+                page = fetched_pages.get(source_id)
+                resolved_url = (
+                    page.url
+                    if page is not None and page.success
+                    else source.url
+                )
+                source_type = _classify_source_type(
+                    url=resolved_url,
+                    title=(
+                        page.title
+                        if page is not None and page.success
+                        else source.title
+                    ),
+                )
+
                 theme_source_ids.add(
                     source_id
                 )
@@ -1362,9 +2086,13 @@ Do not omit a pair. If the page is unavailable, use verdict 'unavailable'.
                     source.model
                 )
 
-                if analysis.competitor:
+                source_competitor = (
+                    analysis.competitor
+                    or _entity_from_domain(resolved_url)
+                )
+                if source_type == "commercial" and source_competitor:
                     theme_candidate_competitors.add(
-                        analysis.competitor
+                        source_competitor
                     )
 
                 for evidence in verified_theme_evidence:
@@ -1386,12 +2114,23 @@ Do not omit a pair. If the page is unavailable, use verdict 'unavailable'.
                     continue
 
                 competitor, status = _verify_competitor(
-                    candidate=analysis.competitor,
+                    candidate=(
+                        analysis.competitor
+                        or _entity_from_domain(
+                            page.url
+                            if page is not None
+                            else None
+                        )
+                    ),
                     page=page,
                     company_name=company_name,
                     relevant=any(
                         evidence.source_id == source_id
                         for evidence in theme_evidence
+                    ),
+                    source_type=_classify_source_type(
+                        url=page.url if page is not None else None,
+                        title=page.title if page is not None else None,
                     ),
                 )
 
@@ -1406,6 +2145,39 @@ Do not omit a pair. If the page is unavailable, use verdict 'unavailable'.
             # Candidate competitors can come from all candidate
             # analyses associated with the theme.
             verified = bool(theme_evidence)
+            target_coverage = target_theme_coverage.get(
+                theme_key,
+                "unknown",
+            )
+            target_evidence = target_theme_evidence.get(
+                theme_key,
+                [],
+            )
+            theme_gap_status = (
+                "established"
+                if target_coverage == "not_covered"
+                else "not_established"
+            )
+            if target_coverage == "covered":
+                theme_opportunity = (
+                    f"The target-site inventory contains verified evidence "
+                    f"covering {theme}; review whether that coverage is "
+                    f"sufficient for the intended audience and use case."
+                )
+            elif target_coverage == "not_covered":
+                theme_opportunity = (
+                    f"No verified coverage of {theme} was found across the "
+                    f"complete fetched sitemap inventory. This establishes "
+                    f"a content-gap signal within the assessed sitemap "
+                    f"inventory, not necessarily across every public URL."
+                )
+            else:
+                theme_opportunity = (
+                    f"No verified page was found in the bounded target-site "
+                    f"search that answers {theme}. Treat this as a potential "
+                    f"content-gap signal only; targeted search is not proof "
+                    f"of site-wide absence."
+                )
 
             theme_assessments.append(
                 ThemeAssessment(
@@ -1441,13 +2213,10 @@ Do not omit a pair. If the page is unavailable, use verdict 'unavailable'.
                         theme_verified_competitors
                     ),
                     evidence=theme_evidence,
-                    target_site_coverage="unknown",
-                    content_gap_status="not_established",
-                    opportunity=(
-                        f"Investigate whether {company_name} already "
-                        f"has content that clearly covers {theme}. "
-                        "Target-site coverage has not been assessed."
-                    ),
+                    target_site_coverage=target_coverage,
+                    target_site_evidence=target_evidence,
+                    content_gap_status=theme_gap_status,
+                    opportunity=theme_opportunity,
                 )
             )
 
@@ -1477,6 +2246,27 @@ Do not omit a pair. If the page is unavailable, use verdict 'unavailable'.
                 else None
             )
 
+            resolved_url = (
+                page.url
+                if page is not None and page.success
+                else source.url
+            )
+            source_type = _classify_source_type(
+                url=resolved_url,
+                title=(
+                    page.title
+                    if page is not None and page.success
+                    else source.title
+                ),
+            )
+            if source_type == "commercial":
+                candidate_competitor = (
+                    candidate_competitor
+                    or _entity_from_domain(resolved_url)
+                )
+            else:
+                candidate_competitor = None
+
             verified_competitor, competitor_status = (
                 _verify_competitor(
                     candidate=candidate_competitor,
@@ -1486,6 +2276,7 @@ Do not omit a pair. If the page is unavailable, use verdict 'unavailable'.
                         evidence.source_id == source_id
                         for evidence in verified_theme_evidence
                     ),
+                    source_type=source_type,
                 )
             )
 
@@ -1592,8 +2383,22 @@ Do not omit a pair. If the page is unavailable, use verdict 'unavailable'.
                 AnalyzedSource(
                     source_id=source_id,
                     model=source.model,
-                    url=source.url,
-                    domain=source.domain,
+                    source_type=source_type,
+                    url=(
+                        page.url
+                        if page is not None and page.success
+                        else source.url
+                    ),
+                    domain=(
+                        _safe_domain(page.url)
+                        if page is not None and page.success
+                        else source.domain
+                    ),
+                    title=(
+                        page.title
+                        if page is not None and page.success and page.title
+                        else source.title
+                    ),
                     competitor=verified_competitor,
                     excerpt=source.excerpt,
                     contribution=contribution,
@@ -1611,6 +2416,11 @@ Do not omit a pair. If the page is unavailable, use verdict 'unavailable'.
                         if page is not None
                         and page.success
                         else None
+                    ),
+                    requested_url=(
+                        page.requested_url
+                        if page is not None
+                        else source.url
                     ),
                     verification_note=verification_note,
                 )
@@ -1641,21 +2451,66 @@ Do not omit a pair. If the page is unavailable, use verdict 'unavailable'.
             theme_evidence=verified_theme_evidence,
         )
 
+        if target_site_url:
+            verification_summary += (
+                f" Target-site inventory: {target_site_coverage}; "
+                f"{target_site_pages_fetched} of "
+                f"{target_site_pages_discovered} pages extracted."
+            )
+            if target_site_note:
+                verification_summary += f" {target_site_note}"
+
+        established_gap_themes = [
+            assessment.theme
+            for assessment in theme_assessments
+            if assessment.content_gap_status == "established"
+        ]
+
         # --------------------------------------------------------------
         # Candidate opportunity.
         #
         # Important: this is NOT a confirmed content gap.
         # --------------------------------------------------------------
 
-        if verified_theme_names:
+        if established_gap_themes:
             opportunity = (
-                "Investigate the verified source themes against the "
-                f"{company_name} site inventory before establishing "
-                "a content gap. Verified themes include: "
-                + ", ".join(
-                    verified_theme_names
+                f"The complete extracted sitemap inventory did not show "
+                f"coverage for these source-verified themes: "
+                + ", ".join(established_gap_themes)
+                + ". Review these as potential gaps, noting that the sitemap "
+                "may not enumerate every public page."
+            )
+        elif verified_theme_names and target_site_coverage == "assessed":
+            opportunity = (
+                f"The target-site inventory was assessed across "
+                f"{target_site_pages_fetched} extracted pages. Compare the "
+                f"page-level coverage evidence for the verified themes before "
+                "choosing a content action."
+            )
+        elif verified_theme_names and target_site_pages_fetched:
+            potential_gap_themes = [
+                theme
+                for theme in verified_theme_names
+                if target_theme_coverage.get(_theme_key(theme)) == "unknown"
+            ]
+            if potential_gap_themes:
+                opportunity = (
+                    "Targeted website search found no verified coverage for these "
+                    "specific questions: "
+                    + ", ".join(potential_gap_themes[:5])
+                    + ". Treat them as potential content-gap signals, not "
+                    "proof of site-wide absence."
                 )
-                + "."
+            else:
+                opportunity = (
+                    "Targeted website search found verified coverage for the "
+                    "selected questions. No site-wide content gap is established."
+                )
+        elif verified_theme_names:
+            opportunity = (
+                "Investigate the verified coverage questions against the "
+                f"{company_name} site; target-site inspection is "
+                f"{target_site_coverage}."
             )
         elif candidate_themes:
             opportunity = (
@@ -1674,15 +2529,25 @@ Do not omit a pair. If the page is unavailable, use verdict 'unavailable'.
         # Content angle.
         # --------------------------------------------------------------
 
-        if verified_theme_names:
+        if established_gap_themes:
+            target_angle = (
+                f"Review or develop {company_name} content for "
+                + ", ".join(established_gap_themes)
+                + ", using the verified cited-source evidence as the reference."
+            )
+        elif verified_theme_names and target_site_coverage == "assessed":
+            target_angle = (
+                f"Use the assessed target-site pages and verified source evidence "
+                f"to prioritize coverage of: {', '.join(verified_theme_names)}."
+            )
+        elif verified_theme_names:
             target_angle = (
                 f"Compare {company_name}'s existing coverage of "
                 + ", ".join(
                     verified_theme_names
                 )
-                + " against the verified source evidence. "
-                "Do not treat this as a content gap until the "
-                "target-site inventory has been checked."
+                + f" against the verified source evidence. Target-site "
+                f"inspection is {target_site_coverage}; do not infer missing coverage."
             )
         elif candidate_themes:
             target_angle = (
@@ -1701,13 +2566,82 @@ Do not omit a pair. If the page is unavailable, use verdict 'unavailable'.
         # Final ContentGap.
         # --------------------------------------------------------------
 
+        if target_site_coverage == "assessed":
+            target_site_observation = (
+                f"The sitemap-derived inventory for {company_name} was "
+                f"fully extracted ({target_site_pages_fetched} pages). "
+                + (
+                    "The checked themes not covered were: "
+                    + ", ".join(established_gap_themes)
+                    + "."
+                    if established_gap_themes
+                    else "No verified source theme was classified as absent from the inventory."
+                )
+            )
+        elif target_site_coverage == "partial":
+            target_site_observation = (
+                f"Only {target_site_pages_fetched} of "
+                f"{target_site_pages_discovered} discovered pages were "
+                "sufficiently inspected; missing-theme findings remain unknown."
+            )
+        else:
+            target_site_observation = None
+
         hypothesis = _build_hypothesis(
             company_name=company_name,
             verified_themes=verified_theme_names,
             candidate_themes=(
                 candidate_themes or assessed_theme_names
             ),
+            target_site_observation=target_site_observation,
         )
+
+        covered_target_themes = [
+            theme
+            for theme in verified_theme_names
+            if target_theme_coverage.get(_theme_key(theme)) == "covered"
+        ]
+        potential_gap_themes = [
+            theme
+            for theme in verified_theme_names
+            if (
+                target_site_pages_fetched > 0
+                and target_theme_coverage.get(_theme_key(theme)) == "unknown"
+            )
+        ]
+        if established_gap_themes:
+            candidate_target_angle = (
+                "Review whether new or improved resources are appropriate for: "
+                + ", ".join(established_gap_themes)
+                + ". These are potential gaps in the checked sitemap pages, "
+                "not proof that the entire website lacks this content."
+            )
+        elif potential_gap_themes:
+            candidate_target_angle = (
+                "Potential content-gap signals from targeted website search: "
+                + ", ".join(potential_gap_themes[:5])
+                + ". These are specific unanswered coverage questions in the "
+                "selected pages, not proof of site-wide absence."
+            )
+        elif covered_target_themes:
+            candidate_target_angle = (
+                "Review the existing pages covering "
+                + ", ".join(covered_target_themes[:5])
+                + ". Consider additional content only if a specific unmet "
+                "audience need remains; no product advantage is inferred."
+            )
+        elif verified_theme_names:
+            candidate_target_angle = (
+                "Review the verified coverage questions against the selected "
+                "target-site pages: "
+                + ", ".join(verified_theme_names[:5])
+                + ". No site-wide gap is established."
+            )
+        else:
+            candidate_target_angle = (
+                "A target content angle cannot be recommended until source "
+                "themes are verified and relevant target-site pages are reviewed."
+            )
 
         return ContentGap(
             prompt_id=prompt_evidence.prompt_id,
@@ -1715,13 +2649,25 @@ Do not omit a pair. If the page is unavailable, use verdict 'unavailable'.
             cited_sources=analyzed_sources,
             candidate_themes=candidate_themes,
             themes=verified_theme_names,
-            candidate_target_angle=first_pass.editorial_angle,
+            candidate_target_angle=candidate_target_angle,
             theme_evidence=verified_theme_evidence,
             theme_assessments=theme_assessments,
             verification_status=verification_status,
             verification_summary=verification_summary,
-            target_site_coverage="unknown",
-            content_gap_status="not_established",
+            target_site_url=target_site_url,
+            target_site_coverage=target_site_coverage,
+            target_site_pages_discovered=target_site_pages_discovered,
+            target_site_urls_discovered=target_site_urls_discovered,
+            target_site_pages_attempted=target_site_pages_attempted,
+            target_site_pages_fetched=target_site_pages_fetched,
+            target_site_diagnostics=target_site_diagnostics,
+            target_site_inventory_complete=target_site_inventory_complete,
+            target_site_note=target_site_note,
+            content_gap_status=(
+                "established"
+                if established_gap_themes
+                else "not_established"
+            ),
             opportunity=opportunity,
             target_angle=target_angle,
             hypothesis=hypothesis,
@@ -1766,6 +2712,8 @@ async def run(
     project = get_project(
         campaign["project_id"]
     )
+    if state.company_url:
+        project["company_url"] = state.company_url
 
     analyzer = SourceAnalyzer()
 
