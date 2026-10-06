@@ -336,3 +336,107 @@ def get_source_analyzer_input(
     )
 
     return project, prompts
+
+
+def get_campaign_audit_dataset(
+    campaign_id: int,
+    score_threshold: float | None = None,
+    latest_only: bool = False,
+) -> dict[str, Any]:
+    """
+    Fetch all audit scores, prompts, AI model responses, and citations for a campaign
+    directly from AImpact PostgreSQL.
+
+    Returns:
+        dict with 'campaign', 'project', 'responses', and 'source_content'.
+    """
+    campaign = get_campaign(campaign_id)
+    project = get_project(campaign["project_id"])
+
+    query = """
+        SELECT
+            a.id AS audit_score_id,
+            a.project_id,
+            a.campaign_id,
+            a.prompt_id,
+            a.score,
+            a.model_name,
+            a.region,
+            a.response_text,
+            a.sources,
+            a.created_at,
+
+            cp.prompt_text,
+            cp.intent_category
+
+        FROM audit_scores a
+
+        LEFT JOIN campaign_prompts cp
+            ON cp.id = a.prompt_id
+
+        WHERE a.campaign_id = %s
+          AND a.prompt_id IS NOT NULL
+
+        ORDER BY
+            a.created_at DESC;
+    """
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, (campaign_id,))
+            rows = cur.fetchall()
+
+    if latest_only:
+        latest: dict[tuple[int, str], dict] = {}
+        for row in rows:
+            key = (row["prompt_id"], row["model_name"] or "")
+            if key not in latest:
+                latest[key] = row
+        rows = list(latest.values())
+
+    if score_threshold is not None:
+        rows = [
+            r for r in rows
+            if r["score"] is not None and r["score"] < score_threshold
+        ]
+
+    responses = []
+    for row in rows:
+        model_name = str(row["model_name"] or "unknown")
+        raw_sources = _normalize_sources(row["sources"], model_name)
+        citations = []
+        for s in raw_sources:
+            citations.append({
+                "url": s.url or "",
+                "title": s.title or "",
+                "domain": s.domain or "",
+                "content": s.excerpt or "",
+                "competitor": s.competitor,
+            })
+
+        timestamp = ""
+        if row["created_at"]:
+            if hasattr(row["created_at"], "isoformat"):
+                timestamp = row["created_at"].isoformat()
+            else:
+                timestamp = str(row["created_at"])
+
+        responses.append({
+            "audit_score_id": row["audit_score_id"],
+            "prompt_id": str(row["prompt_id"]),
+            "prompt": row["prompt_text"] or "",
+            "intent_category": row["intent_category"] or "",
+            "model": model_name,
+            "score": float(row["score"]) if row["score"] is not None else None,
+            "region": row["region"] or "",
+            "timestamp": timestamp,
+            "answer": row["response_text"] or "",
+            "citations": citations,
+        })
+
+    return {
+        "campaign": campaign,
+        "project": project,
+        "responses": responses,
+        "source_content": {},
+    }

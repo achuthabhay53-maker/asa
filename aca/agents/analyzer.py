@@ -1,2725 +1,2643 @@
-"""
-ACA Source Analyzer.
+"""AImpact Source Intelligence Analyzer.
 
-Responsibilities
-----------------
-1. Read underperforming AImpact prompt evidence.
-2. Analyze cited sources with Claude Haiku.
-3. Fetch cited source pages through the SourceFetcher abstraction.
-4. Verify candidate claims and candidate themes against fetched page text.
-5. Deterministically validate evidence quotes.
-6. Verify candidate competitors conservatively.
-7. Produce an evidence-based ContentGap.
 
-Important boundary
-------------------
-This agent does NOT establish that the target company's website has
-a content gap.
 
-Target-site coverage remains "unknown" unless a separate target-site
-content inventory is supplied and analyzed.
+Connects to AImpact PostgreSQL to extract AI prompts, model responses, and citations,
 
-The Source Analyzer answers:
+then analyzes each low-scoring prompt individually as well as producing an aggregated
 
-    "What does the AI-visible source evidence tell us?"
+cross-prompt intelligence report.
 
-It does not answer:
 
-    "What exact article should we write?"
 
-That is the Brief Agent's responsibility.
+Report Structure:
+
+    report
+
+    ├── campaign_summary
+
+    ├── low_scoring_summary
+
+    ├── prompt_analysis
+
+    │   ├── prompt_1
+
+    │   ├── prompt_2
+
+    │   └── ...
+
+    └── cross_prompt_insights
+
+
+
+Run directly from CLI:
+
+    python .\\\aca\\\agents\\\analyzer.py
+
+    python .\\\aca\\\agents\\\analyzer.py --campaign-id 81 --score-threshold 70 --output report.json
+
 """
 
 from __future__ import annotations
 
-import os
-import re
-from typing import Literal
-from urllib.parse import urlparse
 
-from dotenv import load_dotenv
-from langchain_anthropic import ChatAnthropic
-from pydantic import BaseModel, Field, field_validator
+
+import argparse
+
+import anthropic
+
+import json
+
+import os
+
+import re
+
+import sys
+
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from datetime import datetime, timezone
+
+from pathlib import Path
+
+from typing import Any
+
+from urllib.parse import urlsplit, urlunsplit
+
+
+
+# Ensure project root is in sys.path when executed directly as a script
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
+if str(PROJECT_ROOT) not in sys.path:
+
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+
+
+try:
+
+    import tldextract
+
+except ImportError:
+
+    tldextract = None
+
+
 
 from aca.orchestrator.state import (
-    AnalyzedSource,
+
     ContentGap,
-    CitedSource,
-    PromptEvidence,
-    SourceClaimAssessment,
-    TargetSiteDiagnostic,
-    TargetSiteEvidence,
-    ThemeAssessment,
-    ThemeEvidence,
+
     WorkflowState,
-)
-from aca.tools.source_fetcher import (
-    FetchedPage,
-    SiteSearchCandidates,
-    get_source_fetcher,
+
 )
 
-load_dotenv()
+from aca.tools.aimpact import (
 
+    get_campaign,
 
-# ---------------------------------------------------------------------------
-# LLM output schemas
-# ---------------------------------------------------------------------------
+    get_campaign_audit_dataset,
 
+    get_project,
 
-class SourceAnalysis(BaseModel):
-    """First-pass analysis of one cited source."""
+)
 
-    source_id: str
 
-    competitor: str | None = None
 
-    contribution: str
+HAIKU_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
+MAX_CONCURRENT = 12
 
-    claims_to_verify: list[str] = Field(
-        default_factory=list,
-        max_length=3,
-    )
+TOP_DOMAIN_COUNT = 5
 
-    # Specific, checkable target-site coverage questions.
-    themes: list[str] = Field(
-        default_factory=list,
-        max_length=5,
-    )
-
-
-class SourceAnalyzerOutput(BaseModel):
-    """First-pass Source Analyzer output."""
-
-    source_analyses: list[SourceAnalysis] = Field(
-        default_factory=list,
-        max_length=100,
-    )
-
-    themes: list[str] = Field(
-        default_factory=list,
-        max_length=20,
-    )
-
-    visibility_gap: str
-
-    editorial_angle: str
-
-    hypothesis: str
-
-
-class ClaimCheck(BaseModel):
-    """Verification result for one candidate claim."""
-
-    source_id: str
-
-    claim: str
-
-    verdict: Literal[
-        "supported",
-        "contradicted",
-        "not_found",
-        "inconclusive",
-        "unavailable",
-    ]
-
-    evidence_quote: str | None = None
-
-
-class ThemeCheck(BaseModel):
-    """Verification result for one candidate theme."""
-
-    source_id: str
-
-    theme: str
-
-    verdict: Literal[
-        "supported",
-        "contradicted",
-        "not_found",
-        "inconclusive",
-        "unavailable",
-    ]
-
-    evidence_quote: str | None = None
-
-    @field_validator("theme", mode="before")
-    @classmethod
-    def _empty_missing_theme(cls, value):
-        return value.strip() if isinstance(value, str) else ""
-
-
-class SourceVerificationOutput(BaseModel):
-    """Second-pass verification output."""
-
-    claim_checks: list[ClaimCheck] = Field(
-        default_factory=list,
-        max_length=100,
-    )
-
-    theme_checks: list[ThemeCheck] = Field(
-        default_factory=list,
-        max_length=800,
-    )
-
-
-class TargetSiteVerificationOutput(BaseModel):
-    """Theme coverage checks against target-site pages."""
-
-    theme_checks: list[ThemeCheck] = Field(
-        default_factory=list,
-        max_length=800,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Normalization helpers
-# ---------------------------------------------------------------------------
-
-
-def _normalize(value: str) -> str:
-    """
-    Normalize text for conservative matching.
-
-    This is intentionally simple. We do not use fuzzy semantic matching
-    here because verification should be deterministic.
-    """
-
-    value = value.lower().strip()
-
-    value = re.sub(
-        r"[^a-z0-9\s-]",
-        "",
-        value,
-    )
-
-    value = re.sub(
-        r"\s+",
-        " ",
-        value,
-    )
-
-    return value.strip()
-
-
-def _theme_key(theme: str) -> str:
-    """
-    Conservative theme canonicalization.
-
-    Only collapses obvious wording variants. It does not attempt
-    semantic clustering because that could incorrectly merge
-    distinct research concepts.
-    """
-
-    normalized = _normalize(theme)
-
-    replacements = (
-        (" platforms and technologies", " platforms"),
-        (" platform and technologies", " platform"),
-        (" technologies and platforms", " platforms"),
-        (" technologies", " technology"),
-    )
-
-    for old, new in replacements:
-        if normalized.endswith(old):
-            normalized = normalized[: -len(old)] + new
-
-    return normalized.strip()
-
-
-def _dedupe_themes(themes: list[str]) -> list[str]:
-    """
-    Preserve the first human-readable form of each normalized theme.
-    """
-
-    seen: set[str] = set()
-    result: list[str] = []
-
-    for theme in themes:
-        theme = theme.strip()
-
-        if not theme:
-            continue
-
-        key = _theme_key(theme)
-
-        if not key or key in seen:
-            continue
-
-        seen.add(key)
-        result.append(theme)
-
-    return result
-
-
-def _select_candidate_themes(
-    *,
-    global_themes: list[str],
-    analyses: list[SourceAnalysis],
-    limit: int = 8,
-) -> list[str]:
-    """Select a compact, source-backed theme shortlist for verification."""
-
-    source_counts: dict[str, int] = {}
-    candidates: list[str] = []
-
-    for analysis in analyses:
-        source_keys = {
-            _theme_key(theme)
-            for theme in analysis.themes
-            if _theme_key(theme)
-        }
-        for key in source_keys:
-            source_counts[key] = source_counts.get(key, 0) + 1
-        candidates.extend(analysis.themes)
-
-    candidates = _dedupe_themes(candidates)
-    global_rank = {
-        _theme_key(theme): index
-        for index, theme in enumerate(global_themes)
-    }
-    original_rank = {
-        _theme_key(theme): index
-        for index, theme in enumerate(candidates)
-    }
-
-    candidates.sort(
-        key=lambda theme: (
-            -source_counts.get(_theme_key(theme), 0),
-            global_rank.get(_theme_key(theme), len(global_rank)),
-            original_rank[_theme_key(theme)],
-        )
-    )
-
-    return candidates[:limit]
-
-
-def _build_hypothesis(
-    *,
-    company_name: str,
-    verified_themes: list[str],
-    candidate_themes: list[str],
-    target_site_observation: str | None = None,
-) -> str:
-    if verified_themes:
-        citation_observation = (
-            "The sampled AI responses cite pages with verified coverage of: "
-            + ", ".join(verified_themes)
-            + "."
-        )
-    elif candidate_themes:
-        citation_observation = (
-            "The cited sources proposed these topics for investigation: "
-            + ", ".join(candidate_themes)
-            + "; none met the page-verification threshold."
-        )
-    else:
-        citation_observation = (
-            "The cited-source evidence did not establish a verified theme."
-        )
-
-    site_observation = target_site_observation or (
-        f"{company_name}'s actual site coverage has not been assessed."
-    )
-
-    return (
-        f"{citation_observation} This describes the sampled citation "
-        f"set only. {site_observation} The absence of the company from "
-        "the citations alone is not evidence of missing website content."
-    )
-
-
-def _quote_is_present(
-    quote: str | None,
-    page_text: str,
-) -> bool:
-    """
-    Deterministically verify that the LLM's evidence quote actually
-    occurs in fetched page text.
-
-    Matching is whitespace-normalized and case-insensitive.
-    """
-
-    if not quote or not quote.strip():
-        return False
-
-    normalized_quote = _normalize_whitespace(quote)
-    normalized_page = _normalize_whitespace(page_text)
-
-    if not normalized_quote:
-        return False
-
-    return normalized_quote.lower() in normalized_page.lower()
-
-
-def _claim_quote_is_valid(
-    check: ClaimCheck,
-    page: FetchedPage | None,
-) -> bool:
-    if not (
-        check.verdict == "supported"
-        and check.evidence_quote
-        and page is not None
-        and page.success
-        and _quote_is_present(
-            check.evidence_quote,
-            page.content,
-        )
-    ):
-        return False
-
-    claim = _normalize(check.claim)
-    quote = _normalize(check.evidence_quote)
-    claim_is_normative = any(
-        term in claim
-        for term in (
-            "standard",
-            "standards",
-            "guideline",
-            "guidelines",
-            "recommendation",
-            "recommendations",
-            "requirement",
-            "requirements",
-        )
-    )
-    quote_only_states_aim = any(
-        phrase in quote
-        for phrase in (
-            "aim of this review",
-            "aim of the review",
-            "objective of this review",
-            "objective of the review",
-            "purpose of this review",
-            "purpose of the review",
-            "aim of this study",
-            "objective of this study",
-            "purpose of this study",
-        )
-    )
-    if claim_is_normative and quote_only_states_aim:
-        return False
-
-    named_entities = (
-        "thermo fisher scientific",
-        "thermo fisher",
-        "sigma aldrich",
-        "milliplex",
-        "bio techne",
-        "r&d systems",
-        "rd systems",
-        "bio rad",
-        "bio plex",
-        "meso scale discovery",
-        "mesoscale",
-        "raybiotech",
-        "creative proteomics",
-        "creative biomart",
-        "olink",
-        "luminex",
-        "xmap",
-        "u plex",
-        "s plex",
-        "nulisa",
-        "nulisa seq",
-        "abcam",
-    )
-    for entity in named_entities:
-        normalized_entity = _normalize(entity)
-        if normalized_entity in claim and normalized_entity not in quote:
-            return False
-
-    return True
-
-
-def _classify_target_fetch_failure(
-    page: FetchedPage,
-) -> str:
-    error = (page.error or "").lower()
-    path = urlparse(page.url).path.lower()
-
-    if any(
-        marker in error
-        for marker in (
-            "robots.txt",
-            "blocked by robots",
-            "robots exclusion",
-            "forbidden",
-            "access denied",
-            "status code 401",
-            "status code 403",
-            "http 401",
-            "http 403",
-        )
-    ):
-        return "robots/access restriction"
-
-    if any(
-        marker in error
-        for marker in (
-            "unsupported content type",
-            "application/pdf",
-            "image/",
-            "rss feed",
-            "atom feed",
-            "not html",
-        )
-    ) or path.endswith(
-        (
-            ".pdf",
-            ".png",
-            ".jpg",
-            ".jpeg",
-            ".gif",
-            ".webp",
-            ".svg",
-            ".rss",
-            ".atom",
-            ".xml",
-            ".mp4",
-        )
-    ):
-        return "non-HTML content"
-
-    if any(
-        marker in error
-        for marker in (
-            "redirect",
-            "timed out",
-            "timeout",
-            "connection",
-            "dns",
-            "tls",
-            "ssl",
-            "status code 3",
-            "status code 4",
-            "status code 5",
-            "http 3",
-            "http 4",
-            "http 5",
-        )
-    ):
-        return "HTTP/redirect failure"
-
-    if page.failure_stage == "tavily_batch":
-        return "Tavily batch/extraction behavior"
-
-    if page.failure_stage in {
-        "tavily_failed_result",
-        "tavily_empty_content",
-    }:
-        return "Tavily extraction failure"
-
-    return "other error"
-
-
-def _normalize_whitespace(value: str) -> str:
-    return re.sub(
-        r"\s+",
-        " ",
-        value,
-    ).strip()
-
-
-def _safe_domain(url: str | None) -> str | None:
-    if not url:
-        return None
-
-    try:
-        hostname = urlparse(url).hostname
-    except ValueError:
-        return None
-
-    if not hostname:
-        return None
-
-    return hostname.lower()
-
-
-_KNOWN_DOMAIN_ENTITIES = {
-    "thermofisher.com": "Thermo Fisher Scientific",
-    "sigmaaldrich.com": "Sigma-Aldrich",
-    "bio-techne.com": "Bio-Techne",
-    "rndsystems.com": "Bio-Techne",
-    "biorad.com": "Bio-Rad",
-    "mesoscale.com": "Meso Scale Discovery",
-    "meso-scale.com": "Meso Scale Discovery",
-    "raybiotech.com": "RayBiotech",
-    "creative-proteomics.com": "Creative Proteomics",
-    "olink.com": "Olink",
-    "abcam.com": "Abcam",
-    "evotec.com": "Evotec",
+NON_SOURCE_DOMAINS = {
+    "google.com",
+    "www.google.com",
+    "bing.com",
+    "www.bing.com",
+    "search.yahoo.com",
+    "www.search.yahoo.com",
+    "duckduckgo.com",
+    "www.duckduckgo.com",
 }
+HAIKU_MAX_TOKENS = 3000
 
+SOURCE_TYPE_RULES = [
 
-def _entity_from_domain(url: str | None) -> str | None:
-    domain = _safe_domain(url)
-    if not domain:
-        return None
+    (
 
-    return next(
+        "research_or_academic",
+
         (
-            entity
-            for known_domain, entity in _KNOWN_DOMAIN_ENTITIES.items()
-            if domain == known_domain or domain.endswith(f".{known_domain}")
-        ),
-        None,
-    )
 
+            "pubmed.",
 
-def _classify_source_type(
-    *,
-    url: str | None,
-    title: str | None = None,
-) -> Literal["commercial", "academic", "educational", "unknown"]:
-    domain = _safe_domain(url) or ""
-    path = urlparse(url or "").path.lower()
-    normalized_title = _normalize(title or "")
-
-    if (
-        domain.endswith(".edu")
-        or domain.endswith(".gov")
-        or domain in {
-            "pubmed.ncbi.nlm.nih.gov",
-            "ncbi.nlm.nih.gov",
-            "pmc.ncbi.nlm.nih.gov",
-            "arxiv.org",
-            "doi.org",
-            "frontiersin.org",
             "nature.com",
-            "jci.org",
-        }
-        or "/pmc/articles/" in path
-        or "journal" in path
-        or "review" in normalized_title
-    ):
-        return "academic"
 
-    if any(
-        marker in path
-        for marker in (
-            "/knowledge-center/",
-            "/technical-documents/",
-            "/education/",
-            "/learn/",
-            "/blog/",
-            "/publication/",
-            "/publications/",
-        )
-    ):
-        return "educational"
+            "sciencedirect.com",
 
-    if _entity_from_domain(url) or any(
-        marker in path
-        for marker in (
-            "/products/",
-            "/product/",
-            "/services/",
-            "/solutions/",
-            "/assays/",
-            "/panels/",
-            "/platform/",
-            "/sciencepool/",
-        )
-    ):
-        return "commercial"
+            "springer.com",
 
-    return "unknown"
+            "arxiv.org",
+
+            "doi.org",
+
+            "ncbi.nlm.nih.gov",
+
+            "nih.gov",
+
+            "cell.com",
+
+            "biorxiv.org",
+
+            "medrxiv.org",
+
+            "wiley.com",
+
+            "frontiersin.org",
+
+            "thelancet.com",
+
+            "academic.",
+
+            "broadinstitute.org",
+
+            ".edu",
+
+        ),
+
+    ),
+
+    (
+
+        "government_or_public_sector",
+
+        (
+
+            ".gov",
+
+            ".gov.uk",
+
+            ".gov.in",
+
+            "europa.eu",
+
+            "who.int",
+
+            "cdc.gov",
+
+            "fda.gov",
+
+        ),
+
+    ),
+
+    (
+
+        "commercial_or_vendor",
+
+        (
+
+            "sigmaaldrich.",
+
+            "thermofisher.",
+
+            "criver.",
+
+            "alamarbio.",
+
+            "evetechnologies.",
+
+            "crownbio.",
+
+            "quanterix.",
+
+            "creative-proteomics.",
+
+            "bio-rad.",
+
+            "abcam.",
+
+            "merck.",
+
+            "cellsignal.",
+
+            "rndsystems.",
+
+            "illumina.",
+
+            "olink.",
+
+            "bio-techne.",
+
+            "mesoscale.",
+
+            "cellcarta.",
+
+            "oncimmune.",
+
+            "axispharm.",
+
+            "biomere.",
+
+            "immunologixlabs.",
+
+            "biopharmiq.",
+
+            "arborassays.",
+
+            "precisionformedicine.",
+
+            "biotech",
+
+            "pharma",
+
+            "labs.com",
+
+            "/product",
+
+            "/services",
+
+            "/solutions",
+
+            "corp.",
+
+            "inc.",
+
+        ),
+
+    ),
+
+    (
+
+        "industry_analyst_or_market_report",
+
+        (
+
+            "marketsandmarkets.",
+
+            "rootsanalysis.",
+
+            "mordorintelligence.",
+
+            "grandviewresearch.",
+
+            "fortunebusinessinsights.",
+
+            "verifiedmarketresearch.",
+
+            "globenewswire.com",
+
+            "prnewswire.com",
+
+            "businesswire.com",
+
+        ),
+
+    ),
+
+    (
+
+        "community_or_forum",
+
+        (
+
+            "reddit.com",
+
+            "quora.com",
+
+            "stackoverflow.com",
+
+            "stackexchange.com",
+
+            "community.",
+
+        ),
+
+    ),
+
+    (
+
+        "video_or_social",
+
+        (
+
+            "youtube.com",
+
+            "youtu.be",
+
+            "linkedin.com",
+
+            "facebook.com",
+
+            "instagram.com",
+
+            "tiktok.com",
+
+            "twitter.com",
+
+            "x.com",
+
+        ),
+
+    ),
+
+    (
+
+        "review_or_directory",
+
+        (
+
+            "g2.com",
+
+            "capterra.com",
+
+            "trustpilot.com",
+
+            "yelp.com",
+
+            "tripadvisor.com",
+
+        ),
+
+    ),
+
+    (
+
+        "news_or_publisher",
+
+        (
+
+            "reuters.com",
+
+            "bbc.com",
+
+            "cnn.com",
+
+            "forbes.com",
+
+            "techcrunch.com",
+
+            "nytimes.com",
+
+            "bloomberg.com",
+
+            "wsj.com",
+
+        ),
+
+    ),
+
+]
 
 
-def _classify_target_page_type(
-    *,
-    url: str,
-    title: str | None,
-) -> str:
-    path = urlparse(url).path.lower()
-    normalized_title = _normalize(title or "")
 
-    if any(
-        marker in path
-        for marker in ("/publication/", "/publications/", "/papers/", "/journal/")
-    ) or any(
-        marker in normalized_title
-        for marker in ("clinical study", "research study", "published in", "journal article")
-    ):
-        return "publication"
+CONTENT_TYPE_RULES = [
 
-    if any(marker in path for marker in ("/blog/", "/news/", "/insights/")):
-        return "blog/news"
+    (
 
-    if any(
-        marker in path
-        for marker in (
-            "/product/",
-            "/products/",
-            "/service/",
-            "/services/",
-            "/technology/",
-            "/platform/",
-            "/assays/",
-            "/panels/",
-        )
-    ):
-        return "product/service/technology"
+        "comparison_or_buyer_guide",
 
-    if any(marker in path for marker in ("/event/", "/events/", "/webinar/")):
-        return "event"
+        (
 
-    return "general page"
+            "compare",
+
+            "comparison",
+
+            "versus",
+
+            " vs ",
+
+            "best ",
+
+            "top ",
+
+            "alternatives",
+
+        ),
+
+    ),
+
+    ("review", ("review", "pros and cons", "rating", "customer reviews")),
+
+    (
+
+        "research_or_study",
+
+        (
+
+            "research",
+
+            "study",
+
+            "methodology",
+
+            "experiment",
+
+            "dataset",
+
+            "findings",
+
+            "clinical",
+
+            "trial",
+
+        ),
+
+    ),
+
+    (
+
+        "news_or_article",
+
+        ("news", "announced", "reportedly", "journalist", "press release"),
+
+    ),
+
+    (
+
+        "documentation_or_reference",
+
+        (
+
+            "documentation",
+
+            "docs",
+
+            "api reference",
+
+            "manual",
+
+            "specification",
+
+            "guideline",
+
+            "protocol",
+
+        ),
+
+    ),
+
+    (
+
+        "product_or_service_page",
+
+        (
+
+            "pricing",
+
+            "features",
+
+            "product",
+
+            "plans",
+
+            "request a demo",
+
+            "platform",
+
+            "assay",
+
+        ),
+
+    ),
+
+    (
+
+        "community_discussion",
+
+        ("reddit", "forum", "thread", "discussion", "question"),
+
+    ),
+
+    (
+
+        "educational_guide",
+
+        (
+
+            "how to",
+
+            "guide",
+
+            "tutorial",
+
+            "what is",
+
+            "explained",
+
+            "definition",
+
+            "overview",
+
+        ),
+
+    ),
+
+]
 
 
-# ---------------------------------------------------------------------------
-# Competitor verification
-# ---------------------------------------------------------------------------
 
 
-def _competitor_appears_in_page(
-    candidate: str,
-    page: FetchedPage,
-) -> bool:
-    """
-    Conservative competitor verification.
 
-    The candidate must actually appear in the fetched page content
-    or in the fetched URL/domain.
+def normalize_url(raw_url: str) -> str:
 
-    We intentionally do NOT maintain a large alias map because aliases
-    can silently turn brands into companies or parent companies.
-    """
+    raw_url = (raw_url or "").strip()
 
-    if not candidate:
-        return False
+    if not raw_url:
 
-    candidate_normalized = _normalize(candidate)
+        return ""
 
-    if not candidate_normalized:
-        return False
+    if not urlsplit(raw_url).scheme:
 
-    page_content = _normalize(
-        page.content,
+        raw_url = "https://" + raw_url
+
+    parts = urlsplit(raw_url)
+
+    host = (parts.hostname or "").lower()
+
+    if not host:
+
+        return raw_url
+
+    if host.startswith("www."):
+
+        host = host[4:]
+
+    tracking = {"gclid", "fbclid", "ref", "source"}
+
+    query = "&".join(
+
+        item
+
+        for item in (parts.query.split("&") if parts.query else [])
+
+        if not item.split("=", 1)[0].lower().startswith("utm_")
+
+        and item.split("=", 1)[0].lower() not in tracking
+
     )
 
-    page_url = _normalize(
-        page.url,
-    )
-
-    if candidate_normalized in page_content:
-        return True
-
-    # Domain check is deliberately conservative.
-    domain = _safe_domain(page.url)
-
-    if domain:
-        domain_normalized = _normalize(domain)
-
-        candidate_tokens = [
-            token
-            for token in candidate_normalized.split()
-            if len(token) >= 4
-        ]
-
-        if candidate_tokens and all(
-            token in domain_normalized
-            for token in candidate_tokens
-        ):
-            return True
-
-    if candidate_normalized in page_url:
-        return True
-
-    return False
-
-
-def _verify_competitor(
-    candidate: str | None,
-    page: FetchedPage | None,
-    company_name: str,
-    relevant: bool,
-    source_type: str | None = None,
-) -> tuple[
-    str | None,
-    Literal[
-        "verified",
-        "unverified",
-        "unavailable",
-        "not_identified",
-    ],
-]:
-    """
-    Return the verified competitor and verification status.
-
-    Candidate names remain separate from verified names.
-
-    A candidate is never promoted to verified merely because:
-      - Haiku suggested it
-      - the source URL fetched successfully
-      - the domain is generally related to the candidate
-    """
-
-    if page is None:
-        return None, "unavailable"
-
-    if not page.success:
-        return None, "unavailable"
-
-    source_type = source_type or _classify_source_type(
-        url=page.url,
-        title=page.title,
-    )
-    if source_type != "commercial":
-        return None, "not_identified"
-
-    candidate = (
-        candidate.strip()
-        if candidate and candidate.strip()
-        else _entity_from_domain(page.url)
-    )
-    if not candidate:
-        return None, "not_identified"
-
-    # Do not classify the target company itself as a competitor.
-    if _normalize(candidate) == _normalize(company_name):
-        return None, "not_identified"
-
-    if not relevant:
-        return None, "unverified"
-
-    if _competitor_appears_in_page(
-        candidate=candidate,
-        page=page,
-    ):
-        return candidate, "verified"
-
-    return None, "unverified"
-
-
-# ---------------------------------------------------------------------------
-# Source contribution
-# ---------------------------------------------------------------------------
-
-
-def _build_verified_contribution(
-    *,
-    candidate_contribution: str,
-    claim_checks: list[ClaimCheck],
-    page: FetchedPage | None,
-) -> str:
-    """
-    Build source contribution from verification results.
-
-    We avoid presenting an unverified LLM interpretation as factual.
-    """
-
-    if page is None or not page.success:
-        return (
-            "Source page was unavailable, so the proposed contribution "
-            "could not be verified."
-        )
-
-    supported = [
-        check.claim
-        for check in claim_checks
-        if _claim_quote_is_valid(check, page)
-    ]
-
-    contradicted = [
-        check.claim
-        for check in claim_checks
-        if check.verdict == "contradicted"
-    ]
-
-    not_found = [
-        check.claim
-        for check in claim_checks
-        if check.verdict == "not_found"
-    ]
-
-    inconclusive = [
-        check.claim
-        for check in claim_checks
-        if check.verdict == "inconclusive"
-    ]
-
-    parts: list[str] = []
-
-    if supported:
-        parts.append(
-            "Verified claims: "
-            + "; ".join(supported)
-        )
-
-    if contradicted:
-        parts.append(
-            "Contradicted claims: "
-            + "; ".join(contradicted)
-        )
-
-    if not_found:
-        parts.append(
-            "Claims not found: "
-            + "; ".join(not_found)
-        )
-
-    if inconclusive:
-        parts.append(
-            "Inconclusive claims: "
-            + "; ".join(inconclusive)
-        )
-
-    if parts:
-        return " ".join(parts)
-
-    return (
-        "The source was fetched successfully, but no proposed claims "
-        "were verified against the fetched page."
-    )
-
-
-# ---------------------------------------------------------------------------
-# Verification status
-# ---------------------------------------------------------------------------
-
-
-def _overall_verification_status(
-    *,
-    fetched_count: int,
-    total_sources: int,
-    claim_checks: list[ClaimCheck],
-    theme_evidence: list[ThemeEvidence],
-) -> Literal[
-    "verified",
-    "partially_verified",
-    "unverified",
-    "unavailable",
-]:
-    if total_sources == 0:
-        return "unavailable"
-
-    if fetched_count == 0:
-        return "unavailable"
-
-    supported_claims = sum(
-        1
-        for check in claim_checks
-        if check.verdict == "supported"
-    )
-
-    supported_themes = len(theme_evidence)
-
-    if (
-        fetched_count == total_sources
-        and claim_checks
-        and all(
-            check.verdict == "supported"
-            for check in claim_checks
-        )
-    ):
-        return "verified"
-
-    if supported_claims > 0 or supported_themes > 0:
-        return "partially_verified"
-
-    return "unverified"
-
-
-def _verification_summary(
-    *,
-    total_sources: int,
-    fetched_count: int,
-    claim_checks: list[ClaimCheck],
-    theme_checks: list[ThemeCheck],
-    theme_evidence: list[ThemeEvidence],
-) -> str:
-    verified_claims = sum(
-        1
-        for check in claim_checks
-        if check.verdict == "supported"
-    )
-
-    verified_themes = len(
-        {
-            _theme_key(evidence.theme)
-            for evidence in theme_evidence
-        }
-    )
-
-    candidate_theme_count = len(
-        {
-            _theme_key(check.theme)
-            for check in theme_checks
-        }
-    )
-
-    unavailable_sources = total_sources - fetched_count
-
-    summary = (
-        f"Fetched {fetched_count} of {total_sources} cited sources. "
-        f"Verified {verified_claims} of {len(claim_checks)} candidate claims "
-        f"and {verified_themes} of {candidate_theme_count} candidate themes "
-        f"against fetched page text."
-    )
-
-    if unavailable_sources:
-        summary += (
-            f" {unavailable_sources} cited sources were unavailable."
-        )
-
-    summary += (
-        " Target-site coverage remains unknown and no content gap "
-        "has been established."
-    )
-
-    return summary
-
-
-def _complete_theme_checks(
-    *,
-    analyses: list[SourceAnalysis],
-    fetched_pages: dict[str, FetchedPage],
-    returned_checks: list[ThemeCheck],
-) -> list[ThemeCheck]:
-    """Return one evidence-validated result for every expected source/theme pair."""
-
-    expected: dict[tuple[str, str], str] = {}
-    for analysis in analyses:
-        for theme in analysis.themes:
-            key = _theme_key(theme)
-            if key:
-                expected.setdefault(
-                    (analysis.source_id, key),
-                    theme.strip(),
-                )
-
-    returned: dict[tuple[str, str], list[ThemeCheck]] = {}
-    for check in returned_checks:
-        key = _theme_key(check.theme)
-        if not key:
-            continue
-        pair = (check.source_id, key)
-        if pair in expected:
-            returned.setdefault(pair, []).append(check)
-
-    completed: list[ThemeCheck] = []
-    for (source_id, theme_key), theme in expected.items():
-        page = fetched_pages.get(source_id)
-        if page is None or not page.success:
-            completed.append(
-                ThemeCheck(
-                    source_id=source_id,
-                    theme=theme,
-                    verdict="unavailable",
-                )
-            )
-            continue
-
-        checks = returned.get((source_id, theme_key), [])
-        supported = next(
-            (
-                check
-                for check in checks
-                if check.verdict == "supported"
-                and check.evidence_quote
-                and _quote_is_present(
-                    check.evidence_quote,
-                    page.content,
-                )
-            ),
-            None,
-        )
-        if supported is not None:
-            completed.append(
-                ThemeCheck(
-                    source_id=source_id,
-                    theme=theme,
-                    verdict="supported",
-                    evidence_quote=supported.evidence_quote,
-                )
-            )
-            continue
-
-        contradicted = next(
-            (
-                check
-                for check in checks
-                if check.verdict == "contradicted"
-                and check.evidence_quote
-                and _quote_is_present(
-                    check.evidence_quote,
-                    page.content,
-                )
-            ),
-            None,
-        )
-        if contradicted is not None:
-            completed.append(
-                ThemeCheck(
-                    source_id=source_id,
-                    theme=theme,
-                    verdict="contradicted",
-                    evidence_quote=contradicted.evidence_quote,
-                )
-            )
-            continue
-
-        non_support_result = next(
-            (
-                check
-                for check in checks
-                if check.verdict
-                not in {"supported", "contradicted", "unavailable"}
-            ),
-            None,
-        )
-        completed.append(
-            ThemeCheck(
-                source_id=source_id,
-                theme=theme,
-                verdict=(
-                    non_support_result.verdict
-                    if non_support_result is not None
-                    else "inconclusive"
-                ),
-            )
-        )
-
-    return completed
-
-
-# ---------------------------------------------------------------------------
-# Source Analyzer
-# ---------------------------------------------------------------------------
-
-
-class SourceAnalyzer:
-    """
-    Source-driven AI visibility analyzer.
-
-    Uses:
-        Haiku -> candidate analysis
-        Tavily -> page extraction
-        Haiku -> claim/theme verification
-        Python -> deterministic evidence validation
+    path = re.sub(r"/{2,}", "/", parts.path or "/")
+
+    if path != "/":
+
+        path = path.rstrip("/")
+
+    return urlunsplit((parts.scheme.lower() or "https", host, path, query, ""))
+
+
+
+
+
+def is_grounding_redirect(url: str) -> bool:
+
+    return "vertexaisearch.cloud.google.com" in url and "grounding-api-redirect" in url
+
+
+
+
+
+def get_domain(url: str) -> str:
+
+    host = (urlsplit(url).hostname or "").lower()
+
+    if host.startswith("www."):
+
+        host = host[4:]
+
+    if not host:
+
+        return "unknown"
+
+    if tldextract:
+
+        extracted = tldextract.extract(host)
+
+        if extracted.domain and extracted.suffix:
+
+            return f"{extracted.domain}.{extracted.suffix}"
+
+    return host
+
+
+
+
+
+def resolve_citation(raw_url: str, title: str = "") -> tuple[str, str]:
+
     """
 
-    def __init__(self) -> None:
-        self.model = ChatAnthropic(
-            model="claude-haiku-4-5-20251001",
-            temperature=0,
-        )
+    Returns (clean_url, domain).
 
-        self.fetcher = get_source_fetcher()
+    Resolves Google Search grounding redirects to their real domain
 
-    # ------------------------------------------------------------------
-    # First pass
-    # ------------------------------------------------------------------
+    using the title when available.
 
-    def _analyze_candidates(
-        self,
-        *,
-        company: dict,
-        prompt_evidence: PromptEvidence,
-        sources: list[tuple[str, CitedSource]],
-    ) -> SourceAnalyzerOutput:
-        source_text = []
+    """
 
-        for source_id, source in sources:
-            source_text.append(
-                f"""
-SOURCE {source_id}
-Model: {source.model}
-URL: {source.url}
-Domain: {source.domain}
-Existing competitor label: {source.competitor}
-Excerpt:
-{source.excerpt}
-""".strip()
-            )
+    clean_url = normalize_url(raw_url)
 
-        joined_sources = "\n\n".join(source_text)
+    if is_grounding_redirect(clean_url):
 
-        system_prompt = """
-You are the Source Analyzer for an AI visibility/content system.
+        title_stripped = (title or "").strip().lower()
 
-Your job is to analyze the evidence that AI systems cited when answering
-a user's research prompt.
+        if tldextract:
 
-You are NOT a keyword researcher.
+            extracted = tldextract.extract(title_stripped)
 
-You must NOT invent:
-- competitors
-- claims
-- URLs
-- products
-- capabilities
-- target-site content gaps
+            if extracted.domain and extracted.suffix:
 
-You may identify:
-- what each cited source contributes
-- candidate competitors
-- candidate themes
-- evidence-based visibility patterns
-- an editorial angle
-- a hypothesis about why the cited sources are useful
+                domain = f"{extracted.domain}.{extracted.suffix}"
 
-Important:
-A target-site content gap cannot be established from competitor/source
-evidence alone.
+                resolved_url = (
 
-The target company website has NOT been inspected by this agent.
+                    title_stripped
 
-Candidate themes must be specific, checkable content-coverage questions
-grounded in the cited material. They are not broad subject labels.
+                    if title_stripped.startswith("http")
 
-Each question must be narrow enough that a target-site page can clearly
-answer it with evidence. Prefer a concrete application, audience need,
-comparison, workflow, or capability over a generic topic name.
+                    else f"https://{title_stripped}"
 
-Good examples:
-- Does the site explain neurology biomarker panels for CSF or plasma?
-- Does the site compare NULISA with Luminex-based multiplex assays or Olink/PEA?
-- Does the site explain multiplex assay options for oncology immune profiling?
-- Does the site describe how multiplex panels are used for inflammatory biomarkers?
-
-Bad examples:
-- Multiplex protein assays
-- Immunology
-- Proteomics
-- Research
-- Scientific information
-
-Keep each question concise enough to use as a website search query.
-Do not invent facts about the target company; the question must come from
-the cited source evidence.
-
-For each source:
-- explain its contribution to the AI answer
-- propose at most 3 claims that can be checked against the source page
-- propose at most 5 themes directly represented by that source
-- identify a candidate competitor only when the source clearly represents
-    a company's product, platform, or service that is relevant to the user's
-    prompt; a passing mention or citation is not enough
-
-Do not infer hidden model reasoning or infer website absence from missing
-citations. Describe the citation set; do not claim why a model selected it.
-"""
-
-        user_prompt = f"""
-TARGET COMPANY
-Name: {company.get("company_name")}
-Website: {company.get("company_url")}
-Region: {company.get("region")}
-
-AI PROMPT
-{prompt_evidence.prompt_text}
-
-AI MODEL EVIDENCE
-{joined_sources}
-
-Produce the structured Source Analyzer output.
-
-The visibility_gap should describe an evidence-based AI visibility
-observation, not a confirmed website content gap.
-
-The editorial_angle should describe what a future content strategy
-could investigate based on the cited evidence.
-
-For the themes field, return a short list of specific, checkable
-content-coverage questions. Do not return broad topic labels. Each
-question must be grounded in the cited evidence and narrow enough that
-a target-site page can answer it with a yes/no-style evidence check.
-
-The hypothesis should clearly distinguish observed evidence from
-inference.
-"""
-
-        structured = self.model.with_structured_output(
-            SourceAnalyzerOutput
-        )
-
-        return structured.invoke(
-            [
-                (
-                    "system",
-                    system_prompt,
-                ),
-                (
-                    "human",
-                    user_prompt,
-                ),
-            ]
-        )
-
-    # ------------------------------------------------------------------
-    # Verification pass
-    # ------------------------------------------------------------------
-
-    def _verify_sources(
-        self,
-        *,
-        prompt_evidence: PromptEvidence,
-        analyses: list[SourceAnalysis],
-        fetched_pages: dict[str, FetchedPage],
-    ) -> SourceVerificationOutput:
-        claim_items: list[str] = []
-        theme_items: list[str] = []
-
-        analysis_by_source = {
-            analysis.source_id: analysis
-            for analysis in analyses
-        }
-
-        for source_id, analysis in analysis_by_source.items():
-            page = fetched_pages.get(source_id)
-            if page is None:
-                page_context = "STATUS: unavailable"
-            else:
-                fetch_status = "success" if page.success else "failed"
-                page_context = (
-                    f"URL: {page.url}\n"
-                    f"FETCH STATUS: {fetch_status}"
                 )
-                if page.success:
-                    page_context += (
-                        f"\nFETCHED PAGE TEXT:\n{page.content[:30000]}"
-                    )
 
-            claim_items.append(
-                f"SOURCE {source_id}\n{page_context}\n"
-                "CANDIDATE CLAIMS:\n"
-                + "\n".join(
-                    f"- {claim}"
-                    for claim in analysis.claims_to_verify
-                )
-            )
-            theme_items.append(
-                f"SOURCE {source_id}\n{page_context}\n"
-                "CANDIDATE THEMES:\n"
-                + "\n".join(
-                    f"- {theme}"
-                    for theme in analysis.themes
-                )
+                return resolved_url, domain
+
+    domain = get_domain(clean_url)
+
+    return clean_url, domain
+
+
+
+
+
+def classify_source(url: str, title: str = "", domain: str = "") -> str:
+
+    text = f"{url} {domain} {title}".lower()
+
+    for label, terms in SOURCE_TYPE_RULES:
+
+        if any(term in text for term in terms):
+
+            return label
+
+    return "other_or_unclassified"
+
+
+
+
+
+def classify_content_type(title: str, content: str, url: str) -> str:
+
+    text = f"{title} {url} {(content or '')[:2500]}".lower()
+
+    for label, terms in CONTENT_TYPE_RULES:
+
+        if any(term in text for term in terms):
+
+            return label
+
+    return "general_article_or_page"
+
+
+
+
+
+def content_signals(content: str, prompt: str = "") -> dict[str, Any]:
+
+    text = re.sub(r"\s+", " ", content or "").strip()
+
+    lower = text.lower()
+
+    words = re.findall(r"\b[\w'-]+\b", text)
+
+    sentences = [s for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+
+    numbers = re.findall(r"\b\d+(?:[.,]\d+)?%?\b", text)
+
+    bullets = len(re.findall(r"(?:^|\s)(?:[-*•]|\d+[.)])\s+", content or ""))
+
+    stopwords = {
+
+        "what",
+
+        "where",
+
+        "when",
+
+        "which",
+
+        "with",
+
+        "from",
+
+        "that",
+
+        "this",
+
+        "does",
+
+        "have",
+
+        "about",
+
+        "into",
+
+    }
+
+    terms = {
+
+        w
+
+        for w in re.findall(r"[a-zA-Z0-9]{3,}", (prompt or "").lower())
+
+        if w not in stopwords
+
+    }
+
+    content_terms = set(re.findall(r"[a-zA-Z0-9]{3,}", lower))
+
+    overlap = round(len(terms & content_terms) / max(1, len(terms)), 3)
+
+    return {
+
+        "content_available": bool(text),
+
+        "word_count": len(words),
+
+        "sentence_count": len(sentences),
+
+        "number_or_statistic_count": len(numbers),
+
+        "list_or_bullet_count": bullets,
+
+        "has_comparison_language": any(
+
+            x in lower
+
+            for x in (
+
+                "compared with",
+
+                "versus",
+
+                " vs ",
+
+                "pros and cons",
+
+                "alternatives",
+
             )
 
-        joined_claims = "\n\n".join(claim_items)
-        joined_themes = "\n\n".join(theme_items)
+        ),
 
-        structured = self.model.with_structured_output(
-            SourceVerificationOutput
-        )
+        "has_methodology_language": any(
 
-        claim_result = structured.invoke(
-            [
-                (
-                    "system",
-                    """Verify only the candidate claims against their corresponding
-fetched source pages. Do not add claims or use outside knowledge. A claim
-is supported only when the page directly supports it. For supported or
-contradicted claims, return a short verbatim quote from that page. Do not
-paraphrase or invent quotes. The quote must support the entire claim,
-not merely contain a related generic term. If a claim names a company,
-product, or platform, the quote must connect that entity to the claimed
-fact. A paper's stated aim or scope is not evidence that its intended
-result, standard, or recommendation exists. Return claim_checks only;
-leave theme_checks empty.""",
-                ),
-                (
-                    "human",
-                    f"""PROMPT
-{prompt_evidence.prompt_text}
+            x in lower
 
-SOURCE CLAIM VERIFICATION MATERIAL
-{joined_claims}
+            for x in (
 
-Return one claim check for each supplied candidate claim.
-""",
-                ),
-            ]
-        )
+                "methodology",
 
-        theme_result = structured.invoke(
-            [
-                (
-                    "system",
-                    """Verify only the listed candidate source-theme pairs against
-their corresponding fetched pages. Return exactly one ThemeCheck for
-every listed pair, preserving its source_id and theme. Do not add themes
-or use outside knowledge. A theme is supported only when the page
-directly represents it as a meaningful subject. A page about multiplex
-immunoassays for neuroscience can support a neurology biomarker-panel
-theme when the passage establishes that application; a generic mention
-of technology cannot support a specific platform theme. For supported
-or contradicted results, include a short verbatim quote from that source
-page. For inconclusive or not_found, a quote may be null. Never invent
-or paraphrase evidence.""",
-                ),
-                (
-                    "human",
-                    f"""PROMPT
-{prompt_evidence.prompt_text}
+                "we measured",
 
-SOURCE THEME VERIFICATION MATERIAL
-{joined_themes}
+                "sample size",
 
-Return one theme_check per candidate theme listed under each source.
-Do not omit a pair. If the page is unavailable, use verdict 'unavailable'.
-""",
-                ),
-            ]
-        )
+                "methods",
 
-        return SourceVerificationOutput(
-            claim_checks=claim_result.claim_checks,
-            theme_checks=theme_result.theme_checks,
-        )
+                "data were collected",
 
-    def _verify_target_site_themes(
-        self,
-        *,
-        themes: list[str],
-        pages: dict[str, FetchedPage],
-    ) -> list[ThemeCheck]:
-        """Verify target-site theme coverage against the fetched sitemap inventory."""
+            )
 
-        if not themes or not pages:
-            return []
+        ),
 
-        page_items = list(pages.items())
-        expected_themes = {
-            _theme_key(theme): theme
-            for theme in themes
-        }
+        "has_firsthand_or_original_evidence_language": any(
 
-        returned_checks: list[ThemeCheck] = []
-        structured = self.model.with_structured_output(
-            TargetSiteVerificationOutput
-        )
+            x in lower
 
-        # Keep each request bounded. Missing checks are handled below as
-        # inconclusive; they are never silently interpreted as not_found.
-        batch_size = 8
+            for x in (
 
-        for start in range(0, len(page_items), batch_size):
-            batch = page_items[start:start + batch_size]
-            page_blocks: list[str] = []
+                "our study",
 
-            for source_id, page in batch:
-                if page.success:
-                    page_status = "success"
-                    page_text = page.content[:10000]
-                else:
-                    page_status = "failed"
-                    page_text = ""
+                "we tested",
 
-                page_blocks.append(
-                    f"TARGET PAGE {source_id}\n"
-                    f"URL: {page.url}\n"
-                    f"TITLE: {page.title or 'unknown'}\n"
-                    f"PAGE TYPE: {_classify_target_page_type(url=page.url, title=page.title)}\n"
-                    f"FETCH STATUS: {page_status}\n"
-                    f"PAGE TEXT:\n{page_text}"
-                )
+                "our survey",
+
+                "we analyzed",
+
+                "original data",
+
+                "case study",
+
+            )
+
+        ),
+
+        "has_freshness_language": bool(
+
+            re.search(r"\b(202[4-9]|updated|last updated|published on)\b", lower)
+
+        ),
+
+        "has_definitional_language": any(
+
+            x in lower
+
+            for x in (
+
+                " is defined as ",
+
+                " refers to ",
+
+                " means ",
+
+                "what is ",
+
+            )
+
+        ),
+
+        "query_term_overlap": overlap,
+
+    }
+
+
+
+
+
+def as_list(value: Any) -> list:
+
+    return value if isinstance(value, list) else []
+
+
+
+
+
+# ---------------------------------------------------------------------------
+
+# Individual Prompt Analysis
+
+# ---------------------------------------------------------------------------
+
+
+
+
+
+def analyze_single_prompt(
+
+    prompt_record: dict[str, Any],
+
+    content_map: dict[str, str],
+
+) -> dict[str, Any]:
+
+    """
+
+    Analyzes all AI responses and citations for a single prompt.
+
+    """
+
+    prompt_id = prompt_record["prompt_id"]
+
+    prompt_text = prompt_record["prompt_text"]
+
+    intent_category = prompt_record.get("intent_category") or ""
+
+    responses = prompt_record["responses"]
+
+    scores = prompt_record["scores"]
+
+
+
+    avg_score = (
+
+        round(sum(scores) / len(scores), 1) if scores else 0.0
+
+    )
+
+
+
+    scores_by_model: dict[str, list[float]] = defaultdict(list)
+
+    for r in responses:
+
+        m = r.get("model") or "unknown"
+
+        s = r.get("score")
+
+        if s is not None:
 
             try:
-                result = structured.invoke(
-                    [
-                        (
-                            "system",
-                            """You are verifying whether specific, checkable content-coverage
-questions are answered by pages from a target company's website.
 
-For EVERY target page and EVERY listed coverage question, return exactly
-one theme_check.
+                scores_by_model[m].append(float(s))
 
-Rules:
-1. Preserve source_id exactly.
-2. Preserve the supplied coverage-question wording.
-3. Return exactly one check for every page/question pair.
-4. Use "supported" only when the page's main subject or a substantive
-   section directly answers the question. A passing mention is not enough.
-5. A product, service, or technology page is strong evidence when it
-   directly answers the question. A publication, event, poster, or PDF
-   is supporting evidence only when the page itself answers the question
-   substantively.
-6. A "supported" result MUST contain a short verbatim quote copied from
-   the supplied page text.
-7. Use "not_found" when the supplied page text does not answer the question.
-8. Use "inconclusive" when the page is tangential or the text is insufficient.
-9. Use "unavailable" when the page fetch status is failed.
-10. Do not infer from company name, URL alone, reputation, outside
-    knowledge, or other pages.
-11. Never invent or paraphrase evidence.
-12. Do not omit a page/question pair.
+            except (ValueError, TypeError):
 
-The Python application independently verifies every supporting quote.
-""",
-                        ),
-                        (
-                            "human",
-                            f"""TARGET COMPANY WEBSITE
-
-VERIFIED SOURCE COVERAGE QUESTIONS:
-{chr(10).join(f'- {theme}' for theme in themes)}
-
-TARGET PAGES:
-{chr(10).join(page_blocks)}
-
-Return exactly one theme_check for every combination of:
-TARGET PAGE x VERIFIED SOURCE COVERAGE QUESTION
-
-For failed pages use "unavailable".
-For successful pages that do not substantively answer the question use
-"not_found". For insufficient text use "inconclusive". For supported
-questions provide a short verbatim evidence_quote that directly answers
-the question.""",
-                        ),
-                    ]
-                )
-                returned_checks.extend(result.theme_checks)
-
-            except Exception:
-                # A failed verification call is not evidence of absence.
-                for source_id, page in batch:
-                    for theme in themes:
-                        returned_checks.append(
-                            ThemeCheck(
-                                source_id=source_id,
-                                theme=theme,
-                                verdict=(
-                                    "unavailable"
-                                    if not page.success
-                                    else "inconclusive"
-                                ),
-                            )
-                        )
-
-        checks_by_pair: dict[tuple[str, str], list[ThemeCheck]] = {}
-
-        for check in returned_checks:
-            theme_key = _theme_key(check.theme)
-
-            if theme_key not in expected_themes:
-                continue
-
-            if check.source_id not in pages:
-                continue
-
-            checks_by_pair.setdefault(
-                (check.source_id, theme_key),
-                [],
-            ).append(check)
-
-        completed: list[ThemeCheck] = []
-
-        # Complete the expected page x theme matrix deterministically.
-        # Missing model output becomes inconclusive, never not_found.
-        for source_id, page in page_items:
-            for theme_key, theme in expected_themes.items():
-
-                if not page.success:
-                    completed.append(
-                        ThemeCheck(
-                            source_id=source_id,
-                            theme=theme,
-                            verdict="unavailable",
-                        )
-                    )
-                    continue
-
-                checks = checks_by_pair.get(
-                    (source_id, theme_key),
-                    [],
-                )
-
-                supported = next(
-                    (
-                        check
-                        for check in checks
-                        if (
-                            check.verdict == "supported"
-                            and check.evidence_quote
-                            and _quote_is_present(
-                                check.evidence_quote,
-                                page.content,
-                            )
-                        )
-                    ),
-                    None,
-                )
-
-                if supported is not None:
-                    completed.append(
-                        ThemeCheck(
-                            source_id=source_id,
-                            theme=theme,
-                            verdict="supported",
-                            evidence_quote=supported.evidence_quote,
-                        )
-                    )
-                    continue
-
-                if any(
-                    check.verdict == "not_found"
-                    for check in checks
-                ):
-                    completed.append(
-                        ThemeCheck(
-                            source_id=source_id,
-                            theme=theme,
-                            verdict="not_found",
-                        )
-                    )
-                    continue
-
-                completed.append(
-                    ThemeCheck(
-                        source_id=source_id,
-                        theme=theme,
-                        verdict="inconclusive",
-                    )
-                )
-
-        return completed
-
-    def analyze(
-        self,
-        *,
-        project: dict,
-        prompt_evidence: PromptEvidence,
-    ) -> ContentGap:
-        """
-        Analyze one underperforming prompt.
-        """
-
-        company_name = (
-            project.get("company_name")
-            or "Unknown company"
-        )
-
-        # --------------------------------------------------------------
-        # Flatten all cited sources into stable S1/S2/S3 IDs.
-        # --------------------------------------------------------------
-
-        sources: list[tuple[str, CitedSource]] = []
-
-        source_counter = 1
-
-        for model_name, model_evidence in prompt_evidence.per_model.items():
-            for source in model_evidence.sources:
-                source_id = f"S{source_counter}"
-
-                sources.append(
-                    (
-                        source_id,
-                        source.model or model_name,
-                    )
-                    if False
-                    else (
-                        source_id,
-                        source,
-                    )
-                )
-
-                source_counter += 1
-
-        # --------------------------------------------------------------
-        # No cited sources.
-        # --------------------------------------------------------------
-
-        if not sources:
-            return ContentGap(
-                prompt_id=prompt_evidence.prompt_id,
-                prompt_text=prompt_evidence.prompt_text,
-                cited_sources=[],
-                candidate_themes=[],
-                themes=[],
-                candidate_target_angle="",
-                theme_evidence=[],
-                theme_assessments=[],
-                verification_status="unavailable",
-                verification_summary=(
-                    "No cited sources were available for this prompt. "
-                    "Target-site coverage remains unknown and no content "
-                    "gap has been established."
-                ),
-                target_site_coverage="unknown",
-                content_gap_status="not_established",
-                opportunity=(
-                    "No source evidence was available to identify an "
-                    "AI-visible content opportunity."
-                ),
-                target_angle=(
-                    "No target content angle can be established "
-                    "without source evidence."
-                ),
-                hypothesis=(
-                    "No hypothesis can be established because the "
-                    "prompt contained no cited sources."
-                ),
-            )
-
-        # --------------------------------------------------------------
-        # First-pass Haiku analysis.
-        # --------------------------------------------------------------
-
-        first_pass = self._analyze_candidates(
-            company=project,
-            prompt_evidence=prompt_evidence,
-            sources=sources,
-        )
-
-        candidate_themes = _select_candidate_themes(
-            global_themes=first_pass.themes,
-            analyses=first_pass.source_analyses,
-        )
-        selected_theme_keys = {
-            _theme_key(theme)
-            for theme in candidate_themes
-        }
-        for analysis in first_pass.source_analyses:
-            analysis.themes = [
-                theme
-                for theme in analysis.themes
-                if _theme_key(theme) in selected_theme_keys
-            ]
-
-        # --------------------------------------------------------------
-        # Fetch every cited source.
-        # --------------------------------------------------------------
-
-        source_url_map: dict[str, str] = {
-            source_id: source.url
-            for source_id, source in sources
-            if source.url
-        }
-
-        fetched_pages = self.fetcher.fetch_pages(
-            source_url_map
-        )
-
-        # --------------------------------------------------------------
-        # Second-pass verification.
-        # --------------------------------------------------------------
-
-        verification = self._verify_sources(
-            prompt_evidence=prompt_evidence,
-            analyses=first_pass.source_analyses,
-            fetched_pages=fetched_pages,
-        )
-
-        verification = SourceVerificationOutput(
-            claim_checks=verification.claim_checks,
-            theme_checks=_complete_theme_checks(
-                analyses=first_pass.source_analyses,
-                fetched_pages=fetched_pages,
-                returned_checks=verification.theme_checks,
-            ),
-        )
-
-        analyses_by_source = {
-            analysis.source_id: analysis
-            for analysis in first_pass.source_analyses
-        }
-
-        source_by_id = {
-            source_id: source
-            for source_id, source in sources
-        }
-
-        # --------------------------------------------------------------
-        # Index verification results.
-        # --------------------------------------------------------------
-
-        claims_by_source: dict[str, list[ClaimCheck]] = {}
-
-        for check in verification.claim_checks:
-            claims_by_source.setdefault(
-                check.source_id,
-                [],
-            ).append(check)
-
-        theme_checks_by_source: dict[str, list[ThemeCheck]] = {}
-
-        for check in verification.theme_checks:
-            theme_checks_by_source.setdefault(
-                check.source_id,
-                [],
-            ).append(check)
-
-        # --------------------------------------------------------------
-        # Deterministically validate theme evidence.
-        # --------------------------------------------------------------
-
-        verified_theme_evidence: list[ThemeEvidence] = []
-
-        verified_theme_keys: set[str] = set()
-
-        for check in verification.theme_checks:
-            source_id = check.source_id
-
-            source = source_by_id.get(source_id)
-            analysis = analyses_by_source.get(source_id)
-            page = fetched_pages.get(source_id)
-
-            if source is None:
-                continue
-
-            if analysis is None:
-                continue
-
-            if page is None or not page.success:
-                continue
-
-            if check.verdict != "supported":
-                continue
-
-            if not check.evidence_quote:
-                continue
-
-            if not _quote_is_present(
-                check.evidence_quote,
-                page.content,
-            ):
-                continue
-
-            # The theme must have been proposed for this source.
-            source_theme_keys = {
-                _theme_key(theme)
-                for theme in analysis.themes
-            }
-
-            if _theme_key(check.theme) not in source_theme_keys:
-                continue
-
-            theme_key = _theme_key(check.theme)
-
-            if theme_key in verified_theme_keys:
-                # Keep multiple pieces of evidence even when the theme
-                # is already verified.
                 pass
-            else:
-                verified_theme_keys.add(theme_key)
 
-            verified_theme_evidence.append(
-                ThemeEvidence(
-                    theme=check.theme.strip(),
-                    source_id=source_id,
-                    source_url=page.url,
-                    evidence_quote=check.evidence_quote.strip(),
-                )
-            )
 
-        # --------------------------------------------------------------
-        # Canonical verified theme names.
-        #
-        # Preserve the first candidate spelling rather than allowing
-        # multiple LLM variants to become separate themes.
-        # --------------------------------------------------------------
 
-        canonical_theme_name: dict[str, str] = {}
+    model_score_map = {
 
-        for theme in candidate_themes:
-            canonical_theme_name.setdefault(
-                _theme_key(theme),
-                theme,
-            )
+        m: round(sum(v) / len(v), 1)
 
-        verified_theme_names: list[str] = []
+        for m, v in scores_by_model.items()
 
-        for evidence in verified_theme_evidence:
-            key = _theme_key(evidence.theme)
+        if v
 
-            canonical = canonical_theme_name.get(
-                key,
-                evidence.theme,
-            )
+    }
 
-            if key not in {
-                _theme_key(theme)
-                for theme in verified_theme_names
-            }:
-                verified_theme_names.append(canonical)
 
-        target_site_url = project.get("company_url")
-        target_site_pages: dict[str, FetchedPage] = {}
-        target_site_pages_discovered = 0
-        target_site_urls_discovered = 0
-        target_site_pages_attempted = 0
-        target_site_pages_fetched = 0
-        target_site_diagnostics: list[TargetSiteDiagnostic] = []
-        target_site_inventory_complete = False
-        target_site_note = "No target company URL was provided."
-        target_theme_coverage: dict[str, str] = {}
-        target_theme_evidence: dict[str, list[TargetSiteEvidence]] = {}
 
-        if target_site_url:
-            try:
-                max_target_urls = int(
-                    os.getenv("ACA_TARGET_SITE_MAX_URLS", "15")
-                )
-                if max_target_urls < 1:
-                    max_target_urls = 1
-                pages_per_theme = int(
-                    os.getenv("ACA_TARGET_PAGES_PER_THEME", "3")
-                )
-                if pages_per_theme < 1:
-                    pages_per_theme = 1
+    models_seen = set()
 
-                site_inventory: SiteSearchCandidates = (
-                    self.fetcher.search_site_pages(
-                        target_site_url,
-                        verified_theme_names,
-                        per_theme_limit=pages_per_theme,
-                        total_limit=max_target_urls,
-                    )
-                )
+    category_counts = Counter()
 
-                target_site_pages_discovered = len(site_inventory.urls)
-                target_site_urls_discovered = (
-                    site_inventory.discovered_url_count
-                )
+    format_counts = Counter()
 
-                for skipped in site_inventory.skipped_urls or []:
-                    target_site_diagnostics.append(
-                        TargetSiteDiagnostic(
-                            status="skipped",
-                            url=skipped.url,
-                            reason_category=skipped.reason_category,
-                            reason=skipped.reason,
-                        )
-                    )
+    model_citations = Counter()
 
-                target_site_pages = self.fetcher.fetch_pages(
-                    {
-                        f"TARGET-{index}": url
-                        for index, url in enumerate(
-                            site_inventory.urls,
-                            start=1,
-                        )
-                    }
-                )
+    domain_counts = Counter()
 
-                target_site_pages_attempted = len(target_site_pages)
-                target_site_pages_fetched = sum(
-                    1
-                    for page in target_site_pages.values()
-                    if page.success
-                )
+    domain_models: dict[str, set[str]] = defaultdict(set)
 
-                for page in target_site_pages.values():
-                    if page.success:
-                        continue
+    url_counts = Counter()
 
-                    target_site_diagnostics.append(
-                        TargetSiteDiagnostic(
-                            status="failed",
-                            url=page.url,
-                            reason_category=_classify_target_fetch_failure(
-                                page
-                            ),
-                            reason=page.error or "No error detail returned.",
-                        )
-                    )
+    url_models: dict[str, set[str]] = defaultdict(set)
 
-                target_site_note = site_inventory.note or ""
-                target_site_note = (
-                    f"{target_site_note} Targeted search checked at most "
-                    f"{pages_per_theme} URLs per coverage question and "
-                    f"{max_target_urls} total. This is not an exhaustive "
-                    "site inventory, so unanswered questions are potential "
-                    "gap signals only."
-                ).strip()
+    url_details: dict[str, dict[str, Any]] = {}
 
-                if target_site_pages_fetched < target_site_pages_discovered:
-                    failed_count = (
-                        target_site_pages_discovered
-                        - target_site_pages_fetched
-                    )
-                    target_site_note = (
-                        f"{target_site_note} "
-                        f"{failed_count} target-site page(s) could not be "
-                        f"extracted. Negative coverage findings remain unknown."
-                    ).strip()
 
-                target_site_inventory_complete = False
 
-            except Exception as exc:
-                target_site_note = f"Target-site discovery failed: {exc}"
-                target_site_inventory_complete = False
+    all_citations = []
 
-        target_site_coverage = (
-            "assessed"
-            if target_site_inventory_complete
-            else "partial"
-            if target_site_pages_fetched
-            else "unknown"
+    combined_content = []
+
+
+
+    for resp in responses:
+
+        model = str(resp.get("model") or "unknown")
+
+        models_seen.add(model)
+
+        citations = as_list(resp.get("citations")) or as_list(
+
+            resp.get("sources")
+
         )
 
-        if verified_theme_names and target_site_pages:
-            target_checks = self._verify_target_site_themes(
-                themes=verified_theme_names,
-                pages=target_site_pages,
+
+
+        for item in citations:
+
+            item = {"url": item} if isinstance(item, str) else item
+
+            if not isinstance(item, dict):
+
+                continue
+
+            raw_url = str(
+
+                item.get("url")
+
+                or item.get("source_url")
+
+                or item.get("href")
+
+                or ""
+
             )
 
-            for theme in verified_theme_names:
-                theme_key = _theme_key(theme)
-                checks = [
-                    check
-                    for check in target_checks
-                    if _theme_key(check.theme) == theme_key
-                ]
+            title = str(
 
-                evidence: list[TargetSiteEvidence] = []
+                item.get("title")
 
-                for check in checks:
-                    if len(evidence) >= 3:
-                        break
+                or item.get("page_title")
 
-                    page = target_site_pages.get(check.source_id)
+                or "")
 
-                    if (
-                        check.verdict == "supported"
-                        and check.evidence_quote
-                        and page is not None
-                        and page.success
-                        and _quote_is_present(
-                            check.evidence_quote,
-                            page.content,
-                        )
-                    ):
-                        evidence.append(
-                            TargetSiteEvidence(
-                                theme=theme,
-                                source_url=page.url,
-                                evidence_quote=check.evidence_quote,
-                                page_type=_classify_target_page_type(
-                                    url=page.url,
-                                    title=page.title,
-                                ),
-                            )
-                        )
+            url, domain = resolve_citation(raw_url, title)
 
-                target_theme_evidence[theme_key] = evidence
+            if not url and not domain:
 
-                if evidence:
-                    target_theme_coverage[theme_key] = "covered"
+                continue
 
-                elif (
-                    target_site_inventory_complete
-                    and len(checks) == target_site_pages_discovered
-                    and all(
-                        check.verdict == "not_found"
-                        for check in checks
-                    )
-                ):
-                    target_theme_coverage[theme_key] = "not_covered"
+            if not url:
 
-                else:
-                    target_theme_coverage[theme_key] = "unknown"
+                url = f"https://{domain}"
 
-        assessed_theme_names = list(candidate_themes)
-        original_candidate_theme_count = len(assessed_theme_names)
 
-        verified_theme_keys = {
-            _theme_key(theme)
-            for theme in verified_theme_names
-        }
 
-        unresolved_candidate_themes = [
-            theme
-            for theme in assessed_theme_names
-            if _theme_key(theme) not in verified_theme_keys
-        ]
+            inline = str(
 
-        # Keep candidate_themes as unresolved themes for backwards
-        # compatibility with the existing ContentGap contract.
-        candidate_themes = unresolved_candidate_themes
+                item.get("content")
 
-        # --------------------------------------------------------------
-        # Theme assessments.
-        # --------------------------------------------------------------
+                or item.get("text")
 
-        theme_assessments: list[ThemeAssessment] = []
+                or item.get("excerpt")
 
-        for theme in assessed_theme_names:
-            theme_key = _theme_key(theme)
+                or ""
 
-            theme_source_ids: set[str] = set()
-            theme_cited_by: set[str] = set()
-            theme_candidate_competitors: set[str] = set()
-            theme_verified_competitors: set[str] = set()
-            theme_evidence: list[ThemeEvidence] = []
+            )
 
-            for source_id, analysis in analyses_by_source.items():
-                source_theme_keys = {
-                    _theme_key(candidate)
-                    for candidate in analysis.themes
+            content = (
+
+                inline
+
+                or str(
+
+                    content_map.get(raw_url)
+
+                    or content_map.get(url)
+
+                    or ""
+
+                )
+
+            )
+
+            if content:
+
+                combined_content.append(content)
+
+
+
+            source_type = classify_source(url, title, domain)
+
+            content_type = classify_content_type(title, content, url)
+
+
+
+            category_counts[source_type] += 1
+
+            format_counts[content_type] += 1
+
+            model_citations[model] += 1
+
+            domain_counts[domain] += 1
+
+            domain_models[domain].add(model)
+
+            url_counts[url] += 1
+
+            url_models[url].add(model)
+
+
+
+            if url not in url_details:
+
+                url_details[url] = {
+
+                    "url": url,
+
+                    "domain": domain,
+
+                    "title": title,
+
+                    "source_type": source_type,
+
+                    "content_type": content_type,
+
+                    "citation_count": 0,
+
+                    "models": set(),
+
                 }
 
-                if theme_key not in source_theme_keys:
-                    continue
+            url_details[url]["citation_count"] += 1
 
-                source = source_by_id.get(source_id)
+            url_details[url]["models"].add(model)
 
-                if source is None:
-                    continue
+            all_citations.append(url)
 
-                page = fetched_pages.get(source_id)
-                resolved_url = (
-                    page.url
-                    if page is not None and page.success
-                    else source.url
-                )
-                source_type = _classify_source_type(
-                    url=resolved_url,
-                    title=(
-                        page.title
-                        if page is not None and page.success
-                        else source.title
-                    ),
-                )
 
-                theme_source_ids.add(
-                    source_id
-                )
 
-                theme_cited_by.add(
-                    source.model
-                )
+    total_citations = len(all_citations)
 
-                source_competitor = (
-                    analysis.competitor
-                    or _entity_from_domain(resolved_url)
-                )
-                if source_type == "commercial" and source_competitor:
-                    theme_candidate_competitors.add(
-                        source_competitor
-                    )
+    denominator = max(1, total_citations)
 
-                for evidence in verified_theme_evidence:
-                    if (
-                        evidence.source_id == source_id
-                        and _theme_key(evidence.theme) == theme_key
-                    ):
-                        theme_evidence.append(
-                            evidence
-                        )
 
-            # Verified competitors represented by sources supporting
-            # this theme.
-            for source_id in theme_source_ids:
-                analysis = analyses_by_source.get(source_id)
-                page = fetched_pages.get(source_id)
 
-                if analysis is None:
-                    continue
+    top_domains = [
 
-                competitor, status = _verify_competitor(
-                    candidate=(
-                        analysis.competitor
-                        or _entity_from_domain(
-                            page.url
-                            if page is not None
-                            else None
-                        )
-                    ),
-                    page=page,
-                    company_name=company_name,
-                    relevant=any(
-                        evidence.source_id == source_id
-                        for evidence in theme_evidence
-                    ),
-                    source_type=_classify_source_type(
-                        url=page.url if page is not None else None,
-                        title=page.title if page is not None else None,
-                    ),
-                )
+        {
 
-                if (
-                    status == "verified"
-                    and competitor
-                ):
-                    theme_verified_competitors.add(
-                        competitor
-                    )
+            "domain": dom,
 
-            # Candidate competitors can come from all candidate
-            # analyses associated with the theme.
-            verified = bool(theme_evidence)
-            target_coverage = target_theme_coverage.get(
-                theme_key,
-                "unknown",
-            )
-            target_evidence = target_theme_evidence.get(
-                theme_key,
-                [],
-            )
-            theme_gap_status = (
-                "established"
-                if target_coverage == "not_covered"
-                else "not_established"
-            )
-            if target_coverage == "covered":
-                theme_opportunity = (
-                    f"The target-site inventory contains verified evidence "
-                    f"covering {theme}; review whether that coverage is "
-                    f"sufficient for the intended audience and use case."
-                )
-            elif target_coverage == "not_covered":
-                theme_opportunity = (
-                    f"No verified coverage of {theme} was found across the "
-                    f"complete fetched sitemap inventory. This establishes "
-                    f"a content-gap signal within the assessed sitemap "
-                    f"inventory, not necessarily across every public URL."
-                )
-            else:
-                theme_opportunity = (
-                    f"No verified page was found in the bounded target-site "
-                    f"search that answers {theme}. Treat this as a potential "
-                    f"content-gap signal only; targeted search is not proof "
-                    f"of site-wide absence."
-                )
+            "citation_count": cnt,
 
-            theme_assessments.append(
-                ThemeAssessment(
-                    theme=theme,
-                    status=(
-                        "verified"
-                        if verified
-                        else "unverified"
-                    ),
-                    candidate_source_ids=sorted(
-                        theme_source_ids
-                    ),
-                    candidate_cited_by=sorted(
-                        theme_cited_by
-                    ),
-                    candidate_competitors=sorted(
-                        theme_candidate_competitors
-                    ),
-                    source_ids=sorted(
-                        {
-                            evidence.source_id
-                            for evidence in theme_evidence
-                        }
-                    ),
-                    cited_by=sorted(
-                        {
-                            source_by_id[evidence.source_id].model
-                            for evidence in theme_evidence
-                            if evidence.source_id in source_by_id
-                        }
-                    ),
-                    competitors=sorted(
-                        theme_verified_competitors
-                    ),
-                    evidence=theme_evidence,
-                    target_site_coverage=target_coverage,
-                    target_site_evidence=target_evidence,
-                    content_gap_status=theme_gap_status,
-                    opportunity=theme_opportunity,
-                )
-            )
+            "models_citing": sorted(domain_models[dom]),
 
-        # --------------------------------------------------------------
-        # Analyze each cited source into AnalyzedSource.
-        # --------------------------------------------------------------
+            "model_count": len(domain_models[dom]),
 
-        analyzed_sources: list[AnalyzedSource] = []
+        }
 
-        for source_id, source in sources:
-            analysis = analyses_by_source.get(
-                source_id
-            )
+        for dom, cnt in domain_counts.most_common()
+        if dom not in NON_SOURCE_DOMAINS
 
-            page = fetched_pages.get(
-                source_id
-            )
+    ][:TOP_DOMAIN_COUNT]
 
-            source_claim_checks = claims_by_source.get(
-                source_id,
-                [],
-            )
 
-            candidate_competitor = (
-                analysis.competitor
-                if analysis
-                else None
-            )
 
-            resolved_url = (
-                page.url
-                if page is not None and page.success
-                else source.url
-            )
-            source_type = _classify_source_type(
-                url=resolved_url,
-                title=(
-                    page.title
-                    if page is not None and page.success
-                    else source.title
-                ),
-            )
-            if source_type == "commercial":
-                candidate_competitor = (
-                    candidate_competitor
-                    or _entity_from_domain(resolved_url)
-                )
-            else:
-                candidate_competitor = None
+    top_sources = [
 
-            verified_competitor, competitor_status = (
-                _verify_competitor(
-                    candidate=candidate_competitor,
-                    page=page,
-                    company_name=company_name,
-                    relevant=any(
-                        evidence.source_id == source_id
-                        for evidence in verified_theme_evidence
-                    ),
-                    source_type=source_type,
-                )
-            )
+        {
 
-            # Build SourceClaimAssessment objects only from the
-            # verification output.
-            source_claims: list[
-                SourceClaimAssessment
-            ] = []
+            "url": d["url"],
 
-            for check in source_claim_checks:
-                quote_valid = _claim_quote_is_valid(
-                    check,
-                    page,
-                )
-                source_claims.append(
-                    SourceClaimAssessment(
-                        claim=check.claim,
-                        status=(
-                            "verified"
-                            if quote_valid
-                            else "model_supported"
-                            if check.verdict == "supported"
-                            else check.verdict
-                        ),
-                        evidence_quote=(
-                            check.evidence_quote
-                            if quote_valid
-                            or check.verdict != "supported"
-                            else None
-                        ),
-                    )
-)
-            supported_claims = [
-                check
-                for check in source_claim_checks
-                if _claim_quote_is_valid(check, page)
-            ]
+            "domain": d["domain"],
 
-            contradicted_claims = [
-                check
-                for check in source_claim_checks
-                if check.verdict == "contradicted"
-            ]
+            "title": d["title"],
 
-            not_found_claims = [
-                check
-                for check in source_claim_checks
-                if check.verdict == "not_found"
-            ]
+            "source_type": d["source_type"],
 
-            if page is None or not page.success:
-                source_status: Literal[
-                    "verified",
-                    "partially_verified",
-                    "unsupported",
-                    "unverified",
-                    "unavailable",
-                ] = "unavailable"
+            "content_type": d["content_type"],
 
-                verification_note = (
-                    page.error
-                    if page is not None
-                    else "Source was not fetched."
-                )
+            "citation_count": d["citation_count"],
 
-            elif supported_claims and not (
-                contradicted_claims
-                or not_found_claims
-            ):
-                source_status = "verified"
-                verification_note = None
+            "models": sorted(d["models"]),
 
-            elif supported_claims:
-                source_status = "partially_verified"
-                verification_note = (
-                    "Some proposed claims were verified, "
-                    "while others were not fully supported."
-                )
+            "model_count": len(d["models"]),
 
-            elif source_claim_checks:
-                source_status = "unsupported"
-                verification_note = (
-                    "The fetched page did not provide sufficient "
-                    "evidence for the proposed claims."
-                )
+        }
 
-            else:
-                source_status = "unverified"
-                verification_note = (
-                    "No claims were proposed for verification."
-                )
+        for d in sorted(
 
-            contribution = _build_verified_contribution(
-                candidate_contribution=(
-                    analysis.contribution
-                    if analysis
-                    else ""
-                ),
-                claim_checks=source_claim_checks,
-                page=page,
-            )
+            url_details.values(),
 
-            analyzed_sources.append(
-                AnalyzedSource(
-                    source_id=source_id,
-                    model=source.model,
-                    source_type=source_type,
-                    url=(
-                        page.url
-                        if page is not None and page.success
-                        else source.url
-                    ),
-                    domain=(
-                        _safe_domain(page.url)
-                        if page is not None and page.success
-                        else source.domain
-                    ),
-                    title=(
-                        page.title
-                        if page is not None and page.success and page.title
-                        else source.title
-                    ),
-                    competitor=verified_competitor,
-                    excerpt=source.excerpt,
-                    contribution=contribution,
-                    candidate_competitor=candidate_competitor,
-                    competitor_verification_status=competitor_status,
-                    verified_claims=source_claims,
-                    verification_status=source_status,
-                    verification_evidence=[
-                        check.evidence_quote
-                        for check in supported_claims
-                        if check.evidence_quote
-                    ],
-                    verified_url=(
-                        page.url
-                        if page is not None
-                        and page.success
-                        else None
-                    ),
-                    requested_url=(
-                        page.requested_url
-                        if page is not None
-                        else source.url
-                    ),
-                    verification_note=verification_note,
-                )
-            )
+            key=lambda x: (-x["citation_count"], -len(x["models"]), x["url"]),
 
-        # --------------------------------------------------------------
-        # Overall status.
-        # --------------------------------------------------------------
+        )[:15]
 
-        fetched_count = sum(
-            1
-            for page in fetched_pages.values()
-            if page.success
-        )
+    ]
 
-        verification_status = _overall_verification_status(
-            fetched_count=fetched_count,
-            total_sources=len(sources),
-            claim_checks=verification.claim_checks,
-            theme_evidence=verified_theme_evidence,
-        )
 
-        verification_summary = _verification_summary(
-            total_sources=len(sources),
-            fetched_count=fetched_count,
-            claim_checks=verification.claim_checks,
-            theme_checks=verification.theme_checks,
-            theme_evidence=verified_theme_evidence,
-        )
 
-        if target_site_url:
-            verification_summary += (
-                f" Target-site inventory: {target_site_coverage}; "
-                f"{target_site_pages_fetched} of "
-                f"{target_site_pages_discovered} pages extracted."
-            )
-            if target_site_note:
-                verification_summary += f" {target_site_note}"
+    # Sources cited across multiple AI models for this specific prompt
 
-        established_gap_themes = [
-            assessment.theme
-            for assessment in theme_assessments
-            if assessment.content_gap_status == "established"
-        ]
+    multi_model_sources = [
 
-        # --------------------------------------------------------------
-        # Candidate opportunity.
-        #
-        # Important: this is NOT a confirmed content gap.
-        # --------------------------------------------------------------
+        s
 
-        if established_gap_themes:
-            opportunity = (
-                f"The complete extracted sitemap inventory did not show "
-                f"coverage for these source-verified themes: "
-                + ", ".join(established_gap_themes)
-                + ". Review these as potential gaps, noting that the sitemap "
-                "may not enumerate every public page."
-            )
-        elif verified_theme_names and target_site_coverage == "assessed":
-            opportunity = (
-                f"The target-site inventory was assessed across "
-                f"{target_site_pages_fetched} extracted pages. Compare the "
-                f"page-level coverage evidence for the verified themes before "
-                "choosing a content action."
-            )
-        elif verified_theme_names and target_site_pages_fetched:
-            potential_gap_themes = [
-                theme
-                for theme in verified_theme_names
-                if target_theme_coverage.get(_theme_key(theme)) == "unknown"
-            ]
-            if potential_gap_themes:
-                opportunity = (
-                    "Targeted website search found no verified coverage for these "
-                    "specific questions: "
-                    + ", ".join(potential_gap_themes[:5])
-                    + ". Treat them as potential content-gap signals, not "
-                    "proof of site-wide absence."
-                )
-            else:
-                opportunity = (
-                    "Targeted website search found verified coverage for the "
-                    "selected questions. No site-wide content gap is established."
-                )
-        elif verified_theme_names:
-            opportunity = (
-                "Investigate the verified coverage questions against the "
-                f"{company_name} site; target-site inspection is "
-                f"{target_site_coverage}."
-            )
-        elif candidate_themes:
-            opportunity = (
-                "Investigate the candidate source themes against the "
-                f"{company_name} site inventory before establishing "
-                "a content gap. No candidate theme has yet met the "
-                "verification threshold."
-            )
-        else:
-            opportunity = (
-                "No sufficiently grounded source themes were identified. "
-                "Target-site coverage remains unknown."
-            )
+        for s in top_sources
 
-        # --------------------------------------------------------------
-        # Content angle.
-        # --------------------------------------------------------------
+        if s["model_count"] >= 2
 
-        if established_gap_themes:
-            target_angle = (
-                f"Review or develop {company_name} content for "
-                + ", ".join(established_gap_themes)
-                + ", using the verified cited-source evidence as the reference."
-            )
-        elif verified_theme_names and target_site_coverage == "assessed":
-            target_angle = (
-                f"Use the assessed target-site pages and verified source evidence "
-                f"to prioritize coverage of: {', '.join(verified_theme_names)}."
-            )
-        elif verified_theme_names:
-            target_angle = (
-                f"Compare {company_name}'s existing coverage of "
-                + ", ".join(
-                    verified_theme_names
-                )
-                + f" against the verified source evidence. Target-site "
-                f"inspection is {target_site_coverage}; do not infer missing coverage."
-            )
-        elif candidate_themes:
-            target_angle = (
-                f"Investigate {company_name}'s existing coverage of "
-                + ", ".join(candidate_themes)
-                + " against the cited source evidence. "
-                "No content gap is established."
-            )
-        else:
-            target_angle = (
-                "No target content angle can be established until "
-                "relevant source evidence is available."
-            )
+    ]
 
-        # --------------------------------------------------------------
-        # Final ContentGap.
-        # --------------------------------------------------------------
 
-        if target_site_coverage == "assessed":
-            target_site_observation = (
-                f"The sitemap-derived inventory for {company_name} was "
-                f"fully extracted ({target_site_pages_fetched} pages). "
-                + (
-                    "The checked themes not covered were: "
-                    + ", ".join(established_gap_themes)
-                    + "."
-                    if established_gap_themes
-                    else "No verified source theme was classified as absent from the inventory."
-                )
-            )
-        elif target_site_coverage == "partial":
-            target_site_observation = (
-                f"Only {target_site_pages_fetched} of "
-                f"{target_site_pages_discovered} discovered pages were "
-                "sufficiently inspected; missing-theme findings remain unknown."
-            )
-        else:
-            target_site_observation = None
 
-        hypothesis = _build_hypothesis(
-            company_name=company_name,
-            verified_themes=verified_theme_names,
-            candidate_themes=(
-                candidate_themes or assessed_theme_names
+    source_type_summary = [
+
+        {
+
+            "source_type": k,
+
+            "citation_count": v,
+
+            "share_percent": round(v / denominator * 100, 1),
+
+        }
+
+        for k, v in category_counts.most_common()
+
+    ]
+
+
+
+    content_type_summary = [
+
+        {
+
+            "content_type": k,
+
+            "citation_count": v,
+
+            "share_percent": round(v / denominator * 100, 1),
+
+        }
+
+        for k, v in format_counts.most_common()
+
+    ]
+
+
+
+    model_summary = [
+
+        {
+
+            "model": k,
+
+            "citation_count": v,
+
+            "share_percent": round(v / denominator * 100, 1),
+
+        }
+
+        for k, v in model_citations.most_common()
+
+    ]
+
+
+
+    # Determine dominant source ecosystem for this prompt
+
+    academic_share = sum(
+
+        v
+
+        for k, v in category_counts.items()
+
+        if k in ("research_or_academic", "government_or_public_sector")
+
+    ) / denominator
+
+    vendor_share = category_counts.get("commercial_or_vendor", 0) / denominator
+
+    analyst_share = category_counts.get("industry_analyst_or_market_report", 0) / denominator
+
+    review_share = category_counts.get("review_or_directory", 0) / denominator
+
+
+
+    if academic_share >= 0.35:
+
+        dominant_ecosystem = "academic_research"
+
+    elif vendor_share >= 0.25:
+
+        dominant_ecosystem = "commercial_vendor"
+
+    elif analyst_share >= 0.15:
+
+        dominant_ecosystem = "industry_market_intelligence"
+
+    elif review_share >= 0.20:
+
+        dominant_ecosystem = "review_directory"
+
+    else:
+
+        dominant_ecosystem = "mixed_or_general"
+
+
+
+    # Aggregated text signals
+
+    signals = content_signals(
+
+        " ".join(combined_content[:10]), prompt=prompt_text
+
+    )
+
+
+
+    # Prompt-specific opportunities
+
+    prompt_opportunities = []
+
+    if source_type_summary:
+
+        top_cat = source_type_summary[0]
+
+        prompt_opportunities.append({
+
+            "observation": (
+
+                f"AI models predominantly cite '{top_cat['source_type']}' "
+
+                f"({top_cat['share_percent']}%) for this question."
+
             ),
-            target_site_observation=target_site_observation,
-        )
 
-        covered_target_themes = [
-            theme
-            for theme in verified_theme_names
-            if target_theme_coverage.get(_theme_key(theme)) == "covered"
-        ]
-        potential_gap_themes = [
-            theme
-            for theme in verified_theme_names
-            if (
-                target_site_pages_fetched > 0
-                and target_theme_coverage.get(_theme_key(theme)) == "unknown"
-            )
-        ]
-        if established_gap_themes:
-            candidate_target_angle = (
-                "Review whether new or improved resources are appropriate for: "
-                + ", ".join(established_gap_themes)
-                + ". These are potential gaps in the checked sitemap pages, "
-                "not proof that the entire website lacks this content."
-            )
-        elif potential_gap_themes:
-            candidate_target_angle = (
-                "Potential content-gap signals from targeted website search: "
-                + ", ".join(potential_gap_themes[:5])
-                + ". These are specific unanswered coverage questions in the "
-                "selected pages, not proof of site-wide absence."
-            )
-        elif covered_target_themes:
-            candidate_target_angle = (
-                "Review the existing pages covering "
-                + ", ".join(covered_target_themes[:5])
-                + ". Consider additional content only if a specific unmet "
-                "audience need remains; no product advantage is inferred."
-            )
-        elif verified_theme_names:
-            candidate_target_angle = (
-                "Review the verified coverage questions against the selected "
-                "target-site pages: "
-                + ", ".join(verified_theme_names[:5])
-                + ". No site-wide gap is established."
-            )
-        else:
-            candidate_target_angle = (
-                "A target content angle cannot be recommended until source "
-                "themes are verified and relevant target-site pages are reviewed."
-            )
+            "suggested_next_step": (
 
-        return ContentGap(
-            prompt_id=prompt_evidence.prompt_id,
-            prompt_text=prompt_evidence.prompt_text,
-            cited_sources=analyzed_sources,
-            candidate_themes=candidate_themes,
-            themes=verified_theme_names,
-            candidate_target_angle=candidate_target_angle,
-            theme_evidence=verified_theme_evidence,
-            theme_assessments=theme_assessments,
-            verification_status=verification_status,
-            verification_summary=verification_summary,
-            target_site_url=target_site_url,
-            target_site_coverage=target_site_coverage,
-            target_site_pages_discovered=target_site_pages_discovered,
-            target_site_urls_discovered=target_site_urls_discovered,
-            target_site_pages_attempted=target_site_pages_attempted,
-            target_site_pages_fetched=target_site_pages_fetched,
-            target_site_diagnostics=target_site_diagnostics,
-            target_site_inventory_complete=target_site_inventory_complete,
-            target_site_note=target_site_note,
-            content_gap_status=(
-                "established"
-                if established_gap_themes
-                else "not_established"
+                f"Create authority content structured for the {top_cat['source_type']} ecosystem. "
+
+                f"Top citing models: {', '.join(sorted(models_seen))}."
+
             ),
-            opportunity=opportunity,
-            target_angle=target_angle,
-            hypothesis=hypothesis,
-        )
+
+        })
+
+
+
+    if multi_model_sources:
+
+        lead_domain = multi_model_sources[0]["domain"]
+
+        prompt_opportunities.append({
+
+            "observation": (
+
+                f"'{lead_domain}' achieved consensus citations across multiple AI models "
+
+                f"({', '.join(multi_model_sources[0]['models'])})."
+
+            ),
+
+            "suggested_next_step": (
+
+                f"Inspect {lead_domain}'s cited content structure on this topic to identify "
+
+                "the factual coverage depth models expect."
+
+            ),
+
+        })
+
+
+
+    return {
+
+        "prompt_id": str(prompt_id),
+
+        "prompt_text": prompt_text,
+
+        "intent_category": intent_category,
+
+        "average_score": avg_score,
+
+        "scores_by_model": model_score_map,
+
+        "response_count": len(responses),
+
+        "citation_count": total_citations,
+
+        "unique_domain_count": len(domain_counts),
+
+        "unique_url_count": len(url_counts),
+
+        "models_analyzed": sorted(models_seen),
+
+        "model_breakdown": model_summary,
+
+        "dominant_ecosystem": dominant_ecosystem,
+
+        "top_domains": top_domains,
+
+        "top_sources": top_sources,
+
+        "multi_model_sources": multi_model_sources,
+
+        "source_type_summary": source_type_summary,
+
+        "content_type_summary": content_type_summary,
+
+        "observable_signals": signals,
+
+        "publishing_opportunities": prompt_opportunities,
+
+    }
+
+
+
 
 
 # ---------------------------------------------------------------------------
-# LangGraph/module entrypoint
+
+# Claude Haiku prompt-level analysis
 # ---------------------------------------------------------------------------
 
 
-async def run(
-    state: WorkflowState,
-) -> WorkflowState:
-    """
-    Run Source Analyzer for the first prompt in WorkflowState.
+def prepare_response_evidence(responses: list[dict[str, Any]], content_map: dict[str, str]) -> list[dict[str, Any]]:
+    """Prepare bounded observable AImpact evidence for Claude Haiku."""
+    evidence = []
+    for response in responses:
+        model = str(response.get("model") or "unknown")
+        response_text = str(response.get("response") or response.get("answer") or response.get("content") or response.get("text") or "")
+        item = {"model": model, "score": response.get("score"), "response": response_text[:6000], "citations": []}
+        citations = as_list(response.get("citations")) or as_list(response.get("sources"))
+        for citation in citations[:30]:
+            citation = {"url": citation} if isinstance(citation, str) else citation
+            if not isinstance(citation, dict):
+                continue
+            raw_url = str(citation.get("url") or citation.get("source_url") or citation.get("href") or "")
+            title = str(citation.get("title") or citation.get("page_title") or "")
+            url, domain = resolve_citation(raw_url, title)
+            inline = str(citation.get("content") or citation.get("text") or citation.get("excerpt") or "")
+            content = inline or str(content_map.get(raw_url) or content_map.get(url) or "")
+            item["citations"].append({"url": url, "domain": domain, "title": title, "source_type": classify_source(url, title, domain), "content_type": classify_content_type(title, content, url), "excerpt": content[:1500]})
+        evidence.append(item)
+    return evidence
 
-    The production orchestrator can later invoke this node once per
-    selected prompt or provide a prompt-specific state.
+
+def _parse_haiku_json(text: str) -> dict[str, Any]:
+    text = (text or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE).strip()
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if match:
+            try:
+                parsed = json.loads(match.group(0))
+                return parsed if isinstance(parsed, dict) else {}
+            except json.JSONDecodeError:
+                pass
+    return {}
+
+
+def analyze_prompt_with_haiku(prompt_analysis: dict[str, Any]) -> dict[str, Any]:
+    """Analyze ONE low-scoring prompt with Claude Haiku."""
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY is not set.")
+    client = anthropic.Anthropic(api_key=api_key)
+    evidence = {
+        "prompt": prompt_analysis["prompt_text"],
+        "average_score": prompt_analysis["average_score"],
+        "scores_by_model": prompt_analysis["scores_by_model"],
+        "models_analyzed": prompt_analysis["models_analyzed"],
+        "top_domains": prompt_analysis["top_domains"],
+        "top_sources": prompt_analysis["top_sources"],
+        "multi_model_sources": prompt_analysis["multi_model_sources"],
+        "source_type_summary": prompt_analysis["source_type_summary"],
+        "content_type_summary": prompt_analysis["content_type_summary"],
+        "observable_signals": prompt_analysis["observable_signals"],
+        "responses": prompt_analysis.get("responses", []),
+    }
+    analysis_prompt = f"""
+You are the Source Intelligence analyst for an AI visibility platform.
+
+Analyze ONE low-scoring AI search prompt.
+
+Use only the supplied AImpact evidence. Do not claim to know hidden reasoning
+inside ChatGPT, Claude, Gemini, GoogleAI, or any other model. Do not say a model
+trusts, likes, or prefers a source unless the evidence directly demonstrates a
+repeatable observable pattern.
+
+Focus on what was cited, why those sources were likely useful based on observable
+evidence, cross-model citation patterns, content characteristics, and realistic
+publishing opportunities. Clearly distinguish observations from interpretations.
+Do not invent facts about cited websites.
+
+Return ONLY valid JSON with exactly these keys:
+{{
+  "source_selection_observations": [],
+  "citation_patterns": [],
+  "cross_model_observations": [],
+  "content_characteristics": [],
+  "likely_selection_factors": [],
+  "publishing_opportunities": [],
+  "priority_actions": []
+}}
+
+AIMPACT EVIDENCE:
+{json.dumps(evidence, indent=2, ensure_ascii=False)}
+"""
+    response = client.messages.create(
+        model=HAIKU_MODEL,
+        max_tokens=HAIKU_MAX_TOKENS,
+
+        messages=[{"role": "user", "content": analysis_prompt}],
+    )
+    text = "".join(block.text for block in response.content if getattr(block, "type", None) == "text").strip()
+    parsed = _parse_haiku_json(text)
+    if parsed:
+        return parsed
+    return {
+        "source_selection_observations": [],
+        "citation_patterns": [],
+        "cross_model_observations": [],
+        "content_characteristics": [],
+        "likely_selection_factors": [],
+        "publishing_opportunities": [],
+        "priority_actions": [],
+        "raw_haiku_response": text,
+    }
+
+
+def attach_haiku_analyses(prompt_analyses: list[dict[str, Any]]) -> None:
+    """Run Claude Haiku on every low-scoring prompt, up to 12 concurrently."""
+    if not prompt_analyses:
+        return
+    print(f"\nRunning Claude Haiku analysis for {len(prompt_analyses)} low-scoring prompts (max concurrent: {MAX_CONCURRENT})...")
+    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT) as executor:
+        futures = {executor.submit(analyze_prompt_with_haiku, prompt): prompt for prompt in prompt_analyses}
+        completed = 0
+        for future in as_completed(futures):
+            prompt = futures[future]
+            completed += 1
+            try:
+                prompt["haiku_analysis"] = future.result()
+                print(f"  [{completed}/{len(prompt_analyses)}] Prompt {prompt['prompt_id']} analyzed")
+            except Exception as exc:
+                prompt["haiku_analysis"] = {"error": str(exc)}
+                print(f"  [{completed}/{len(prompt_analyses)}] Prompt {prompt['prompt_id']} FAILED: {exc}")
+
+
+# Cross-Prompt Intelligence Synthesis
+
+# ---------------------------------------------------------------------------
+
+
+
+
+
+def analyze_cross_prompt_insights(
+
+    prompt_analyses: list[dict[str, Any]],
+
+    company_name: str | None = None,
+
+    company_url: str | None = None,
+
+) -> dict[str, Any]:
+
     """
 
-    if not state.prompts:
-        raise RuntimeError(
-            "Source Analyzer cannot run because no prompt evidence "
-            f"was supplied for campaign {state.campaign_id}."
+    Synthesizes aggregated patterns across all analyzed low-scoring prompts.
+
+    """
+
+    total_prompts = len(prompt_analyses)
+
+    if not total_prompts:
+
+        return {}
+
+
+
+    # 1. Common Domains across prompts
+
+    domain_prompt_map: dict[str, set[str]] = defaultdict(set)
+
+    domain_citations_total = Counter()
+
+    domain_models_total: dict[str, set[str]] = defaultdict(set)
+
+
+
+    for p in prompt_analyses:
+
+        pid = p["prompt_id"]
+
+        for dom in p["top_domains"]:
+
+            d_name = dom["domain"]
+
+            domain_prompt_map[d_name].add(pid)
+
+            domain_citations_total[d_name] += dom["citation_count"]
+
+            domain_models_total[d_name].update(dom.get("models_citing", []))
+
+
+
+    common_domains = []
+
+    for dom, p_set in sorted(
+
+        domain_prompt_map.items(),
+
+        key=lambda x: (-len(x[1]), -domain_citations_total[x[0]]),
+
+    )[:20]:
+
+        common_domains.append({
+
+            "domain": dom,
+
+            "total_citations": domain_citations_total[dom],
+
+            "prompts_cited_in_count": len(p_set),
+
+            "prompts_cited_in_percent": round(
+
+                len(p_set) / total_prompts * 100, 1
+
+            ),
+
+            "models_citing": sorted(domain_models_total[dom]),
+
+        })
+
+
+
+    # 2. Source Ecosystem Breakdown across question types
+
+    ecosystems: dict[str, list[dict[str, Any]]] = {
+
+        "academic_research": [],
+
+        "commercial_vendor": [],
+
+        "industry_market_intelligence": [],
+
+        "review_directory": [],
+
+        "mixed_or_general": [],
+
+    }
+
+
+
+    for p in prompt_analyses:
+
+        eco = p.get("dominant_ecosystem", "mixed_or_general")
+
+        ecosystems.setdefault(eco, []).append({
+
+            "prompt_id": p["prompt_id"],
+
+            "prompt_text": p["prompt_text"],
+
+            "average_score": p["average_score"],
+
+            "top_domains": [d["domain"] for d in p["top_domains"][:5]],
+
+        })
+
+
+
+    # 3. Multi-Model Consensus Domains (domains cited by >=3 models in >=2 prompts)
+
+    consensus_domains = [
+
+        d
+
+        for d in common_domains
+
+        if len(d["models_citing"]) >= 3 and d["prompts_cited_in_count"] >= 2
+
+    ]
+
+
+
+    # 4. Brand Visibility Check across low-scoring queries
+
+    customer_domain = get_domain(company_url) if company_url else "unknown"
+
+    brand_citations = 0
+
+    prompts_with_brand = []
+
+    prompts_without_brand = []
+
+
+
+    for p in prompt_analyses:
+
+        brand_cited_here = any(
+
+            d["domain"] == customer_domain
+
+            for d in p["top_domains"]
+
         )
 
-    prompt = state.prompts[0]
+        if brand_cited_here:
 
-    # Development adapter only.
-    #
-    # Production ACA should replace this with the AImpact REST client.
-    from aca.tools.aimpact import (
-        get_campaign,
-        get_project,
+            prompts_with_brand.append(p["prompt_id"])
+
+            for d in p["top_domains"]:
+
+                if d["domain"] == customer_domain:
+
+                    brand_citations += d["citation_count"]
+
+        else:
+
+            prompts_without_brand.append({
+
+                "prompt_id": p["prompt_id"],
+
+                "prompt_text": p["prompt_text"],
+
+                "average_score": p["average_score"],
+
+            })
+
+
+
+    brand_visibility = {
+
+        "customer_domain": customer_domain,
+
+        "customer_company": company_name or "Unknown",
+
+        "total_brand_citations": brand_citations,
+
+        "prompts_citing_brand_count": len(prompts_with_brand),
+
+        "prompts_missing_brand_count": len(prompts_without_brand),
+
+        "prompts_missing_brand": prompts_without_brand[:10],
+
+    }
+
+
+
+    # 5. Strategic Publishing Opportunities
+
+    strategic_opportunities = []
+
+
+
+    if common_domains:
+
+        lead = common_domains[0]
+
+        strategic_opportunities.append({
+
+            "scope": "cross_prompt_authority",
+
+            "observation": (
+
+                f"'{lead['domain']}' is the universal authority across low-scoring queries, "
+
+                f"appearing in {lead['prompts_cited_in_count']}/{total_prompts} prompts "
+
+                f"({lead['prompts_cited_in_percent']}%) across models {', '.join(lead['models_citing'])}."
+
+            ),
+
+            "suggested_strategy": (
+
+                f"Analyze the technical depth and citation structure of {lead['domain']} "
+
+                "to benchmark your brand's technical specifications and documentation."
+
+            ),
+
+        })
+
+
+
+    if ecosystems.get("academic_research"):
+
+        strategic_opportunities.append({
+
+            "scope": "ecosystem_academic",
+
+            "observation": (
+
+                f"{len(ecosystems['academic_research'])} queries fall into the Academic / Research ecosystem. "
+
+                "AI models heavily weight PubMed, NIH, and peer-reviewed journals for these questions."
+
+            ),
+
+            "suggested_strategy": (
+
+                "For research queries, publish peer-reviewed whitepapers, protocol validations, "
+
+                "and open-access technical notes rather than promotional sales copy."
+
+            ),
+
+        })
+
+
+
+    if ecosystems.get("commercial_vendor"):
+
+        strategic_opportunities.append({
+
+            "scope": "ecosystem_commercial",
+
+            "observation": (
+
+                f"{len(ecosystems['commercial_vendor'])} queries trigger Commercial / Vendor sources. "
+
+                "AI models cite product specification pages, platform catalogs, and service overviews."
+
+            ),
+
+            "suggested_strategy": (
+
+                "For commercial service queries, publish transparent capability matrices, "
+
+                "instrument spec sheets, and sample-to-answer service workflows."
+
+            ),
+
+        })
+
+
+
+    if brand_visibility["prompts_missing_brand_count"] > 0:
+
+        strategic_opportunities.append({
+
+            "scope": "brand_gap",
+
+            "observation": (
+
+                f"Your brand is completely unmentioned across {brand_visibility['prompts_missing_brand_count']} "
+
+                "low-scoring queries where competitors and authority domains are cited."
+
+            ),
+
+            "suggested_strategy": (
+
+                "Prioritize targeted content pieces specifically answering the unanswered queries "
+
+                f"listed in 'prompts_missing_brand'."
+
+            ),
+
+        })
+
+
+
+    return {
+
+        "common_domains": common_domains,
+
+        "source_ecosystem_breakdown": ecosystems,
+
+        "multi_model_consensus_domains": consensus_domains,
+
+        "brand_visibility": brand_visibility,
+
+        "strategic_publishing_opportunities": strategic_opportunities,
+
+    }
+
+
+
+
+
+# ---------------------------------------------------------------------------
+
+# Master Dataset Intelligence Orchestrator
+
+# ---------------------------------------------------------------------------
+
+
+
+
+
+def analyze_campaign_dataset(
+
+    data: dict[str, Any],
+
+    score_threshold: float = 70.0,
+
+    company_url: str | None = None,
+
+) -> dict[str, Any]:
+
+    """
+
+    Main analysis pipeline:
+
+    1. Campaign summary
+
+    2. Low-scoring summary
+
+    3. Individual prompt analysis for every low-scoring prompt
+
+    4. Cross-prompt insights synthesis
+
+    """
+
+    responses = as_list(data.get("responses"))
+
+    content_map = (
+
+        data.get("source_content")
+
+        if isinstance(data.get("source_content"), dict)
+
+        else {}
+
     )
 
-    campaign = get_campaign(
-        state.campaign_id
+    campaign_info = data.get("campaign") or {}
+
+    project_info = data.get("project") or {}
+
+
+
+    active_company_url = (
+
+        company_url
+
+        or project_info.get("company_url")
+
+        or os.getenv("COMPANY_URL")
+
     )
 
-    project = get_project(
-        campaign["project_id"]
-    )
-    if state.company_url:
-        project["company_url"] = state.company_url
+    if not active_company_url and "alamar" in (project_info.get("company_name") or "").lower():
 
-    analyzer = SourceAnalyzer()
+        active_company_url = "https://alamarbio.com"
 
-    state.gap = analyzer.analyze(
-        project=project,
-        prompt_evidence=prompt,
+
+
+    # Group responses by prompt_id
+
+    prompts: dict[str, dict[str, Any]] = {}
+
+    for r in responses:
+
+        if not isinstance(r, dict):
+
+            continue
+
+        pid = str(r.get("prompt_id") or "")
+
+        ptext = str(r.get("prompt") or r.get("prompt_text") or "").strip()
+
+        if not pid or not ptext:
+
+            continue
+
+
+
+        if pid not in prompts:
+
+            prompts[pid] = {
+
+                "prompt_id": pid,
+
+                "prompt_text": ptext,
+
+                "intent_category": str(r.get("intent_category") or ""),
+
+                "scores": [],
+
+                "responses": [],
+
+            }
+
+
+
+        s = r.get("score")
+
+        if s is not None:
+
+            try:
+
+                prompts[pid]["scores"].append(float(s))
+
+            except (ValueError, TypeError):
+
+                pass
+
+        prompts[pid]["responses"].append(r)
+
+
+
+    # Compute average score per prompt
+
+    for p in prompts.values():
+
+        scores = p["scores"]
+
+        p["average_score"] = (
+
+            round(sum(scores) / len(scores), 1) if scores else 0.0
+
+        )
+
+
+
+    # Filter to low-scoring prompts
+
+    low_scoring_prompts = [
+
+        p for p in prompts.values() if p["average_score"] < score_threshold
+
+    ]
+
+    low_scoring_prompts.sort(key=lambda x: x["average_score"])
+
+
+
+    # Only prompts strictly below the threshold are analyzed.
+    # There is intentionally no fallback to higher-scoring prompts.
+
+    # 1. Individual Prompt Analysis
+
+    prompt_analyses = [
+
+        analyze_single_prompt(p, content_map)
+
+        for p in low_scoring_prompts
+
+    ]
+
+
+
+    # 2. Claude Haiku analysis for EVERY low-scoring prompt
+    attach_haiku_analyses(prompt_analyses)
+
+    # 3. Cross-Prompt Insights
+
+    cross_insights = analyze_cross_prompt_insights(
+
+        prompt_analyses=prompt_analyses,
+
+        company_name=project_info.get("company_name"),
+
+        company_url=active_company_url,
+
     )
+
+
+
+    # 3. Low-Scoring Summary Aggregation
+
+    total_low_responses = sum(p["response_count"] for p in prompt_analyses)
+
+    total_low_citations = sum(p["citation_count"] for p in prompt_analyses)
+
+    all_low_scores = [
+
+        p["average_score"]
+
+        for p in prompt_analyses
+
+        if p["average_score"] is not None
+
+    ]
+
+    avg_low_score = (
+
+        round(sum(all_low_scores) / len(all_low_scores), 1)
+
+        if all_low_scores
+
+        else 0.0
+
+    )
+
+
+
+    low_model_counts = Counter()
+
+    low_category_counts = Counter()
+
+    low_format_counts = Counter()
+
+    low_domains = Counter()
+
+
+
+    for p in prompt_analyses:
+
+        for m in p["model_breakdown"]:
+
+            low_model_counts[m["model"]] += m["citation_count"]
+
+        for c in p["source_type_summary"]:
+
+            low_category_counts[c["source_type"]] += c["citation_count"]
+
+        for f in p["content_type_summary"]:
+
+            low_format_counts[f["content_type"]] += f["citation_count"]
+
+        for d in p["top_domains"]:
+
+            low_domains[d["domain"]] += d["citation_count"]
+
+
+
+    denom = max(1, total_low_citations)
+
+    low_summary = {
+
+        "low_scoring_prompt_count": len(prompt_analyses),
+
+        "low_scoring_response_count": total_low_responses,
+
+        "low_scoring_citation_count": total_low_citations,
+
+        "average_score": avg_low_score,
+
+        "unique_cited_domain_count": len(low_domains),
+
+        "model_breakdown": [
+
+            {
+
+                "model": k,
+
+                "citation_count": v,
+
+                "share_percent": round(v / denom * 100, 1),
+
+            }
+
+            for k, v in low_model_counts.most_common()
+
+        ],
+
+        "top_domains": [
+
+            {"domain": k, "citation_count": v}
+
+            for k, v in low_domains.most_common(15)
+
+        ],
+
+        "source_type_summary": [{
+
+                "source_type": k,
+
+                "citation_count": v,
+
+                "share_percent": round(v / denom * 100, 1),
+
+            }
+
+            for k, v in low_category_counts.most_common()
+
+        ],
+
+        "content_type_summary": [
+
+            {
+
+                "content_type": k,
+
+                "citation_count": v,
+
+                "share_percent": round(v / denom * 100, 1),
+
+            }
+
+            for k, v in low_format_counts.most_common()
+
+        ],
+
+    }
+
+
+
+    # 4. Campaign Summary
+
+    campaign_summary = {
+
+        "campaign_id": campaign_info.get("id"),
+
+        "campaign_name": campaign_info.get("name"),
+
+        "company_name": project_info.get("company_name"),
+
+        "company_url": project_info.get("company_url"),
+
+        "region": project_info.get("region"),
+
+        "score_threshold": score_threshold,
+
+        "total_prompts_audited": len(prompts),
+
+        "total_responses_analyzed": len(responses),
+
+        "total_citations_analyzed": sum(
+
+            len(as_list(r.get("citations")) or as_list(r.get("sources")))
+
+            for r in responses
+
+            if isinstance(r, dict)
+
+        ),
+
+    }
+
+
+
+    return {
+
+        "report_version": "3.0",
+        "analysis_engine": {
+            "provider": "Anthropic",
+            "model": HAIKU_MODEL,
+            "max_concurrent": MAX_CONCURRENT,
+        },
+
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(
+
+            timespec="seconds"
+
+        ),
+
+        "scope_note": (
+
+            "Source Intelligence analysis across individual low-scoring prompts "
+
+            "and synthesized cross-prompt authority ecosystems. "
+
+            "Visible citations only; does not infer hidden model reasoning."
+
+        ),
+
+        "campaign_summary": campaign_summary,
+
+        "low_scoring_summary": low_summary,
+
+        "prompt_analysis": prompt_analyses,
+
+        "cross_prompt_insights": cross_insights,
+
+    }
+
+
+
+
+
+# ---------------------------------------------------------------------------
+
+# LangGraph / Workflow Agent entrypoint
+
+# ---------------------------------------------------------------------------
+
+
+
+
+
+async def run(state: WorkflowState) -> WorkflowState:
+
+    """
+
+    Run Source Intelligence analysis for the campaign in WorkflowState.
+
+    Connects to AImpact to retrieve campaign data, AI responses, and citations,
+
+    analyzes each low-scoring prompt individually and cross-prompt,
+
+    and stores the resulting ContentGap in state.
+
+    """
+
+    campaign_id = state.campaign_id
+
+    if not campaign_id:
+
+        raise ValueError("WorkflowState must contain a valid campaign_id.")
+
+
+
+    dataset = get_campaign_audit_dataset(campaign_id=campaign_id)
+
+    report = analyze_campaign_dataset(
+
+        dataset,
+
+        score_threshold=70.0,
+
+        company_url=state.company_url,
+
+    )
+
+
+
+    cross = report.get("cross_prompt_insights", {})
+
+    common_domains = [
+
+        d["domain"] for d in cross.get("common_domains", [])[:10]
+
+    ]
+
+
+
+    strategic_opps = cross.get("strategic_publishing_opportunities", [])
+
+    if strategic_opps:
+
+        opportunity_text = strategic_opps[0].get("observation", "")
+
+        angle_text = strategic_opps[0].get("suggested_strategy", "")
+
+    else:
+
+        opportunity_text = "Source intelligence analysis complete."
+
+        angle_text = "Review top cited sources."
+
+
+
+    prompt_id = (
+
+        str(state.prompts[0].prompt_id)
+
+        if state.prompts
+
+        else f"campaign-{campaign_id}"
+
+    )
+
+    prompt_text = (
+
+        state.prompts[0].prompt_text
+
+        if state.prompts
+
+        else f"Campaign {campaign_id} Analysis"
+
+    )
+
+
+
+    state.gap = ContentGap(
+
+        prompt_id=prompt_id,
+
+        prompt_text=prompt_text,
+
+        candidate_themes=common_domains,
+
+        themes=common_domains,
+
+        target_angle=angle_text,
+
+        opportunity=opportunity_text,
+
+        hypothesis=(
+
+            f"Common cited authority domains across low-scoring queries: "
+
+            f"{', '.join(common_domains[:5])}."
+
+        ),
+
+        content_gap_status="established" if common_domains else "not_established",
+
+    )
+
+
 
     return state
+
+
+
+
+
+# ---------------------------------------------------------------------------
+
+# CLI entrypoint
+
+# ---------------------------------------------------------------------------
+
+
+
+
+
+def main() -> None:
+
+    parser = argparse.ArgumentParser(
+
+        description="AImpact Source Intelligence Analyzer: prompt-level & cross-prompt intelligence."
+
+    )
+
+    parser.add_argument(
+
+        "--campaign-id",
+
+        type=int,
+
+        default=None,
+
+        help="AImpact Campaign ID to analyze (defaults to CAMPAIGN_ID env var, or 81)",
+
+    )
+
+    parser.add_argument(
+
+        "--score-threshold",
+
+        type=float,
+
+        default=70.0,
+
+        help="Score threshold for low-scoring prompts (default: 70.0)",
+
+    )
+
+    parser.add_argument(
+
+        "--latest-only",
+
+        action="store_true",
+
+        help="Analyze only the latest audit per prompt/model combination",
+
+    )
+
+    parser.add_argument(
+
+        "--company-url",
+
+        default=None,
+
+        help="Optional company website URL to assess brand visibility",
+
+    )
+
+    parser.add_argument(
+
+        "--output",
+
+        default="source_intelligence_report.json",
+
+        help="Path for output report JSON (default: source_intelligence_report.json)",
+
+    )
+
+    args = parser.parse_args()
+
+
+
+    campaign_id = (
+
+        args.campaign_id
+
+        or int(os.getenv("CAMPAIGN_ID", "81"))
+
+    )
+
+
+
+    print(f"Connecting to AImpact database for Campaign {campaign_id}...")
+
+    dataset = get_campaign_audit_dataset(
+
+        campaign_id=campaign_id,
+
+        score_threshold=None,  # Load all so we can categorize by prompt score
+
+        latest_only=args.latest_only,
+
+    )
+
+
+
+    campaign_name = dataset.get("campaign", {}).get("name", "Unknown")
+
+    company_name = dataset.get("project", {}).get("company_name", "Unknown")
+
+    print(f"Campaign: {campaign_name} | Company: {company_name}")
+
+    print(f"Score threshold for low-scoring queries: < {args.score_threshold}")
+
+
+
+    report = analyze_campaign_dataset(
+
+        dataset,
+
+        score_threshold=args.score_threshold,
+
+        company_url=args.company_url,
+
+    )
+
+    output = Path(args.output)
+
+    output.write_text(
+
+        json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
+
+    )
+
+
+
+    print(f"\nReport written to: {output.resolve()}")
+
+
+
+    camp_sum = report["campaign_summary"]
+
+    low_sum = report["low_scoring_summary"]
+
+    prompt_list = report["prompt_analysis"]
+
+    cross = report["cross_prompt_insights"]
+
+
+
+    print("\n================================================================================")
+
+    print("CAMPAIGN & LOW-SCORING SUMMARY")
+
+    print("================================================================================")
+
+    print(f"Total Prompts Audited: {camp_sum['total_prompts_audited']}")
+
+    print(f"Low-Scoring Prompts Analyzed: {low_sum['low_scoring_prompt_count']}")
+
+    print(f"Average Score (Low-Scoring): {low_sum['average_score']}")
+
+    print(f"Total Low-Scoring Citations: {low_sum['low_scoring_citation_count']}")
+
+    print(f"Unique Domains Cited: {low_sum['unique_cited_domain_count']}")
+
+
+
+    print("\nModel Citations Breakdown (Low-Scoring):")
+
+    for m in low_sum["model_breakdown"]:
+
+        print(f"  {m['model']}: {m['citation_count']} citations ({m['share_percent']}%)")
+
+
+
+    print("\n================================================================================")
+
+    print("INDIVIDUAL LOW-SCORING PROMPT ANALYSIS")
+
+    print("================================================================================")
+
+    for p in prompt_list:
+
+        print(f"\n[Prompt {p['prompt_id']}] (Score: {p['average_score']}) | Ecosystem: {p['dominant_ecosystem']}")
+
+        print(f'  Question: "{p["prompt_text"]}"')
+
+        print(f"  Citations: {p['citation_count']} across {p['unique_domain_count']} domains ({len(p['models_analyzed'])} models)")
+
+        top_3 = ", ".join(f"{d['domain']} ({d['citation_count']})" for d in p["top_domains"][:5])
+
+        print(f"  Top Domains: {top_3 or 'None'}")
+
+        if p["multi_model_sources"]:
+
+            mm_lead = p["multi_model_sources"][0]
+
+            print(f"  Consensus Source: {mm_lead['domain']} (cited by {', '.join(mm_lead['models'])})")
+
+        if p["publishing_opportunities"]:
+
+            print(f"  Opportunity: {p['publishing_opportunities'][0]['observation']}")
+
+
+
+    print("\n================================================================================")
+
+    print("CROSS-PROMPT INSIGHTS & SOURCE ECOSYSTEMS")
+
+    print("================================================================================")
+
+    print("\nTop Universal Authority Domains (across prompts):")
+
+    for d in cross.get("common_domains", [])[:8]:
+
+        print(
+
+            f"  * {d['domain']}: cited in {d['prompts_cited_in_count']}/{low_sum['low_scoring_prompt_count']} prompts "
+
+            f"({d['prompts_cited_in_percent']}%) | Total citations: {d['total_citations']}"
+
+        )
+
+
+
+    ecos = cross.get("source_ecosystem_breakdown", {})
+
+    print("\nSource Ecosystems by Query Type:")
+
+    for eco_name, prompts_in_eco in ecos.items():
+
+        if prompts_in_eco:
+
+            print(f"  * {eco_name.upper()} ({len(prompts_in_eco)} queries):")
+
+            for p_sub in prompts_in_eco[:3]:
+
+                print(f'      - "{p_sub["prompt_text"][:60]}..." (Top: {", ".join(p_sub["top_domains"])})')
+
+
+
+    b_vis = cross.get("brand_visibility", {})
+
+    if b_vis:
+
+        print(f"\nBrand Visibility ({b_vis['customer_company']} / {b_vis['customer_domain']}):")
+
+        print(f"  * Brand Cited In: {b_vis['prompts_citing_brand_count']} prompts ({b_vis['total_brand_citations']} citations)")
+
+        print(f"  * Brand Completely Missing In: {b_vis['prompts_missing_brand_count']} low-scoring prompts")
+
+
+
+    print("\nStrategic Opportunities:")
+
+    for opp in cross.get("strategic_publishing_opportunities", []):
+
+        print(f"  * [{opp['scope']}] {opp['observation']}")
+
+        print(f"    Action: {opp['suggested_strategy']}")
+
+
+
+
+
+if __name__ == "__main__":
+
+    main()
+
