@@ -338,6 +338,130 @@ def get_source_analyzer_input(
     return project, prompts
 
 
+def list_campaigns(project_id: int) -> list[dict]:
+    """Campaigns that belong to one AImpact project."""
+    query = """
+        SELECT
+            id,
+            project_id,
+            name
+        FROM campaigns
+        WHERE project_id = %s
+        ORDER BY id;
+    """
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, (project_id,))
+            return list(cur.fetchall())
+
+
+def get_project_audit_dataset(
+    project_id: int,
+    score_threshold: float | None = None,
+    latest_only: bool = True,
+) -> dict[str, Any]:
+    """
+    Latest AI answers and citations for every campaign in one AImpact project.
+
+    This is the input for Agent 1. ``score_threshold`` is applied later, per
+    prompt, so a low-scoring prompt keeps every model's answer.
+    """
+    project = get_project(project_id)
+    campaigns = list_campaigns(project_id)
+    campaign_names = {row["id"]: row["name"] for row in campaigns}
+
+    query = """
+        SELECT
+            a.id AS audit_score_id,
+            a.project_id,
+            a.campaign_id,
+            a.prompt_id,
+            a.score,
+            a.model_name,
+            a.region,
+            a.response_text,
+            a.sources,
+            a.created_at,
+
+            cp.prompt_text,
+            cp.intent_category
+
+        FROM audit_scores a
+
+        LEFT JOIN campaign_prompts cp
+            ON cp.id = a.prompt_id
+
+        WHERE a.project_id = %s
+          AND a.prompt_id IS NOT NULL
+
+        ORDER BY
+            a.created_at DESC;
+    """
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, (project_id,))
+            rows = cur.fetchall()
+
+    if latest_only:
+        latest: dict[tuple[int, str], dict] = {}
+        for row in rows:
+            key = (row["prompt_id"], row["model_name"] or "")
+            if key not in latest:
+                latest[key] = row
+        rows = list(latest.values())
+
+    if score_threshold is not None:
+        rows = [
+            r for r in rows
+            if r["score"] is not None and r["score"] < score_threshold
+        ]
+
+    responses = []
+    for row in rows:
+        model_name = str(row["model_name"] or "unknown")
+        raw_sources = _normalize_sources(row["sources"], model_name)
+        citations = []
+        for s in raw_sources:
+            citations.append({
+                "url": s.url or "",
+                "title": s.title or "",
+                "domain": s.domain or "",
+                "content": s.excerpt or "",
+                "competitor": s.competitor,
+            })
+
+        timestamp = ""
+        if row["created_at"]:
+            if hasattr(row["created_at"], "isoformat"):
+                timestamp = row["created_at"].isoformat()
+            else:
+                timestamp = str(row["created_at"])
+
+        responses.append({
+            "audit_score_id": row["audit_score_id"],
+            "campaign_id": row["campaign_id"],
+            "campaign_name": campaign_names.get(row["campaign_id"], ""),
+            "prompt_id": str(row["prompt_id"]),
+            "prompt": row["prompt_text"] or "",
+            "intent_category": row["intent_category"] or "",
+            "model": model_name,
+            "score": float(row["score"]) if row["score"] is not None else None,
+            "region": row["region"] or "",
+            "timestamp": timestamp,
+            "answer": row["response_text"] or "",
+            "citations": citations,
+        })
+
+    return {
+        "project": project,
+        "campaigns": campaigns,
+        "responses": responses,
+        "source_content": {},
+    }
+
+
 def get_campaign_audit_dataset(
     campaign_id: int,
     score_threshold: float | None = None,
