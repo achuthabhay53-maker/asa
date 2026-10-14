@@ -16,6 +16,9 @@ langgraph==0.2.*
 # LLM (Claude only)
 anthropic==0.39.*
 
+# Search
+tavily-python==0.5.*
+
 # Observability
 langfuse==2.52.*
 opentelemetry-sdk==1.28.*
@@ -27,6 +30,9 @@ boto3==1.35.*                  # KMS / Secrets Manager
 
 # Scheduling
 apscheduler==3.10.*
+
+# Demo
+streamlit==1.40.*
 
 # Dev
 pytest==8.3.*

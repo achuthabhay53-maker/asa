@@ -19,10 +19,13 @@ from urllib.parse import urlparse
 import httpx
 from dotenv import load_dotenv
 from aca.models.ground_truth import (
+    Agent4HandoffPackage,
     CandidateSubtopic,
     CheckedFrom,
     ClaimType,
     ClientInput,
+    CompanyInfo,
+    CompanyTalkingPoint,
     Confidence,
     DoNotWrite,
     Evidence,
@@ -33,8 +36,10 @@ from aca.models.ground_truth import (
     FactStatus,
     GroundTruthGuide,
     HeadingItem,
+    LimitedClaimHandoff,
     LimitedStatement,
     PromptContext,
+    PromptContextHandoff,
     PromptUnderstandingInput,
     PromptVerification,
     Relevance,
@@ -44,6 +49,7 @@ from aca.models.ground_truth import (
     TopicDecision,
     TopicVerdict,
     UnresolvedClaim,
+    VerificationHandoff,
     VerifiedFact,
 )
 from aca.tools.web_research import WebResearch, get_web_research
@@ -149,8 +155,11 @@ def _string_list(raw: Any) -> list[str]:
 
 
 def _extract_json(text: str) -> dict[str, Any]:
+    # Strip markdown fences
     text = re.sub(r"^\s*```(?:json)?\s*", "", text.strip(), flags=re.I)
     text = re.sub(r"\s*```\s*$", "", text)
+
+    # Direct parse
     try:
         data = json.loads(text, strict=False)
         if isinstance(data, dict):
@@ -158,6 +167,7 @@ def _extract_json(text: str) -> dict[str, Any]:
     except Exception:
         pass
 
+    # Slice from first { to last }
     start, end = text.find("{"), text.rfind("}")
     if start >= 0 and end > start:
         candidate = text[start:end + 1]
@@ -167,17 +177,26 @@ def _extract_json(text: str) -> dict[str, Any]:
                 return data
         except Exception:
             pass
+        # Try json_repair on the sliced candidate
+        try:
+            import json_repair  # type: ignore[import]
+            data = json_repair.loads(candidate)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
 
-    # Try json_repair if available
+    # Last resort: json_repair on the full text
     try:
-        import json_repair
+        import json_repair  # type: ignore[import]
         data = json_repair.loads(text)
         if isinstance(data, dict):
             return data
     except Exception:
         pass
 
-    raise ValueError("Claude did not return a valid JSON object.")
+    preview = text[:300].replace("\n", " ")
+    raise ValueError(f"Claude did not return a valid JSON object. Preview: {preview!r}")
 
 
 
@@ -521,7 +540,7 @@ Rules:
         system = """You are Agent 3 in a content intelligence pipeline (Ground Truth & Research Discovery).
 Your job is to discover what the company can write about and organize researched evidence so Agent 4 can decide the content strategy.
 
-Return one JSON object:
+Return one JSON object with exactly these keys:
 {
   "main_topic": "Central subject of the prompt",
   "search_intent": "What the intended reader wants to know",
@@ -532,47 +551,73 @@ Return one JSON object:
       "title": "Subtopic Title",
       "description": "What this subtopic covers and why it is valuable to the reader",
       "topic_angle": "company_capability | industry_context | comparison_methodology | educational_guide",
-      "relevance_to_main_topic": "high | medium",
+      "relevance_to_main_topic": "high | medium | low",
       "evidence_status": "supported | needs_more_research",
+      "research_needed": ["Specific claim that needs evidence before this subtopic can be written"],
       "suggested_questions": ["Key question 1", "Key question 2"],
-      "evidence_quotes": ["Exact quote from supplied text supporting this subtopic"]
+      "evidence_quotes": ["Exact verbatim quote copied from the supplied research_evidence text"]
     }
   ],
   "verified_facts": [
     {
-      "statement": "Concrete verified factual statement",
+      "statement": "Concrete factual statement",
       "category": "company_capability | product_technology | industry_context | regulatory_certification | service_scope",
       "evidence_type": "company_website | reputable_external",
       "confidence": "high | medium",
-      "wording_boundary": "Specific limitation or boundary (or empty string)",
-      "evidence_quote": "Exact quote from supplied text"
+      "wording_boundary": "What the evidence does NOT support (or empty string if no boundary)",
+      "evidence_quote": "Exact verbatim quote copied from the supplied research_evidence text"
     }
   ],
   "research_gaps": [
     {
-      "topic_or_question": "Topic or question relevant to the prompt that lacks sufficient evidence",
-      "reason": "Why the current evidence is inconclusive or what is missing",
-      "suggested_search_direction": "Suggested direction for further research"
+      "topic_or_question": "Topic or question that is relevant to the prompt but lacks evidence",
+      "missing_claim": "The specific assertion that could not be verified (e.g. 'Alamar offers 5-day turnaround for custom assay development')",
+      "reason": "Why the current evidence is inconclusive: what is present, what is absent",
+      "suggested_search_direction": "Exact search query or page type that would resolve this gap",
+      "affects_subtopic_ids": []
     }
   ],
   "limitations": [
-    "Claims or subjects that must be avoided or qualified (e.g., no superlatives like '#1', 'most sensitive', 'leader'; research-use-only products must not be stated as diagnostic services without proof)"
+    "A specific claim or wording that must be avoided or qualified"
   ]
 }
 
 Rules:
-1. Topic Discovery vs Topic Approval:
-   - Your job is discovery and evidence organization. Do NOT decide the final brief; Agent 4 makes the final approval and outline decisions.
-2. Broad Industry vs Company Services:
-   - Preserve broad industry subtopics (e.g. general assay comparison, technology tradeoffs, clinical significance). Do NOT force every subtopic to promote the company.
-3. Two Evidence Types:
-   - Distinguish company-specific claims (sourced from company_website) from broader industry context (sourced from reputable_external).
-4. Evidence Grounding:
-   - Every supported candidate subtopic and verified fact must be grounded in an exact quote present in the supplied pages.
-   - If an important topic lacks direct quote evidence, mark its evidence_status as 'needs_more_research' and include a research_gap entry.
+1. Prompt Focus:
+   - The original_prompt is the anchor. Every candidate subtopic must directly help a reader evaluate the company for THAT prompt.
+   - Topics about geography, regulatory compliance, dried blood spots, neurology applications, or technology comparisons are only valid if the original prompt specifically requests them. If not requested, tag them relevance_to_main_topic=low and include a note in description.
+   - Do NOT expand the scope. Agent 4 decides whether to include optional topics.
+
+2. Evidence Grounding for Facts:
+   - A verified_fact MUST include a non-empty evidence_quote that is verbatim from the supplied research_evidence.
+   - If you cannot find an exact quote for a claim, do NOT include it as a verified_fact. Either omit it or add it as a research_gap.
+   - wording_boundary must state what the quote does NOT support if the claim could be read more broadly than the quote.
+
+3. Support Status Grading:
+   - evidence_status='supported' requires at least one verbatim quote in evidence_quotes that directly supports the title and description.
+   - If you can find a quote about a related product but not about the specific capability in the description, use evidence_status='needs_more_research'.
+   - Do NOT mark a subtopic supported just because the company makes a related product.
+
+4. Specific Research Gaps:
+   - Every research_gap must identify: (a) the exact claim that is unverified in missing_claim, (b) what evidence exists and what is absent in reason, (c) a concrete search direction in suggested_search_direction.
+   - Vague gaps like 'more research needed on platform capabilities' are not acceptable.
+
 5. No Superlatives:
    - Never use superlatives like 'best', 'leading', '#1', 'world's first', or 'unmatched' unless verified by a first-party factual certification.
-6. JSON only."""
+
+6. JSON only. No preamble, no explanation."""
+
+        # Keep each page snippet small so the payload stays within Claude's
+        # context window and leaves enough room for a full JSON response.
+        _SNIPPET = 4_000
+        trimmed_evidence = [
+            {
+                "url": p["url"],
+                "source_type": p.get("source_type", "company_website"),
+                "text_snippet": p["text_snippet"][:_SNIPPET] if isinstance(p.get("text_snippet"), str) else "",
+            }
+            for p in packed_evidence
+        ]
 
         payload = {
             "customer_name": client_name,
@@ -585,11 +630,12 @@ Rules:
                 "prompt_scope": understanding.get("prompt_scope") or "hybrid",
             },
             "known_facts": known_facts,
-            "research_evidence": packed_evidence,
+            "research_evidence": trimmed_evidence,
         }
 
         try:
-            data = self._complete(system, payload, max_tokens=4096)
+            # 8192 tokens gives enough room for a rich subtopic JSON response
+            data = self._complete(system, payload, max_tokens=8192)
         except Exception as exc:
             print(f"  Subtopic discovery LLM failed: {exc}")
             data = {}
@@ -625,15 +671,69 @@ Rules:
                     return ev_id
             return None
 
-        # Seed evidence from known checked facts
+        # Seed evidence from known checked facts.
+        # Fix A: Force-register every checked-fact quote as an EvidenceItem even if
+        # the verbatim text is not found in the scraped pages (checked-fact quotes come
+        # from the checking LLM which may paraphrase slightly). We use the source URL
+        # from the checked evidence object to construct the item directly.
+        def _force_register_evidence(
+            quote: str, url: str, source_tier: str
+        ) -> str | None:
+            """Register a quote unconditionally using its known URL, bypassing page-text match."""
+            q_clean = _clean(quote)
+            if len(q_clean) < 25:
+                return None
+            key = q_clean.lower()
+            if key in evidence_map:
+                return evidence_map[key]
+            ev_id = f"ev_{len(evidence_items) + 1:03d}"
+            stype: str = "company_website" if source_tier == "first_party" or _host(url) == client_host else "reputable_external"
+            item = EvidenceItem(
+                evidence_id=ev_id,
+                url=url,
+                quote=q_clean,
+                source_type=stype,
+                domain=_host(url),
+            )
+            evidence_items.append(item)
+            evidence_map[key] = ev_id
+            return ev_id
+
+        # Map checked-fact quote -> evidence_id so facts can be linked back
+        checked_fact_ev_map: dict[str, list[str]] = {}  # fact_id -> [ev_id, ...]
         for f in checked_guide.can_write:
+            ev_ids_for_fact: list[str] = []
             for ev in f.evidence:
-                add_evidence(ev.quote, "company_website" if ev.source_tier == "first_party" else "reputable_external")
+                eid = add_evidence(ev.quote, "company_website" if ev.source_tier == "first_party" else "reputable_external")
+                if eid is None and ev.url:
+                    eid = _force_register_evidence(ev.quote, ev.url, ev.source_tier)
+                if eid:
+                    ev_ids_for_fact.append(eid)
+            checked_fact_ev_map[f.fact_id] = ev_ids_for_fact
         for l in checked_guide.can_write_with_limits:
+            ev_ids_for_fact = []
             for ev in l.evidence:
-                add_evidence(ev.quote, "company_website" if ev.source_tier == "first_party" else "reputable_external")
+                eid = add_evidence(ev.quote, "company_website" if ev.source_tier == "first_party" else "reputable_external")
+                if eid is None and ev.url:
+                    eid = _force_register_evidence(ev.quote, ev.url, ev.source_tier)
+                if eid:
+                    ev_ids_for_fact.append(eid)
+            checked_fact_ev_map[l.fact_id] = ev_ids_for_fact
 
         # 2. Parse candidate subtopics
+        # Build a quick lookup: quote_norm -> fact_id for verified_fact_ids linking
+        fact_quote_index: dict[str, str] = {}
+        for f in checked_guide.can_write:
+            for ev in f.evidence:
+                fact_quote_index[_clean(ev.quote).lower()] = f.fact_id
+        for l in checked_guide.can_write_with_limits:
+            for ev in l.evidence:
+                fact_quote_index[_clean(ev.quote).lower()] = l.fact_id
+
+        # Build a valid set of fact IDs to validate references against
+        # (populated after verified_facts are built — used in gap linkage below)
+        valid_fact_id_set: set[str] = set()
+
         candidate_subtopics: list[CandidateSubtopic] = []
         for idx, item in enumerate(data.get("candidate_subtopics") or [], start=1):
             if not isinstance(item, dict):
@@ -641,15 +741,36 @@ Rules:
             title = _clean(str(item.get("title") or ""))
             if not title:
                 continue
-            ev_ids = []
+
+            ev_ids: list[str] = []
+            vfact_ids: list[str] = []
             for q in item.get("evidence_quotes") or []:
                 ev_id = add_evidence(str(q))
                 if ev_id:
                     ev_ids.append(ev_id)
+                # Cross-link to a verified fact if the same quote grounds one
+                q_key = _clean(str(q)).lower()
+                if q_key in fact_quote_index:
+                    fid = fact_quote_index[q_key]
+                    if fid not in vfact_ids:
+                        vfact_ids.append(fid)
 
-            status = str(item.get("evidence_status") or "supported").strip().lower()
-            if status not in {"supported", "needs_more_research", "unsupported"}:
-                status = "supported" if ev_ids else "needs_more_research"
+            # Fix 2: Strip any IDs that are not in the fact_xxx namespace.
+            # LLMs sometimes emit limit_xxx or ev_xxx here by mistake.
+            vfact_ids = [fid for fid in vfact_ids if fid.startswith("fact_")]
+
+            # Fix 3: Stricter support_status — fully_supported requires BOTH
+            # an evidence record AND a verified-fact cross-link.
+            raw_status = str(item.get("evidence_status") or "").strip().lower()
+            if ev_ids and vfact_ids:
+                support_status: str = "fully_supported"
+            elif ev_ids:
+                # Evidence quote exists but no matching verified fact → partial
+                support_status = "partially_supported"
+            elif raw_status == "needs_more_research":
+                support_status = "needs_more_research"
+            else:
+                support_status = "needs_more_research"
 
             angle = str(item.get("topic_angle") or "company_capability").strip().lower()
             if angle not in {"company_capability", "industry_context", "comparison_methodology", "educational_guide"}:
@@ -659,18 +780,26 @@ Rules:
             if relevance not in _RELEVANCE:
                 relevance = "high"
 
+            research_needed = _string_list(item.get("research_needed"))
+            if support_status in {"needs_more_research", "partially_supported"} and not research_needed:
+                research_needed = [f"Find primary evidence for: {title}"]
+
             candidate_subtopics.append(CandidateSubtopic(
                 subtopic_id=f"subtopic_{idx:03d}",
                 title=title,
                 description=_clean(str(item.get("description") or "")),
                 topic_angle=angle,
-                relevance_to_main_topic=relevance,
-                evidence_status=status,
+                relevance=relevance,
+                support_status=support_status,
+                verified_fact_ids=vfact_ids,
                 evidence_ids=ev_ids,
+                research_needed=research_needed,
                 suggested_questions=_string_list(item.get("suggested_questions")),
             ))
 
         # 3. Parse verified facts
+        # Fix B: after building facts, link them to the evidence IDs we seeded from
+        # checked facts (checked_fact_ev_map) so facts don't remain evidence-orphaned.
         verified_facts: list[VerifiedFact] = []
         for idx, item in enumerate(data.get("verified_facts") or [], start=1):
             if not isinstance(item, dict):
@@ -680,47 +809,116 @@ Rules:
                 continue
             q = str(item.get("evidence_quote") or "")
             ev_id = add_evidence(q) if q else None
+
+            # If add_evidence failed (quote not verbatim in pages), try force-register
+            if ev_id is None and q:
+                # Try to find the URL from research_pages by partial text match
+                q_clean = _clean(q)
+                for p in research_pages:
+                    if len(q_clean) >= 20 and q_clean[:40].lower() in p["text"].lower():
+                        ev_id = _force_register_evidence(q, p["url"], "first_party" if _host(p["url"]) == client_host else "other")
+                        break
+
             ev_type = str(item.get("evidence_type") or "company_website").strip().lower()
             if ev_type not in {"company_website", "reputable_external"}:
                 ev_type = "company_website"
             boundary = _clean(str(item.get("wording_boundary") or ""))
 
+            # Fix 1: A fact with no evidence is not verified — downgrade confidence
+            # and add a wording boundary explaining it needs evidence.
+            has_evidence = bool(ev_id)
+            confidence: str
+            if has_evidence:
+                confidence = str(item.get("confidence") or "high").strip().lower()
+                if confidence not in {"high", "medium", "low"}:
+                    confidence = "high"
+            else:
+                confidence = "low"
+                if not boundary:
+                    boundary = "No verbatim evidence quote found; treat as unverified until sourced."
+
+            fact_id = f"fact_{idx:03d}"
             verified_facts.append(VerifiedFact(
-                fact_id=f"fact_{idx:03d}",
+                fact_id=fact_id,
                 statement=statement,
                 category=_clean(str(item.get("category") or "company_capability")),
                 evidence_type=ev_type,
                 evidence_ids=[ev_id] if ev_id else [],
-                confidence="high" if ev_id else "medium",
+                confidence=confidence,
                 wording_boundary=boundary if boundary else None,
             ))
+            valid_fact_id_set.add(fact_id)
 
+        # Fix 1 continued: Also update valid_fact_id_set from fallback facts
         # Add checked facts if LLM verified_facts was sparse
         if not verified_facts:
             for idx, f in enumerate(checked_guide.can_write, start=1):
-                ev_ids = [evidence_map.get(_clean(e.quote).lower()) for e in f.evidence if _clean(e.quote).lower() in evidence_map]
+                ev_ids_f = checked_fact_ev_map.get(f.fact_id, [])
+                fact_id = f"fact_{idx:03d}"
                 verified_facts.append(VerifiedFact(
-                    fact_id=f"fact_{idx:03d}",
+                    fact_id=fact_id,
                     statement=f.claim,
                     category="company_capability",
                     evidence_type="company_website",
-                    evidence_ids=[eid for eid in ev_ids if eid],
-                    confidence="high",
+                    evidence_ids=ev_ids_f,
+                    confidence="high" if ev_ids_f else "low",
                 ))
+                valid_fact_id_set.add(fact_id)
             offset = len(verified_facts)
             for idx, l in enumerate(checked_guide.can_write_with_limits, start=offset + 1):
-                ev_ids = [evidence_map.get(_clean(e.quote).lower()) for e in l.evidence if _clean(e.quote).lower() in evidence_map]
+                ev_ids_l = checked_fact_ev_map.get(l.fact_id, [])
+                fact_id = f"fact_{idx:03d}"
                 verified_facts.append(VerifiedFact(
-                    fact_id=f"fact_{idx:03d}",
+                    fact_id=fact_id,
                     statement=l.statement,
                     category="company_capability",
                     evidence_type="company_website",
-                    evidence_ids=[eid for eid in ev_ids if eid],
-                    confidence="medium",
+                    evidence_ids=ev_ids_l,
+                    confidence="medium" if ev_ids_l else "low",
                     wording_boundary=l.wording_limit,
                 ))
+                valid_fact_id_set.add(fact_id)
+
+        # Fix B (post-fact): Re-link LLM-emitted facts to checked_fact_ev_map evidence.
+        # The LLM may emit a fact whose statement matches a checked claim; re-use those
+        # evidence IDs so the fact isn't left orphaned.
+        checked_claim_norms = {
+            _norm(f.claim): checked_fact_ev_map.get(f.fact_id, []) for f in checked_guide.can_write
+        }
+        checked_claim_norms.update({
+            _norm(l.statement): checked_fact_ev_map.get(l.fact_id, []) for l in checked_guide.can_write_with_limits
+        })
+        for vf in verified_facts:
+            if not vf.evidence_ids:
+                match_ev = checked_claim_norms.get(_norm(vf.statement), [])
+                if match_ev:
+                    vf.evidence_ids = match_ev
+                    vf.confidence = "medium"  # checked-claim source, not LLM-fresh
+
+        # Fix 2 (post-fact): Link verified facts to candidate subtopics based on shared evidence IDs or topic matching
+        ev_to_fact_ids: dict[str, list[str]] = {}
+        for vf in verified_facts:
+            for eid in vf.evidence_ids:
+                ev_to_fact_ids.setdefault(eid, []).append(vf.fact_id)
+
+        for sub in candidate_subtopics:
+            linked_facts = set(sub.verified_fact_ids)
+            for eid in sub.evidence_ids:
+                for fid in ev_to_fact_ids.get(eid, []):
+                    linked_facts.add(fid)
+            if not linked_facts:
+                sub_words = set(_norm(sub.title).split()) | set(_norm(sub.description).split())
+                for vf in verified_facts:
+                    vf_words = set(_norm(vf.statement).split())
+                    if len(sub_words & vf_words) >= 3:
+                        linked_facts.add(vf.fact_id)
+            sub.verified_fact_ids = sorted(list(linked_facts))
+            if sub.verified_fact_ids and sub.evidence_ids:
+                sub.support_status = "fully_supported"
 
         # 4. Parse research gaps
+        # Build a lookup of subtopic titles so we can link gaps to affected subtopics
+        subtopic_title_map = {sub.title.lower(): sub.subtopic_id for sub in candidate_subtopics}
         research_gaps: list[ResearchGap] = []
         for idx, item in enumerate(data.get("research_gaps") or [], start=1):
             if not isinstance(item, dict):
@@ -728,21 +926,42 @@ Rules:
             t_or_q = _clean(str(item.get("topic_or_question") or ""))
             if not t_or_q:
                 continue
+            missing_claim = _clean(str(item.get("missing_claim") or ""))
+            # Derive affects_subtopic_ids by matching gap topic against subtopic titles
+            raw_affects = item.get("affects_subtopic_ids") or []
+            affects: list[str] = [
+                sid for sid in _string_list(raw_affects) if sid.startswith("subtopic_")
+            ]
+            # Also auto-link if gap topic words appear in any subtopic title
+            if not affects:
+                t_words = set(t_or_q.lower().split())
+                for title_lc, sid in subtopic_title_map.items():
+                    if len(t_words & set(title_lc.split())) >= 2:
+                        affects.append(sid)
             research_gaps.append(ResearchGap(
                 gap_id=f"gap_{idx:03d}",
                 topic_or_question=t_or_q,
+                missing_claim=missing_claim or t_or_q,
                 reason=_clean(str(item.get("reason") or "Evidence inconclusive")),
-                suggested_search_direction=_clean(str(item.get("suggested_search_direction") or "")),
+                suggested_search_direction=_clean(str(item.get("suggested_search_direction") or "")) or None,
+                affects_subtopic_ids=affects,
             ))
 
-        # Also add unverified checked gaps
+        # Fix 5: Also add unverified checked gaps with specific missing_claim
         for item in checked_guide.cannot_write:
             if "not establish" in item.reason.lower() or "further research" in item.reason.lower():
+                topic = item.claim_or_topic
+                affects_auto = [
+                    sub.subtopic_id for sub in candidate_subtopics
+                    if any(w in sub.title.lower() for w in topic.lower().split() if len(w) > 4)
+                ]
                 research_gaps.append(ResearchGap(
                     gap_id=f"gap_{len(research_gaps) + 1:03d}",
-                    topic_or_question=item.claim_or_topic,
+                    topic_or_question=topic,
+                    missing_claim=f"Verified evidence that {topic}",
                     reason=item.reason,
-                    suggested_search_direction=f"Search company documentation or partner publications for {item.claim_or_topic}",
+                    suggested_search_direction=f"Search company documentation or partner publications for {topic}",
+                    affects_subtopic_ids=affects_auto,
                 ))
 
         # 5. Parse limitations
@@ -757,14 +976,15 @@ Rules:
                 limitations.append(f"Avoid claiming '{item.claim_or_topic}': {item.reason}")
         limitations = _string_list(limitations)
 
-        # 6. Legacy compatibility helpers
+        # Fix C: Legacy topics must use verified_fact_ids (fact_xxx), NOT evidence_ids (ev_xxx).
+        # EvidenceBackedTopic.evidence_fact_ids is supposed to reference fact records.
         legacy_topics: list[EvidenceBackedTopic] = []
         for sub in candidate_subtopics:
             sub_ev = [ev for ev in evidence_items if ev.evidence_id in sub.evidence_ids]
             legacy_topics.append(EvidenceBackedTopic(
                 topic=sub.title,
                 description=sub.description,
-                evidence_fact_ids=sub.evidence_ids,
+                evidence_fact_ids=sub.verified_fact_ids,  # fact_xxx only
                 supporting_quotes=[e.quote for e in sub_ev],
                 source_urls=[e.url for e in sub_ev],
             ))
@@ -783,26 +1003,169 @@ Rules:
         target_audience = _clean(str(data.get("target_audience") or understanding.get("target_audience") or context.prompt_understanding.audience or "Industry professionals"))
         prompt_scope = str(data.get("prompt_scope") or understanding.get("prompt_scope") or "hybrid")
 
+        # ----------------------------------------------------------------
+        # Build clean Agent 4 handoff — single canonical object, no dupes
+        # ----------------------------------------------------------------
+        # Editorial constraints: standing bans + per-claim limits
+        editorial_constraints: list[str] = [
+            "Do not make unsupported superiority claims.",
+            "Do not present research-use capabilities as diagnostic services.",
+            "Do not treat missing evidence as proof that a capability does not exist.",
+            "Use only claims supported by their cited evidence.",
+        ]
+        for lim in limitations:
+            if lim not in editorial_constraints:
+                editorial_constraints.append(lim)
+
+        # target_audience as list for Agent 4
+        raw_audience = understanding.get("target_audience") or context.prompt_understanding.audience or ""
+        if isinstance(raw_audience, list):
+            audience_list: list[str] = [str(a) for a in raw_audience if a]
+        elif raw_audience:
+            audience_list = [s.strip() for s in str(raw_audience).split(",") if s.strip()]
+        else:
+            audience_list = ["Industry professionals"]
+
+        # Fix D: Reconcile prohibited_claims vs. limited claims.
+        # A claim already narrowly supported under can_write_with_limits must NOT appear
+        # as a blanket prohibition. Only store the broader extension that is prohibited.
+        limited_claim_norms: set[str] = {
+            _norm(l.statement) for l in checked_guide.can_write_with_limits
+        }
+        raw_prohibited = [
+            item.claim_or_topic for item in checked_guide.cannot_write
+        ] + banned
+        deduped_prohibited: list[str] = []
+        for claim in raw_prohibited:
+            if _norm(claim) not in limited_claim_norms:
+                deduped_prohibited.append(claim)
+
+        # Fix E: Drop research gaps that are already resolved by verified facts.
+        # A gap is resolved if its missing_claim text substantially overlaps with a
+        # verified fact's statement that has at least one evidence_id.
+        resolved_norms: set[str] = {
+            _norm(vf.statement) for vf in verified_facts if vf.evidence_ids
+        }
+        def _gap_is_resolved(gap: ResearchGap) -> bool:
+            mc_norm = _norm(gap.missing_claim)
+            # Consider resolved if >=3 words match a verified fact norm
+            mc_words = set(mc_norm.split())
+            for fact_norm in resolved_norms:
+                if len(mc_words & set(fact_norm.split())) >= 3:
+                    return True
+            return False
+        research_gaps = [g for g in research_gaps if not _gap_is_resolved(g)]
+        # Re-number gap IDs after filtering
+        for i, g in enumerate(research_gaps, start=1):
+            g.gap_id = f"gap_{i:03d}"
+
+        # ----------------------------------------------------------------
+        # Clean Agent 3 Research Result & Agent 4 Handoff (no duplicates)
+        # ----------------------------------------------------------------
+        brief_topic = main_topic or context.original_prompt
+        brief_audience = target_audience or (", ".join(audience_list) if audience_list else "Biopharma companies, CROs, and research organizations")
+        brief_intent = search_intent or f"Understand capabilities, platforms, and services for {brief_topic}"
+
+        # 1. Relevant findings (clean researched claims with source URLs and verification status)
+        relevant_findings: list[CompanyTalkingPoint] = []
+        seen_claims: set[str] = set()
+
+        for vf in verified_facts:
+            st = vf.statement.strip()
+            if not st or st in seen_claims:
+                continue
+            seen_claims.add(st)
+            urls = [ev.url for ev in evidence_items if ev.evidence_id in vf.evidence_ids and ev.url]
+            if not urls:
+                urls = [f"https://{client_host}"]
+            status = "verified" if vf.evidence_ids else "needs_human_review"
+            relevant_findings.append(
+                CompanyTalkingPoint(
+                    claim=st,
+                    source_urls=urls,
+                    verification_status=status,
+                )
+            )
+
+        for cw in checked_guide.can_write_with_limits:
+            st = cw.statement.strip()
+            if not st or st in seen_claims:
+                continue
+            seen_claims.add(st)
+            relevant_findings.append(
+                CompanyTalkingPoint(
+                    claim=st,
+                    source_urls=[f"https://{client_host}"],
+                    verification_status="needs_human_review",
+                )
+            )
+
+        for cw in checked_guide.can_write:
+            st = cw.statement.strip()
+            if not st or st in seen_claims:
+                continue
+            seen_claims.add(st)
+            relevant_findings.append(
+                CompanyTalkingPoint(
+                    claim=st,
+                    source_urls=[f"https://{client_host}"],
+                    verification_status="verified",
+                )
+            )
+
+        # 2. Boundaries (clean, practical rules)
+        boundaries: list[str] = [
+            "Use evidence to support company-specific claims.",
+            f"Distinguish {client_name}'s capabilities from partner capabilities.",
+            "Do not invent technical specifications, certifications, or performance metrics.",
+            "Flag claims that need further research or human verification.",
+        ]
+
+        # 3. Filtered candidate subtopics
+        filtered_subtopics = [
+            sub for sub in candidate_subtopics
+            if sub.support_status != "unsupported"
+        ]
+
+        # 4. Canonical research handoff for Agent 4
+        agent4_handoff = Agent4HandoffPackage(
+            task="Create evidence-backed content brief and strategy",
+            topic=brief_topic,
+            search_intent=brief_intent,
+            target_audience=brief_audience,
+            relevant_findings=relevant_findings,
+            evidence=evidence_items,
+            information_still_needed=research_gaps,
+            candidate_subtopics=filtered_subtopics,
+            boundaries=boundaries,
+            company=CompanyInfo(
+                name=client_name,
+                website=f"https://{client_host}",
+            ),
+            verification=VerificationHandoff(
+                is_verified=verification.is_verified,
+                intent_valid=verification.intent_valid,
+                customer_relevant=verification.customer_relevant,
+                reason=verification.reason or "",
+            ),
+        )
+
         return GroundTruthGuide(
-            main_topic=main_topic,
-            search_intent=search_intent,
-            target_audience=target_audience,
+            topic=brief_topic,
+            main_topic=brief_topic,
+            search_intent=brief_intent,
+            target_audience=brief_audience,
             prompt_scope=prompt_scope,
+            relevant_findings=relevant_findings,
+            evidence=evidence_items,
+            information_still_needed=research_gaps,
+            research_gaps=research_gaps,
             candidate_subtopics=candidate_subtopics,
             verified_facts=verified_facts,
-            evidence=evidence_items,
-            research_gaps=research_gaps,
-            limitations=limitations,
+            boundaries=boundaries,
+            limitations=boundaries,
             verification=verification,
-            scope=_scope_note(context),
-            evidence_backed_topics=legacy_topics,
-            potential_headings=potential_headings,
-            structured_headings=structured_headings,
-            related_topics=related_topics,
-            can_write=checked_guide.can_write,
-            can_write_with_limits=checked_guide.can_write_with_limits,
-            cannot_write=checked_guide.cannot_write,
-            banned_claims=banned,
+            agent4_handoff=agent4_handoff,
         )
 
     def _questions(self, context: PromptContext) -> list[dict[str, str]]:
@@ -1037,6 +1400,12 @@ Rules:
         return checked
 
     def _complete(self, system: str, payload: dict[str, Any], max_tokens: int) -> dict[str, Any]:
+        """Call the Anthropic API and return the parsed JSON dict.
+
+        Uses an assistant prefill of ``{`` so Claude is forced to emit raw JSON
+        from the very first token, which eliminates preamble text that causes
+        JSON parsing to fail.
+        """
         response = httpx.post(
             "https://api.anthropic.com/v1/messages",
             headers={
@@ -1048,14 +1417,20 @@ Rules:
                 "model": self.model,
                 "max_tokens": max_tokens,
                 "system": system,
-                "messages": [{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+                "messages": [
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                    # Prefill: force Claude to start the reply with "{"
+                    {"role": "assistant", "content": "{"},
+                ],
             },
-            timeout=90.0,
+            timeout=120.0,
         )
         response.raise_for_status()
         blocks = response.json().get("content") or []
-        text = "\n".join(block.get("text", "") for block in blocks if block.get("type") == "text")
-        if not text.strip():
+        raw = "\n".join(block.get("text", "") for block in blocks if block.get("type") == "text")
+        # Prepend the prefill character we sent so the text is a complete object
+        text = "{" + raw
+        if not raw.strip():
             raise RuntimeError("Claude returned no text for Agent 3.")
         return _extract_json(text)
 

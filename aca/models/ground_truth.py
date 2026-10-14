@@ -111,6 +111,7 @@ class LimitedStatement(BaseModel):
 EvidenceSourceType = Literal["company_website", "reputable_external"]
 TopicAngle = Literal["company_capability", "industry_context", "comparison_methodology", "educational_guide"]
 EvidenceStatus = Literal["supported", "needs_more_research", "unsupported"]
+SupportStatus = Literal["fully_supported", "partially_supported", "needs_more_research", "unsupported"]
 PromptScope = Literal["broad_industry", "company_specific", "hybrid"]
 
 
@@ -130,14 +131,25 @@ class EvidenceItem(BaseModel):
 class CandidateSubtopic(BaseModel):
     """Possible blog section and related questions discovered through research."""
 
-    subtopic_id: str
+    subtopic_id: str = ""
     title: str
-    description: str
-    topic_angle: TopicAngle = "company_capability"
-    relevance_to_main_topic: Relevance = "high"
-    evidence_status: EvidenceStatus = "supported"
+    description: str = ""
+    relevance: Relevance = "high"
+    support_status: SupportStatus = "partially_supported"
+    verified_fact_ids: list[str] = Field(default_factory=list)
     evidence_ids: list[str] = Field(default_factory=list)
+    research_needed: list[str] = Field(default_factory=list)
     suggested_questions: list[str] = Field(default_factory=list)
+    topic_angle: TopicAngle = "company_capability"
+
+    # Compatibility properties
+    @property
+    def relevance_to_main_topic(self) -> str:
+        return self.relevance
+
+    @property
+    def evidence_status(self) -> str:
+        return self.support_status
 
 
 class VerifiedFact(BaseModel):
@@ -149,6 +161,7 @@ class VerifiedFact(BaseModel):
     evidence_type: EvidenceSourceType = "company_website"
     evidence_ids: list[str] = Field(default_factory=list)
     confidence: Confidence = "high"
+    status: str = "verified"
     wording_boundary: str | None = None
 
 
@@ -157,8 +170,12 @@ class ResearchGap(BaseModel):
 
     gap_id: str
     topic_or_question: str
+    missing_claim: str = ""
+    """The specific claim or assertion that lacks evidence."""
     reason: str
     suggested_search_direction: str | None = None
+    affects_subtopic_ids: list[str] = Field(default_factory=list)
+    """Subtopic IDs that cannot be fully written until this gap is resolved."""
 
 
 class PromptVerification(BaseModel):
@@ -189,32 +206,96 @@ class HeadingItem(BaseModel):
     intent_hint: str = ""
 
 
-class GroundTruthGuide(BaseModel):
-    """The structured research, evidence, and topic discovery output passed to Agent 4."""
+class CompanyInfo(BaseModel):
+    name: str
+    website: str
 
-    # Core structured fields for Agent 4
+
+class PromptContextHandoff(BaseModel):
+    original_prompt: str
+    main_topic: str
+    search_intent: str
+    target_audience: list[str] = Field(default_factory=list)
+    prompt_scope: str = "hybrid"
+    scope_note: str = ""
+
+
+class VerificationHandoff(BaseModel):
+    is_verified: bool
+    intent_valid: bool
+    customer_relevant: bool
+    reason: str = ""
+
+
+class LimitedClaimHandoff(BaseModel):
+    statement: str
+    boundary: str
+    fact_id: str
+
+
+class BlogOutlineSection(BaseModel):
+    """An outline section for the blog brief."""
+
+    heading: str
+    description: str = ""
+    key_points: list[str] = Field(default_factory=list)
+
+
+class CompanyTalkingPoint(BaseModel):
+    """A researched claim about company capabilities with sources and review status."""
+
+    claim: str
+    source_urls: list[str] = Field(default_factory=list)
+    verification_status: str = "verified"  # "verified" | "needs_human_review"
+
+
+class Agent4HandoffPackage(BaseModel):
+    """Clean, structured research handoff package from Agent 3 to Agent 4."""
+
+    task: str = "Create evidence-backed content brief and strategy"
+    topic: str = ""
+    search_intent: str = ""
+    target_audience: str = ""
+    relevant_findings: list[CompanyTalkingPoint] = Field(default_factory=list)
+    evidence: list[EvidenceItem] = Field(default_factory=list)
+    information_still_needed: list[ResearchGap] = Field(default_factory=list)
+    candidate_subtopics: list[CandidateSubtopic] = Field(default_factory=list)
+    boundaries: list[str] = Field(default_factory=list)
+    company: CompanyInfo | None = None
+    verification: VerificationHandoff | None = None
+
+
+class GroundTruthGuide(BaseModel):
+    """Agent 3 structured research result and handoff to Agent 4."""
+
+    topic: str = ""
     main_topic: str = ""
     search_intent: str = ""
     target_audience: str = ""
     prompt_scope: str = "hybrid"
+    relevant_findings: list[CompanyTalkingPoint] = Field(default_factory=list)
+    evidence: list[EvidenceItem] = Field(default_factory=list)
+    information_still_needed: list[ResearchGap] = Field(default_factory=list)
+    research_gaps: list[ResearchGap] = Field(default_factory=list)
     candidate_subtopics: list[CandidateSubtopic] = Field(default_factory=list)
     verified_facts: list[VerifiedFact] = Field(default_factory=list)
-    evidence: list[EvidenceItem] = Field(default_factory=list)
-    research_gaps: list[ResearchGap] = Field(default_factory=list)
+    boundaries: list[str] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
-
-    # Verification gate
     verification: PromptVerification | None = None
+    agent4_handoff: Agent4HandoffPackage | None = None
 
-    # Legacy / compatibility fields preserved
-    scope: ScopeNote | None = None
-    evidence_backed_topics: list[EvidenceBackedTopic] = Field(default_factory=list)
-    potential_headings: list[str] = Field(default_factory=list)
-    structured_headings: list[HeadingItem] = Field(default_factory=list)
-    related_topics: list[str] = Field(default_factory=list)
-    can_write: list[Fact] = Field(default_factory=list)
-    can_write_with_limits: list[LimitedStatement] = Field(default_factory=list)
-    cannot_write: list[DoNotWrite] = Field(default_factory=list)
-    banned_claims: list[str] = Field(default_factory=list)
+    # Internal checking fields used during pipeline processing (excluded from JSON serialization)
+    can_write: list[Fact] = Field(default_factory=list, exclude=True)
+    can_write_with_limits: list[LimitedStatement] = Field(default_factory=list, exclude=True)
+    cannot_write: list[DoNotWrite] = Field(default_factory=list, exclude=True)
+    banned_claims: list[str] = Field(default_factory=list, exclude=True)
+    scope: ScopeNote | None = Field(default=None, exclude=True)
+    potential_headings: list[str] = Field(default_factory=list, exclude=True)
+    structured_headings: list[HeadingItem] = Field(default_factory=list, exclude=True)
+    related_topics: list[str] = Field(default_factory=list, exclude=True)
+    evidence_backed_topics: list[EvidenceBackedTopic] = Field(default_factory=list, exclude=True)
+
+
+
 
 
