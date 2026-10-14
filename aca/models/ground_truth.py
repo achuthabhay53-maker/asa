@@ -108,6 +108,59 @@ class LimitedStatement(BaseModel):
     relevance_to_topic: Relevance = "medium"
 
 
+EvidenceSourceType = Literal["company_website", "reputable_external"]
+TopicAngle = Literal["company_capability", "industry_context", "comparison_methodology", "educational_guide"]
+EvidenceStatus = Literal["supported", "needs_more_research", "unsupported"]
+PromptScope = Literal["broad_industry", "company_specific", "hybrid"]
+
+
+class EvidenceItem(BaseModel):
+    """Detailed evidence quote with attribution and source type."""
+
+    evidence_id: str
+    url: str
+    quote: str
+    source_type: EvidenceSourceType = "company_website"
+    domain: str = ""
+    page_title: str | None = None
+    context: str | None = None
+    published: date | None = None
+
+
+class CandidateSubtopic(BaseModel):
+    """Possible blog section and related questions discovered through research."""
+
+    subtopic_id: str
+    title: str
+    description: str
+    topic_angle: TopicAngle = "company_capability"
+    relevance_to_main_topic: Relevance = "high"
+    evidence_status: EvidenceStatus = "supported"
+    evidence_ids: list[str] = Field(default_factory=list)
+    suggested_questions: list[str] = Field(default_factory=list)
+
+
+class VerifiedFact(BaseModel):
+    """A factual claim verified against researched evidence."""
+
+    fact_id: str
+    statement: str
+    category: str = "company_capability"
+    evidence_type: EvidenceSourceType = "company_website"
+    evidence_ids: list[str] = Field(default_factory=list)
+    confidence: Confidence = "high"
+    wording_boundary: str | None = None
+
+
+class ResearchGap(BaseModel):
+    """A topic or question that needs more evidence before it can be written."""
+
+    gap_id: str
+    topic_or_question: str
+    reason: str
+    suggested_search_direction: str | None = None
+
+
 class PromptVerification(BaseModel):
     """Verification of the original prompt and intent for the customer."""
 
@@ -137,10 +190,24 @@ class HeadingItem(BaseModel):
 
 
 class GroundTruthGuide(BaseModel):
-    """The writing decisions, verification, and blog guidance Agent 4 uses to build the brief."""
+    """The structured research, evidence, and topic discovery output passed to Agent 4."""
 
-    scope: ScopeNote | None = None
+    # Core structured fields for Agent 4
+    main_topic: str = ""
+    search_intent: str = ""
+    target_audience: str = ""
+    prompt_scope: str = "hybrid"
+    candidate_subtopics: list[CandidateSubtopic] = Field(default_factory=list)
+    verified_facts: list[VerifiedFact] = Field(default_factory=list)
+    evidence: list[EvidenceItem] = Field(default_factory=list)
+    research_gaps: list[ResearchGap] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+
+    # Verification gate
     verification: PromptVerification | None = None
+
+    # Legacy / compatibility fields preserved
+    scope: ScopeNote | None = None
     evidence_backed_topics: list[EvidenceBackedTopic] = Field(default_factory=list)
     potential_headings: list[str] = Field(default_factory=list)
     structured_headings: list[HeadingItem] = Field(default_factory=list)
@@ -149,5 +216,5 @@ class GroundTruthGuide(BaseModel):
     can_write_with_limits: list[LimitedStatement] = Field(default_factory=list)
     cannot_write: list[DoNotWrite] = Field(default_factory=list)
     banned_claims: list[str] = Field(default_factory=list)
-    limitations: list[str] = Field(default_factory=list)
+
 

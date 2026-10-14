@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 import httpx
 from dotenv import load_dotenv
 from aca.models.ground_truth import (
+    CandidateSubtopic,
     CheckedFrom,
     ClaimType,
     ClientInput,
@@ -26,6 +27,8 @@ from aca.models.ground_truth import (
     DoNotWrite,
     Evidence,
     EvidenceBackedTopic,
+    EvidenceItem,
+    EvidenceSourceType,
     Fact,
     FactStatus,
     GroundTruthGuide,
@@ -35,11 +38,13 @@ from aca.models.ground_truth import (
     PromptUnderstandingInput,
     PromptVerification,
     Relevance,
+    ResearchGap,
     ScopeNote,
     SourceTier,
     TopicDecision,
     TopicVerdict,
     UnresolvedClaim,
+    VerifiedFact,
 )
 from aca.tools.web_research import WebResearch, get_web_research
 
@@ -147,15 +152,33 @@ def _extract_json(text: str) -> dict[str, Any]:
     text = re.sub(r"^\s*```(?:json)?\s*", "", text.strip(), flags=re.I)
     text = re.sub(r"\s*```\s*$", "", text)
     try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        start, end = text.find("{"), text.rfind("}")
-        if start < 0 or end <= start:
-            raise ValueError("Claude did not return a valid JSON object.")
-        data = json.loads(text[start:end + 1])
-    if not isinstance(data, dict):
-        raise ValueError("Expected a JSON object from Claude.")
-    return data
+        data = json.loads(text, strict=False)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+
+    start, end = text.find("{"), text.rfind("}")
+    if start >= 0 and end > start:
+        candidate = text[start:end + 1]
+        try:
+            data = json.loads(candidate, strict=False)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+
+    # Try json_repair if available
+    try:
+        import json_repair
+        data = json_repair.loads(text)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+
+    raise ValueError("Claude did not return a valid JSON object.")
+
 
 
 def _quote_in_page(quote: str, page: str) -> bool:
@@ -239,16 +262,168 @@ class GroundTruthAgent:
         client_host = _host(context.customer.website)
         if not client_host:
             raise ValueError("The website must include a host, for example https://alamarbio.com.")
-        del agent2  # cited-page topics are not the customer's capabilities
+        del agent2  # cited-page topics are analyzed separately
 
-        # Step 1: Verify the original prompt and its intent for the customer using web research.
-        verification = self._verify_prompt_and_intent(context, client_name, client_host)
-        if not verification.is_verified or not verification.intent_valid or not verification.customer_relevant:
-            # If the intent is invalid or the customer is not relevant to the requested topic, return null and stop.
-            print(f"Agent 3: Intent is invalid or customer '{client_name}' is not relevant to '{context.original_prompt}'. Reason: {verification.reason}. Returning null and stopping.")
+        # Step 1: Understand the original prompt & verify relevance
+        understanding = self._understand_prompt_and_verify(context, client_name, client_host)
+        if not understanding.get("is_verified", False):
+            reason = understanding.get("reason", "Customer is not relevant or prompt intent is invalid.")
+            print(f"Agent 3: Intent is invalid or customer '{client_name}' is not relevant to '{context.original_prompt}'. Reason: {reason}. Returning null and stopping.")
             return None
 
-        # Step 2: Research the web to identify the customer's actual capabilities.
+        # Step 2: Research the specific topic (Company website vs. Reputable external sources)
+        research_pages, checked_pairs, banned = self._research_topic(
+            context, understanding, client_name, client_host
+        )
+
+        # Step 3: Discover candidate subtopics & organize evidence
+        guide = self._discover_subtopics_and_evidence(
+            context, understanding, research_pages, checked_pairs, banned, client_name, client_host
+        )
+
+        # Step 4: Return structured output ready for Agent 4
+        return guide
+
+    def _understand_prompt_and_verify(
+        self,
+        context: PromptContext,
+        client_name: str,
+        client_host: str,
+    ) -> dict[str, Any]:
+        """Step 1: Understand prompt, infer main topic, intent, audience, scope, and verify relevance."""
+        query_fp = f"{context.original_prompt} {context.prompt_understanding.intent}".strip()
+        first_pages, _ = self._collect_pages(query_fp, client_host, client_name, first_party=True)
+        retrieved_pages = list(first_pages)
+        if len(retrieved_pages) < PAGES_PER_PASS:
+            web_query = f"{client_name} {context.original_prompt}"
+            web_pages, _ = self._collect_pages(web_query, client_host, client_name, first_party=False)
+            retrieved_pages.extend(web_pages)
+
+        if not retrieved_pages:
+            try:
+                root_page = self.research.extract(f"https://{client_host}")
+                if root_page and root_page.text.strip():
+                    retrieved_pages.append({"url": root_page.url, "text": root_page.text, "published": None})
+            except Exception:
+                pass
+
+        packed = [
+            {"url": page["url"], "text": page["text"][:PAGE_CHARS]}
+            for page in retrieved_pages
+        ]
+
+        system = """You are Agent 3 in a content intelligence workflow.
+Step 1: Understand the user prompt and verify customer relevance.
+Return one JSON object:
+{
+  "main_topic": "The central subject inferred from the prompt",
+  "search_intent": "What the intended reader wants to know or solve",
+  "target_audience": "Who the blog is for (e.g. researchers, clinicians, buyers, lab directors)",
+  "prompt_scope": "broad_industry | company_specific | hybrid",
+  "is_verified": true|false,
+  "intent_valid": true|false,
+  "customer_relevant": true|false,
+  "reason": "Detailed explanation of why the customer is or is not relevant, and whether the intent is valid.",
+  "quote": "Exact contiguous quote from retrieved text if available, or empty string",
+  "source_url": "URL of the page containing the quote, or empty string"
+}
+Rules:
+- main_topic: Identify the central subject from the user's prompt (e.g., 'Immunology biomarker assay providers and platform capabilities').
+- prompt_scope: Distinguish whether the original prompt describes a broad industry topic, a company-specific capability, or a hybrid. Preserve that distinction rather than forcing every topic to promote the company.
+- is_verified / customer_relevant / intent_valid:
+  * Check whether the customer actually offers, develops, or operates in the space of this prompt.
+  * If the customer is completely unrelated to the topic (e.g. asked about immunology biomarker assays for a shoe company, retail store, or automotive dealer), mark customer_relevant: false, intent_valid: false, and is_verified: false.
+  * If the customer operates in the space (as platform developer, kit provider, assay service, or technology partner), mark is_verified: true, intent_valid: true, and customer_relevant: true.
+- Base your judgment strictly on the retrieved pages and customer facts. Do NOT hallucinate.
+- quote must be an exact contiguous quote from the supplied page text (at least 30 characters) if one is found.
+- JSON only."""
+
+        payload = {
+            "customer_name": client_name,
+            "website": f"https://{client_host}",
+            "original_prompt": context.original_prompt,
+            "prompt_understanding": context.prompt_understanding.model_dump(),
+            "retrieved_pages": packed,
+        }
+
+        try:
+            data = self._complete(system, payload, max_tokens=1500)
+        except Exception as exc:
+            print(f"  Prompt understanding/verification LLM failed: {exc}")
+            return {
+                "main_topic": context.original_prompt,
+                "search_intent": context.prompt_understanding.intent or context.original_prompt,
+                "target_audience": context.prompt_understanding.audience or "Industry professionals",
+                "prompt_scope": "hybrid",
+                "is_verified": False,
+                "intent_valid": False,
+                "customer_relevant": False,
+                "reason": f"Verification failed: {exc}",
+                "quote": "",
+                "source_url": "",
+                "retrieved_pages": retrieved_pages,
+            }
+
+        is_verified = bool(data.get("is_verified", False))
+        intent_valid = bool(data.get("intent_valid", False))
+        customer_relevant = bool(data.get("customer_relevant", False))
+        data["is_verified"] = is_verified and intent_valid and customer_relevant
+        data["retrieved_pages"] = retrieved_pages
+        return data
+
+    def _research_topic(
+        self,
+        context: PromptContext,
+        understanding: dict[str, Any],
+        client_name: str,
+        client_host: str,
+    ) -> tuple[list[dict[str, Any]], list[tuple[dict[str, str], CheckedClaim]], list[str]]:
+        """Step 2: Research the specific topic across company website and reputable external sources."""
+        all_pages: list[dict[str, Any]] = []
+        seen_urls: set[str] = set()
+
+        # Add any pages already collected in Step 1
+        for p in understanding.get("retrieved_pages") or []:
+            u = p.get("url")
+            if u and u not in seen_urls:
+                seen_urls.add(u)
+                all_pages.append({
+                    "url": u,
+                    "text": p.get("text", ""),
+                    "published": p.get("published"),
+                    "source_type": "company_website" if _host(u) == client_host else "reputable_external",
+                })
+
+        # 1. Company Website: Search products, assays, services, capabilities
+        main_topic = understanding.get("main_topic") or context.original_prompt
+        fp_query = f"{main_topic} products assays services technology".strip()
+        fp_pages, _ = self._collect_pages(fp_query, client_host, client_name, first_party=True)
+        for p in fp_pages:
+            u = p.get("url")
+            if u and u not in seen_urls:
+                seen_urls.add(u)
+                all_pages.append({
+                    "url": u,
+                    "text": p.get("text", ""),
+                    "published": p.get("published"),
+                    "source_type": "company_website",
+                })
+
+        # 2. Reputable External: Broader industry context, benchmarks, applications
+        ext_query = f"{main_topic} workflow technology comparison review".strip()
+        ext_pages, _ = self._collect_pages(ext_query, client_host, client_name, first_party=False)
+        for p in ext_pages:
+            u = p.get("url")
+            if u and u not in seen_urls:
+                seen_urls.add(u)
+                all_pages.append({
+                    "url": u,
+                    "text": p.get("text", ""),
+                    "published": p.get("published"),
+                    "source_type": "reputable_external",
+                })
+
+        # Check capability questions for exact factual grounding
         questions = self._questions(context)[: self.max_questions]
         pairs: list[tuple[dict[str, str], CheckedClaim]] = []
         for opportunity in self._opportunity_claims(context):
@@ -271,6 +446,7 @@ class GroundTruthAgent:
                 )))
                 continue
             questions.append(opportunity)
+
         banned = list(_STANDING_BANS)
         for index, question in enumerate(questions, start=1):
             checked = self._check_question(
@@ -284,235 +460,350 @@ class GroundTruthAgent:
             for item in checked.extra_bans:
                 if item not in banned:
                     banned.append(item)
-        guide = _assemble(context, pairs, banned)
-        guide = guide.model_copy(update={"verification": verification})
 
-        # Step 3: Extract evidence-backed topics, potential headings, and related topics suitable for blog content.
-        guidance = self._extract_blog_guidance(context, guide.can_write, guide.can_write_with_limits, client_name)
-        eb_topics = [
-            t if isinstance(t, EvidenceBackedTopic) else EvidenceBackedTopic.model_validate(t)
-            for t in guidance.get("evidence_backed_topics", [])
-        ]
-        headings = [str(h) for h in guidance.get("potential_headings", [])]
-        structured_headings = [
-            h if isinstance(h, HeadingItem) else HeadingItem.model_validate(h)
-            for h in guidance.get("structured_headings", [])
-        ]
-        related_topics = [str(r) for r in guidance.get("related_topics", [])]
+        return all_pages, pairs, banned
 
-        return guide.model_copy(update={
-            "evidence_backed_topics": eb_topics,
-            "potential_headings": headings,
-            "structured_headings": structured_headings,
-            "related_topics": related_topics,
-        })
-
-    def _verify_prompt_and_intent(
+    def _discover_subtopics_and_evidence(
         self,
         context: PromptContext,
+        understanding: dict[str, Any],
+        research_pages: list[dict[str, Any]],
+        checked_pairs: list[tuple[dict[str, str], CheckedClaim]],
+        banned: list[str],
         client_name: str,
         client_host: str,
-    ) -> PromptVerification:
-        """Verify the original prompt and its intent for the customer using web research."""
-        query_fp = f"{context.original_prompt} {context.prompt_understanding.intent}".strip()
-        first_pages, _ = self._collect_pages(query_fp, client_host, client_name, first_party=True)
-        retrieved_pages = list(first_pages)
-        if len(retrieved_pages) < PAGES_PER_PASS:
-            web_query = f"{client_name} {context.original_prompt}"
-            web_pages, _ = self._collect_pages(web_query, client_host, client_name, first_party=False)
-            retrieved_pages.extend(web_pages)
+    ) -> GroundTruthGuide:
+        """Step 3: Discover candidate subtopics, verified facts, evidence, research gaps, limitations."""
+        checked_guide = _assemble(context, checked_pairs, banned)
 
-        if not retrieved_pages:
-            try:
-                root_page = self.research.extract(f"https://{client_host}")
-                if root_page and root_page.text.strip():
-                    retrieved_pages.append({"url": root_page.url, "text": root_page.text, "published": None})
-            except Exception:
-                pass
+        # Build prompt verification object
+        v_quote = _clean(str(understanding.get("quote") or ""))
+        v_url = str(understanding.get("source_url") or "")
+        v_ev: list[Evidence] = []
+        if v_quote and v_url:
+            for p in research_pages:
+                if p["url"] == v_url and _quote_in_page(v_quote, p["text"]):
+                    v_ev.append(Evidence(
+                        url=v_url,
+                        quote=v_quote,
+                        source_tier=_tier(v_url, client_host),
+                        published=p.get("published"),
+                    ))
+                    break
 
-        packed = [
-            {"url": page["url"], "text": page["text"][:PAGE_CHARS]}
-            for page in retrieved_pages
+        verification = PromptVerification(
+            is_verified=bool(understanding.get("is_verified", True)),
+            intent_valid=bool(understanding.get("intent_valid", True)),
+            customer_relevant=bool(understanding.get("customer_relevant", True)),
+            reason=str(understanding.get("reason") or "Verified"),
+            evidence=v_ev,
+        )
+
+        # Prepare evidence snippets from pages
+        packed_evidence = [
+            {
+                "url": p["url"],
+                "source_type": p.get("source_type", "company_website"),
+                "text_snippet": p["text"][:PAGE_CHARS],
+            }
+            for p in research_pages
         ]
 
-        system = """You are Agent 3 verifying whether an original prompt and its intent are valid and relevant for a customer using web research.
+        # Prepare facts from checked claims
+        known_facts = [
+            {"statement": f.claim, "quote": f.evidence[0].quote if f.evidence else "", "source": f.evidence[0].url if f.evidence else ""}
+            for f in checked_guide.can_write
+        ] + [
+            {"statement": l.statement, "limit": l.wording_limit, "quote": l.evidence[0].quote if l.evidence else "", "source": l.evidence[0].url if l.evidence else ""}
+            for l in checked_guide.can_write_with_limits
+        ]
+
+        system = """You are Agent 3 in a content intelligence pipeline (Ground Truth & Research Discovery).
+Your job is to discover what the company can write about and organize researched evidence so Agent 4 can decide the content strategy.
+
 Return one JSON object:
 {
-  "is_verified": true|false,
-  "intent_valid": true|false,
-  "customer_relevant": true|false,
-  "reason": "Detailed explanation of why the customer is or is not relevant, and whether the intent is valid.",
-  "quote": "Exact contiguous quote from retrieved text if available, or empty string",
-  "source_url": "URL of the page containing the quote, or empty string"
+  "main_topic": "Central subject of the prompt",
+  "search_intent": "What the intended reader wants to know",
+  "target_audience": "Who the blog is for",
+  "prompt_scope": "broad_industry | company_specific | hybrid",
+  "candidate_subtopics": [
+    {
+      "title": "Subtopic Title",
+      "description": "What this subtopic covers and why it is valuable to the reader",
+      "topic_angle": "company_capability | industry_context | comparison_methodology | educational_guide",
+      "relevance_to_main_topic": "high | medium",
+      "evidence_status": "supported | needs_more_research",
+      "suggested_questions": ["Key question 1", "Key question 2"],
+      "evidence_quotes": ["Exact quote from supplied text supporting this subtopic"]
+    }
+  ],
+  "verified_facts": [
+    {
+      "statement": "Concrete verified factual statement",
+      "category": "company_capability | product_technology | industry_context | regulatory_certification | service_scope",
+      "evidence_type": "company_website | reputable_external",
+      "confidence": "high | medium",
+      "wording_boundary": "Specific limitation or boundary (or empty string)",
+      "evidence_quote": "Exact quote from supplied text"
+    }
+  ],
+  "research_gaps": [
+    {
+      "topic_or_question": "Topic or question relevant to the prompt that lacks sufficient evidence",
+      "reason": "Why the current evidence is inconclusive or what is missing",
+      "suggested_search_direction": "Suggested direction for further research"
+    }
+  ],
+  "limitations": [
+    "Claims or subjects that must be avoided or qualified (e.g., no superlatives like '#1', 'most sensitive', 'leader'; research-use-only products must not be stated as diagnostic services without proof)"
+  ]
 }
+
 Rules:
-- Verify whether the customer actually offers, develops, or provides capabilities, products, platforms, or services relevant to the requested topic/prompt.
-- If the customer operates in this space (e.g. provides assays, biomarker platforms, reagents, testing services, or technology), mark customer_relevant: true, intent_valid: true, and is_verified: true.
-- If the customer is completely unrelated to the requested topic (e.g. asked about immunology biomarker assays for a shoe company, automotive dealer, or unrelated consumer software), mark customer_relevant: false, intent_valid: false, and is_verified: false.
-- If the intent itself is invalid, nonsensical, or unaddressable for this customer, mark is_verified: false.
-- Base your judgment strictly on the retrieved pages and customer facts. Do NOT hallucinate.
-- quote must be an exact contiguous quote from the supplied page text (at least 30 characters) if one is found.
-- JSON only."""
+1. Topic Discovery vs Topic Approval:
+   - Your job is discovery and evidence organization. Do NOT decide the final brief; Agent 4 makes the final approval and outline decisions.
+2. Broad Industry vs Company Services:
+   - Preserve broad industry subtopics (e.g. general assay comparison, technology tradeoffs, clinical significance). Do NOT force every subtopic to promote the company.
+3. Two Evidence Types:
+   - Distinguish company-specific claims (sourced from company_website) from broader industry context (sourced from reputable_external).
+4. Evidence Grounding:
+   - Every supported candidate subtopic and verified fact must be grounded in an exact quote present in the supplied pages.
+   - If an important topic lacks direct quote evidence, mark its evidence_status as 'needs_more_research' and include a research_gap entry.
+5. No Superlatives:
+   - Never use superlatives like 'best', 'leading', '#1', 'world's first', or 'unmatched' unless verified by a first-party factual certification.
+6. JSON only."""
 
         payload = {
             "customer_name": client_name,
             "website": f"https://{client_host}",
             "original_prompt": context.original_prompt,
-            "prompt_understanding": context.prompt_understanding.model_dump(),
-            "retrieved_pages": packed,
+            "understanding": {
+                "main_topic": understanding.get("main_topic") or context.original_prompt,
+                "search_intent": understanding.get("search_intent") or context.prompt_understanding.intent,
+                "target_audience": understanding.get("target_audience") or context.prompt_understanding.audience,
+                "prompt_scope": understanding.get("prompt_scope") or "hybrid",
+            },
+            "known_facts": known_facts,
+            "research_evidence": packed_evidence,
         }
 
         try:
-            data = self._complete(system, payload, max_tokens=1500)
+            data = self._complete(system, payload, max_tokens=4096)
         except Exception as exc:
-            print(f"  Prompt verification LLM failed: {exc}")
-            return PromptVerification(
-                is_verified=False,
-                intent_valid=False,
-                customer_relevant=False,
-                reason=f"Verification failed: {exc}",
-            )
+            print(f"  Subtopic discovery LLM failed: {exc}")
+            data = {}
 
-        is_verified = bool(data.get("is_verified", False))
-        intent_valid = bool(data.get("intent_valid", False))
-        customer_relevant = bool(data.get("customer_relevant", False))
-        reason = _clean(str(data.get("reason") or ""))
-        quote = _clean(str(data.get("quote") or ""))
-        source_url = str(data.get("source_url") or "")
+        # 1. Build EvidenceItem registry
+        evidence_items: list[EvidenceItem] = []
+        evidence_map: dict[str, str] = {}  # quote_norm -> evidence_id
 
-        evidence_list: list[Evidence] = []
-        if quote and source_url:
-            for page in retrieved_pages:
-                if page["url"] == source_url and _quote_in_page(quote, page["text"]):
-                    evidence_list.append(Evidence(
-                        url=source_url,
-                        quote=quote,
-                        source_tier=_tier(source_url, client_host),
-                        published=page.get("published"),
-                    ))
-                    break
+        def add_evidence(quote: str, preferred_source_type: str | None = None) -> str | None:
+            q_clean = _clean(quote)
+            if len(q_clean) < 25:
+                return None
+            key = q_clean.lower()
+            if key in evidence_map:
+                return evidence_map[key]
 
-        return PromptVerification(
-            is_verified=is_verified and intent_valid and customer_relevant,
-            intent_valid=intent_valid,
-            customer_relevant=customer_relevant,
-            reason=reason or ("Verified" if is_verified else "Customer is not relevant or intent is invalid."),
-            evidence=evidence_list,
-        )
+            # Find matching page
+            for p in research_pages:
+                if _quote_in_page(q_clean, p["text"]):
+                    ev_id = f"ev_{len(evidence_items) + 1:03d}"
+                    stype = p.get("source_type") or preferred_source_type or ("company_website" if _host(p["url"]) == client_host else "reputable_external")
+                    item = EvidenceItem(
+                        evidence_id=ev_id,
+                        url=p["url"],
+                        quote=q_clean,
+                        source_type=stype,
+                        domain=_host(p["url"]),
+                        page_title=p.get("title"),
+                        published=p.get("published"),
+                    )
+                    evidence_items.append(item)
+                    evidence_map[key] = ev_id
+                    return ev_id
+            return None
 
-    def _extract_blog_guidance(
-        self,
-        context: PromptContext,
-        can_write: list[Fact],
-        can_write_with_limits: list[LimitedStatement],
-        client_name: str,
-    ) -> dict[str, Any]:
-        """Extract evidence-backed topics, potential headings, and related topics suitable for blog content."""
-        facts_summary = [
-            {
-                "fact_id": f.fact_id,
-                "claim": f.claim,
-                "evidence_quotes": [e.quote for e in f.evidence],
-                "urls": [e.url for e in f.evidence],
-            }
-            for f in can_write
-        ]
-        limits_summary = [
-            {
-                "fact_id": l.fact_id,
-                "statement": l.statement,
-                "wording_limit": l.wording_limit,
-                "evidence_quotes": [e.quote for e in l.evidence],
-                "urls": [e.url for e in l.evidence],
-            }
-            for l in can_write_with_limits
-        ]
+        # Seed evidence from known checked facts
+        for f in checked_guide.can_write:
+            for ev in f.evidence:
+                add_evidence(ev.quote, "company_website" if ev.source_tier == "first_party" else "reputable_external")
+        for l in checked_guide.can_write_with_limits:
+            for ev in l.evidence:
+                add_evidence(ev.quote, "company_website" if ev.source_tier == "first_party" else "reputable_external")
 
-        system = """You are Agent 3 extracting evidence-backed topics, potential headings, and related topics suitable for blog content based on verified customer capabilities.
-Return one JSON object:
-{
-  "evidence_backed_topics": [
-    {
-      "topic": "Concise topic title",
-      "description": "How this relates to the customer's verified capabilities and the original prompt",
-      "evidence_fact_ids": ["fact_001", ...],
-      "supporting_quotes": ["Exact quote from evidence"],
-      "source_urls": ["URL"]
-    }
-  ],
-  "potential_headings": [
-    "H2 Heading text",
-    ...
-  ],
-  "structured_headings": [
-    {"level": "H2", "text": "Heading text", "intent_hint": "Editorial intent"},
-    {"level": "H3", "text": "Subheading text", "intent_hint": "Editorial intent"}
-  ],
-  "related_topics": [
-    "Related topic or search query for blog content clustering",
-    ...
-  ]
-}
-Rules:
-- Base topics strictly on the verified facts and statements provided. Do NOT assert unverified claims or use superlatives (e.g. best, #1, industry leader).
-- Potential headings should form an outline for an authoritative, helpful blog post that addresses the original prompt while highlighting verified customer capabilities.
-- Related topics should suggest 4-8 relevant semantic topics, comparisons, or search angles suitable for content expansion, FAQs, or pillar articles.
-- JSON only."""
-
-        payload = {
-            "customer_name": client_name,
-            "original_prompt": context.original_prompt,
-            "prompt_understanding": context.prompt_understanding.model_dump(),
-            "verified_facts": facts_summary,
-            "limited_statements": limits_summary,
-        }
-
-        try:
-            data = self._complete(system, payload, max_tokens=2500)
-        except Exception as exc:
-            print(f"  Blog guidance extraction failed: {exc}")
-            return {}
-
-        eb_topics: list[EvidenceBackedTopic] = []
-        for item in data.get("evidence_backed_topics") or []:
+        # 2. Parse candidate subtopics
+        candidate_subtopics: list[CandidateSubtopic] = []
+        for idx, item in enumerate(data.get("candidate_subtopics") or [], start=1):
             if not isinstance(item, dict):
                 continue
-            topic = _clean(str(item.get("topic") or ""))
-            if not topic:
+            title = _clean(str(item.get("title") or ""))
+            if not title:
                 continue
-            eb_topics.append(EvidenceBackedTopic(
-                topic=topic,
+            ev_ids = []
+            for q in item.get("evidence_quotes") or []:
+                ev_id = add_evidence(str(q))
+                if ev_id:
+                    ev_ids.append(ev_id)
+
+            status = str(item.get("evidence_status") or "supported").strip().lower()
+            if status not in {"supported", "needs_more_research", "unsupported"}:
+                status = "supported" if ev_ids else "needs_more_research"
+
+            angle = str(item.get("topic_angle") or "company_capability").strip().lower()
+            if angle not in {"company_capability", "industry_context", "comparison_methodology", "educational_guide"}:
+                angle = "company_capability"
+
+            relevance = str(item.get("relevance_to_main_topic") or "high").strip().lower()
+            if relevance not in _RELEVANCE:
+                relevance = "high"
+
+            candidate_subtopics.append(CandidateSubtopic(
+                subtopic_id=f"subtopic_{idx:03d}",
+                title=title,
                 description=_clean(str(item.get("description") or "")),
-                evidence_fact_ids=_string_list(item.get("evidence_fact_ids")),
-                supporting_quotes=_string_list(item.get("supporting_quotes")),
-                source_urls=_string_list(item.get("source_urls")),
+                topic_angle=angle,
+                relevance_to_main_topic=relevance,
+                evidence_status=status,
+                evidence_ids=ev_ids,
+                suggested_questions=_string_list(item.get("suggested_questions")),
             ))
 
-        headings = _string_list(data.get("potential_headings"))
-        structured: list[HeadingItem] = []
-        for item in data.get("structured_headings") or []:
+        # 3. Parse verified facts
+        verified_facts: list[VerifiedFact] = []
+        for idx, item in enumerate(data.get("verified_facts") or [], start=1):
             if not isinstance(item, dict):
                 continue
-            text = _clean(str(item.get("text") or ""))
-            if not text:
+            statement = _clean(str(item.get("statement") or ""))
+            if not statement:
                 continue
-            level = str(item.get("level") or "H2").strip().upper()
-            if level not in {"H2", "H3", "H4"}:
-                level = "H2"
-            structured.append(HeadingItem(
-                level=level,
-                text=text,
-                intent_hint=_clean(str(item.get("intent_hint") or "")),
+            q = str(item.get("evidence_quote") or "")
+            ev_id = add_evidence(q) if q else None
+            ev_type = str(item.get("evidence_type") or "company_website").strip().lower()
+            if ev_type not in {"company_website", "reputable_external"}:
+                ev_type = "company_website"
+            boundary = _clean(str(item.get("wording_boundary") or ""))
+
+            verified_facts.append(VerifiedFact(
+                fact_id=f"fact_{idx:03d}",
+                statement=statement,
+                category=_clean(str(item.get("category") or "company_capability")),
+                evidence_type=ev_type,
+                evidence_ids=[ev_id] if ev_id else [],
+                confidence="high" if ev_id else "medium",
+                wording_boundary=boundary if boundary else None,
             ))
 
-        related = _string_list(data.get("related_topics"))
+        # Add checked facts if LLM verified_facts was sparse
+        if not verified_facts:
+            for idx, f in enumerate(checked_guide.can_write, start=1):
+                ev_ids = [evidence_map.get(_clean(e.quote).lower()) for e in f.evidence if _clean(e.quote).lower() in evidence_map]
+                verified_facts.append(VerifiedFact(
+                    fact_id=f"fact_{idx:03d}",
+                    statement=f.claim,
+                    category="company_capability",
+                    evidence_type="company_website",
+                    evidence_ids=[eid for eid in ev_ids if eid],
+                    confidence="high",
+                ))
+            offset = len(verified_facts)
+            for idx, l in enumerate(checked_guide.can_write_with_limits, start=offset + 1):
+                ev_ids = [evidence_map.get(_clean(e.quote).lower()) for e in l.evidence if _clean(e.quote).lower() in evidence_map]
+                verified_facts.append(VerifiedFact(
+                    fact_id=f"fact_{idx:03d}",
+                    statement=l.statement,
+                    category="company_capability",
+                    evidence_type="company_website",
+                    evidence_ids=[eid for eid in ev_ids if eid],
+                    confidence="medium",
+                    wording_boundary=l.wording_limit,
+                ))
 
-        return {
-            "evidence_backed_topics": eb_topics,
-            "potential_headings": headings,
-            "structured_headings": structured,
-            "related_topics": related,
-        }
+        # 4. Parse research gaps
+        research_gaps: list[ResearchGap] = []
+        for idx, item in enumerate(data.get("research_gaps") or [], start=1):
+            if not isinstance(item, dict):
+                continue
+            t_or_q = _clean(str(item.get("topic_or_question") or ""))
+            if not t_or_q:
+                continue
+            research_gaps.append(ResearchGap(
+                gap_id=f"gap_{idx:03d}",
+                topic_or_question=t_or_q,
+                reason=_clean(str(item.get("reason") or "Evidence inconclusive")),
+                suggested_search_direction=_clean(str(item.get("suggested_search_direction") or "")),
+            ))
+
+        # Also add unverified checked gaps
+        for item in checked_guide.cannot_write:
+            if "not establish" in item.reason.lower() or "further research" in item.reason.lower():
+                research_gaps.append(ResearchGap(
+                    gap_id=f"gap_{len(research_gaps) + 1:03d}",
+                    topic_or_question=item.claim_or_topic,
+                    reason=item.reason,
+                    suggested_search_direction=f"Search company documentation or partner publications for {item.claim_or_topic}",
+                ))
+
+        # 5. Parse limitations
+        limitations: list[str] = _string_list(data.get("limitations"))
+        for standing in _STANDING_BANS:
+            limitations.append(f"Do not use superlative claims such as '{standing}' without verified primary certification.")
+        for lim in _LIMITATIONS:
+            if lim not in limitations:
+                limitations.append(lim)
+        for item in checked_guide.cannot_write:
+            if item.reason and item.reason not in limitations:
+                limitations.append(f"Avoid claiming '{item.claim_or_topic}': {item.reason}")
+        limitations = _string_list(limitations)
+
+        # 6. Legacy compatibility helpers
+        legacy_topics: list[EvidenceBackedTopic] = []
+        for sub in candidate_subtopics:
+            sub_ev = [ev for ev in evidence_items if ev.evidence_id in sub.evidence_ids]
+            legacy_topics.append(EvidenceBackedTopic(
+                topic=sub.title,
+                description=sub.description,
+                evidence_fact_ids=sub.evidence_ids,
+                supporting_quotes=[e.quote for e in sub_ev],
+                source_urls=[e.url for e in sub_ev],
+            ))
+
+        potential_headings = [f"H2: {sub.title}" for sub in candidate_subtopics]
+        structured_headings = [
+            HeadingItem(level="H2", text=sub.title, intent_hint=sub.description)
+            for sub in candidate_subtopics
+        ]
+        related_topics = [
+            q for sub in candidate_subtopics for q in sub.suggested_questions[:2]
+        ]
+
+        main_topic = _clean(str(data.get("main_topic") or understanding.get("main_topic") or context.original_prompt))
+        search_intent = _clean(str(data.get("search_intent") or understanding.get("search_intent") or context.prompt_understanding.intent))
+        target_audience = _clean(str(data.get("target_audience") or understanding.get("target_audience") or context.prompt_understanding.audience or "Industry professionals"))
+        prompt_scope = str(data.get("prompt_scope") or understanding.get("prompt_scope") or "hybrid")
+
+        return GroundTruthGuide(
+            main_topic=main_topic,
+            search_intent=search_intent,
+            target_audience=target_audience,
+            prompt_scope=prompt_scope,
+            candidate_subtopics=candidate_subtopics,
+            verified_facts=verified_facts,
+            evidence=evidence_items,
+            research_gaps=research_gaps,
+            limitations=limitations,
+            verification=verification,
+            scope=_scope_note(context),
+            evidence_backed_topics=legacy_topics,
+            potential_headings=potential_headings,
+            structured_headings=structured_headings,
+            related_topics=related_topics,
+            can_write=checked_guide.can_write,
+            can_write_with_limits=checked_guide.can_write_with_limits,
+            cannot_write=checked_guide.cannot_write,
+            banned_claims=banned,
+        )
 
     def _questions(self, context: PromptContext) -> list[dict[str, str]]:
         system = """You write the claims Agent 3 will verify about one customer.

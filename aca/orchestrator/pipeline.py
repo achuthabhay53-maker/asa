@@ -58,6 +58,13 @@ def agent3_node(state: PipelineState) -> dict[str, Any]:
         state.source_analysis,
         ClientInput(company_name=name, website=state.website),
     )
+    if guide is None:
+        return {
+            "guide": None,
+            "errors": [
+                "Prompt intent is invalid or customer is not relevant to the requested topic. Stopped as no blog content can be written."
+            ],
+        }
     return {"guide": guide}
 
 
@@ -80,3 +87,25 @@ def build_pipeline():
     graph.add_edge("agent2", "agent3")
     graph.add_edge("agent3", END)
     return graph.compile()
+
+
+def run_workflow(
+    campaign_id: int,
+    prompt_id: str | int,
+    website: str,
+    company_name: str = "",
+    top_n: int = TOP_N_SOURCES,
+    max_questions: int = MAX_QUESTIONS,
+) -> PipelineState:
+    """Run the entire workflow from a single input: campaign_id, prompt_id, website."""
+    initial_state = PipelineState(
+        campaign_id=int(campaign_id),
+        prompt_id=str(prompt_id),
+        website=website.strip(),
+        company_name=company_name.strip(),
+        top_n=top_n,
+        max_questions=max_questions,
+    )
+    pipeline = build_pipeline()
+    final_dict = pipeline.invoke(initial_state)
+    return PipelineState.model_validate(final_dict)
