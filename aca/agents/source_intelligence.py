@@ -1,949 +1,513 @@
+"""Agent 2: Source Intelligence for AImpact.
+
+Independently analyzes citations already stored for one prompt. Ranking is
+separate from content analysis: the top sources stay in ``ranked_sources``
+even when a page cannot be fetched, and those pages are listed in
+``retry_sources``.
+
+It does not search the web for new sources, treat a page's claims as
+verified facts about the customer, or write a content strategy.
 """
-Agent 2 - Source Intelligence
-
-Takes:
-1. Agent 1 PromptAnalysis
-2. Raw AImpact PromptEvidence
-
-Then:
-- ranks real AImpact-cited sources
-- fetches the actual URLs
-- analyzes their content with Claude
-- extracts topics, claims, competitors, structure and style
-
-Important:
-This agent does NOT invent citations.
-A source is considered an "AImpact cited source" only when it
-comes from the raw citation records supplied by AImpact.
-"""
-
 from __future__ import annotations
 
 import json
+import os
 import re
-from collections import Counter
+from html.parser import HTMLParser
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
-import anthropic
 import httpx
-from pydantic import BaseModel, Field
+from dotenv import load_dotenv
 
-from aca.orchestrator.state import CitedSource, PromptEvidence
+from aca.models.source_intelligence import (
+    AnalyzedSource,
+    CitationSummary,
+    ContentAnalysis,
+    ContentStructure,
+    RankedSource,
+    RetrySource,
+    SourceIntelligence,
+    WritingStyle,
+)
+
+load_dotenv()
 
 
-# ============================================================
-# Configuration
-# ============================================================
+# How many highest-cited sources to fetch and analyze.
+# Override at runtime with --top-n or SourceIntelligenceAgent(top_n=...).
+TOP_N_SOURCES = 5
 
-MAX_SOURCES = 10
 FETCH_TIMEOUT = 20.0
-MAX_PAGE_CHARS = 30000
+MAX_HTML_CHARS = 1_000_000
+MAX_PAGE_CHARS = 24_000
+MAX_HEADINGS = 40
+
+_TRACKING_PARAMS = {
+    "utm_source",
+    "utm_medium",
+    "utm_campaign",
+    "utm_term",
+    "utm_content",
+    "utm_id",
+    "gclid",
+    "fbclid",
+    "mc_cid",
+    "mc_eid",
+    "igshid",
+    "si",
+}
+_REDIRECT_HOSTS = {
+    "vertexaisearch.cloud.google.com",
+    "vertexaisearch.googleapis.com",
+    "www.google.com",
+    "google.com",
+}
+_BLOCKED_STATUS = {401, 403, 407, 429, 451}
 
 
-# ============================================================
-# Output models
-# ============================================================
+class _PageStructure(HTMLParser):
+    """Measures headings, lists, tables, and FAQ markers from one page."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.headings: list[str] = []
+        self.has_tables = False
+        self.has_lists = False
+        self.has_faq = False
+        self.title = ""
+        self.text_parts: list[str] = []
+        self._ignore = 0
+        self._chrome = 0
+        self._in_title = False
+        self._title_parts: list[str] = []
+        self._heading_parts: list[str] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        attr = {key.lower(): (value or "") for key, value in attrs}
+        blob = " ".join(
+            [
+                attr.get("id", ""),
+                attr.get("class", ""),
+                attr.get("itemtype", ""),
+                attr.get("role", ""),
+            ]
+        ).lower()
+        if tag in {"script", "style", "noscript", "svg"}:
+            self._ignore += 1
+        if tag in {"nav", "header", "footer"}:
+            self._chrome += 1
+        if tag == "title":
+            self._in_title = True
+        if tag in {"h1", "h2", "h3", "h4", "h5", "h6"} and self._ignore == 0:
+            self._heading_parts = []
+        if tag == "table" and self._chrome == 0:
+            self.has_tables = True
+        if tag in {"ul", "ol"} and self._chrome == 0 and self._ignore == 0:
+            self.has_lists = True
+        if "faq" in blob or "frequentlyasked" in blob.replace(" ", ""):
+            self.has_faq = True
+        if tag in {"p", "li", "br", "h1", "h2", "h3", "h4", "h5", "h6"}:
+            self.text_parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag in {"script", "style", "noscript", "svg"} and self._ignore:
+            self._ignore -= 1
+        if tag in {"nav", "header", "footer"} and self._chrome:
+            self._chrome -= 1
+        if tag == "title":
+            self._in_title = False
+            self.title = _clean_whitespace(" ".join(self._title_parts))
+        if tag in {"h1", "h2", "h3", "h4", "h5", "h6"} and self._heading_parts is not None:
+            heading = _clean_whitespace(" ".join(self._heading_parts))
+            if heading and heading not in self.headings and len(self.headings) < MAX_HEADINGS:
+                self.headings.append(heading)
+                if re.search(r"\bfaq\b|frequently asked", heading, flags=re.I):
+                    self.has_faq = True
+            self._heading_parts = None
+            self.text_parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if self._ignore:
+            return
+        if self._in_title:
+            self._title_parts.append(data)
+        if self._heading_parts is not None:
+            self._heading_parts.append(data)
+        if data.strip():
+            self.text_parts.append(data)
 
 
-class SourceAnalysisItem(BaseModel):
-    """
-    Intelligence extracted from one real AImpact-cited source.
-    """
-
-    source_id: str
-
-    url: str
-    domain: str
-
-    title: str | None = None
-
-    citation_count: int = 0
-
-    cited_by_models: list[str] = Field(default_factory=list)
-
-    source_type: str = "unknown"
-
-    summary: str = ""
-
-    topics: list[str] = Field(default_factory=list)
-
-    important_claims: list[str] = Field(default_factory=list)
-
-    competitors: list[str] = Field(default_factory=list)
-
-    competitor_context: list[str] = Field(default_factory=list)
-
-    content_structure: list[str] = Field(default_factory=list)
-
-    style_profile: list[str] = Field(default_factory=list)
-
-    audience: str = ""
-
-    evidence_density: str = ""
-
-    why_relevant_to_prompt: str = ""
-
-    fetch_status: str = "not_attempted"
-
-    fetch_error: str | None = None
+def _clean_whitespace(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip()
 
 
-class SourceAnalysis(BaseModel):
-    """
-    Complete Agent 2 output for one prompt.
-    """
-
-    prompt_id: str
-
-    prompt: str
-
-    total_unique_cited_sources: int = 0
-
-    total_citation_occurrences: int = 0
-
-    sources_analyzed: int = 0
-
-    top_sources: list[SourceAnalysisItem] = Field(default_factory=list)
+def _value(obj: Any, key: str, default: Any = None) -> Any:
+    return obj.get(key, default) if isinstance(obj, dict) else getattr(obj, key, default)
 
 
-# ============================================================
-# Agent
-# ============================================================
+def _public_id(value: Any) -> int | str:
+    text = str(value).strip()
+    return int(text) if text.isdigit() else text
+
+
+def _normalize_url(url: str) -> str:
+    raw = url.strip()
+    parsed = urlparse(raw)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    query = [
+        (key, item)
+        for key, item in parse_qsl(parsed.query, keep_blank_values=True)
+        if key.lower() not in _TRACKING_PARAMS
+    ]
+    path = parsed.path.rstrip("/")
+    return urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), path, "", urlencode(query), ""))
+
+
+def _is_redirect_host(url: str) -> bool:
+    host = urlparse(url).netloc.lower()
+    return host in _REDIRECT_HOSTS or "grounding-api-redirect" in url
+
+
+def _extract_json(text: str) -> dict[str, Any]:
+    text = re.sub(r"^\s*```(?:json)?\s*", "", text.strip(), flags=re.I)
+    text = re.sub(r"\s*```\s*$", "", text)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        start, end = text.find("{"), text.rfind("}")
+        if start < 0 or end <= start:
+            raise ValueError("Claude did not return a valid JSON object.")
+        data = json.loads(text[start:end + 1])
+    if not isinstance(data, dict):
+        raise ValueError("Expected a JSON object from Claude.")
+    return data
+
+
+def _string_list(raw: Any) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    values: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        text = _clean_whitespace(str(item))
+        key = text.lower()
+        if text and key not in seen:
+            seen.add(key)
+            values.append(text)
+    return values
+
+
+def _looks_like_challenge(text: str, html: str) -> bool:
+    sample = f"{text[:1500]}\n{html[:4000]}".lower()
+    markers = (
+        "cf-challenge",
+        "just a moment",
+        "attention required",
+        "enable javascript and cookies",
+        "captcha",
+        "access denied",
+    )
+    return len(text) < 800 and any(marker in sample for marker in markers)
+
+
+def _parse_page(html: str) -> tuple[ContentStructure, str, str]:
+    parser = _PageStructure()
+    parser.feed(html[:MAX_HTML_CHARS])
+    parser.close()
+    text = _clean_whitespace(" ".join(parser.text_parts))
+    structure = ContentStructure(
+        headings=parser.headings,
+        has_faq=parser.has_faq,
+        has_tables=parser.has_tables,
+        has_lists=parser.has_lists,
+    )
+    return structure, parser.title, text
+
+
+def _collect_sources(prompt_evidence: Any) -> list[dict[str, Any]]:
+    per_model = _value(prompt_evidence, "per_model", {}) or {}
+    grouped: dict[str, dict[str, Any]] = {}
+    for model_name, evidence in per_model.items():
+        for citation in _value(evidence, "sources", []) or []:
+            raw_url = str(_value(citation, "url", "") or "").strip()
+            normalized = _normalize_url(raw_url)
+            if not normalized:
+                continue
+            source = grouped.get(normalized)
+            if source is None:
+                title = _value(citation, "title", None)
+                source = {
+                    "url": normalized,
+                    "title": str(title).strip() if title else None,
+                    "citation_count": 0,
+                    "cited_by_models": [],
+                }
+                grouped[normalized] = source
+            source["citation_count"] += 1
+            model = str(model_name)
+            if model not in source["cited_by_models"]:
+                source["cited_by_models"].append(model)
+    return list(grouped.values())
+
+
+def _rank_sources(sources: list[dict[str, Any]], top_n: int) -> list[dict[str, Any]]:
+    ranked = sorted(
+        sources,
+        key=lambda source: (
+            -int(source["citation_count"]),
+            -len(source["cited_by_models"]),
+            1 if _is_redirect_host(source["url"]) else 0,
+            source["url"],
+        ),
+    )
+    return ranked[:top_n]
 
 
 class SourceIntelligenceAgent:
-    """
-    Agent 2.
+    def __init__(self, model: str | None = None, top_n: int | None = None) -> None:
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise RuntimeError("ANTHROPIC_API_KEY is not set.")
+        if top_n is None:
+            top_n = TOP_N_SOURCES
+        if top_n < 1:
+            raise ValueError("top_n must be at least 1.")
+        self.top_n = top_n
+        self.api_key = api_key
+        self.model = model or os.getenv("ANTHROPIC_MODEL_NAME") or "claude-haiku-4-5-20251001"
 
-    Input:
-        PromptAnalysis from Agent 1
-        PromptEvidence from AImpact
-
-    Output:
-        SourceAnalysis
-    """
-
-    def __init__(
-        self,
-        api_key: str | None = None,
-        model: str = "claude-haiku-4-5",
-    ) -> None:
-
-        self.client = anthropic.Anthropic(
-            api_key=api_key,
-        )
-
-        self.model = model
-
-    # --------------------------------------------------------
-    # Public entry point
-    # --------------------------------------------------------
-
-    def run(
-        self,
-        prompt_analysis: dict[str, Any],
-        prompt_evidence: PromptEvidence,
-    ) -> SourceAnalysis:
-
-        print("\n" + "=" * 70)
-        print("AGENT 2 - SOURCE INTELLIGENCE")
-        print("=" * 70)
-
-        print(f"Prompt ID: {prompt_evidence.prompt_id}")
-        print(f"Prompt: {prompt_evidence.prompt_text}")
-
-        # ----------------------------------------------------
-        # Step 1: Collect raw AImpact citations
-        # ----------------------------------------------------
-
-        sources = self._collect_sources(prompt_evidence)
-
-        print(f"\nRaw unique AImpact sources: {len(sources)}")
-
-        total_citations = sum(
-            source["citation_count"]
-            for source in sources
-        )
-
-        print(f"Total citation occurrences: {total_citations}")
-
-        # ----------------------------------------------------
-        # Step 2: Rank sources
-        # ----------------------------------------------------
-
-        ranked_sources = self._rank_sources(
-            sources=sources,
-            prompt_analysis=prompt_analysis,
-        )
-
-        print(
-            f"Selected top sources for analysis: "
-            f"{len(ranked_sources)}"
-        )
-
-        # ----------------------------------------------------
-        # Step 3: Analyze each source
-        # ----------------------------------------------------
-
-        analyzed_sources: list[SourceAnalysisItem] = []
-
-        for index, source in enumerate(ranked_sources, start=1):
-
-            print(
-                f"\n[{index}/{len(ranked_sources)}] "
-                f"{source['domain']}"
-            )
-
-            print(f"URL: {source['url']}")
-            print(
-                f"Citations: {source['citation_count']}"
-            )
-
-            analysis = self._analyze_source(
-                source=source,
-                prompt_analysis=prompt_analysis,
-                prompt_text=prompt_evidence.prompt_text,
-            )
-
-            analyzed_sources.append(analysis)
-
-        # ----------------------------------------------------
-        # Step 4: Build final output
-        # ----------------------------------------------------
-
-        result = SourceAnalysis(
-            prompt_id=prompt_evidence.prompt_id,
-            prompt=prompt_evidence.prompt_text,
-            total_unique_cited_sources=len(sources),
-            total_citation_occurrences=total_citations,
-            sources_analyzed=len(analyzed_sources),
-            top_sources=analyzed_sources,
-        )
-
-        print("\n" + "=" * 70)
-        print("AGENT 2 COMPLETE")
-        print("=" * 70)
-
-        print(
-            f"Unique AImpact sources: "
-            f"{result.total_unique_cited_sources}"
-        )
-
-        print(
-            f"Total citation occurrences: "
-            f"{result.total_citation_occurrences}"
-        )
-
-        print(
-            f"Sources analyzed: "
-            f"{result.sources_analyzed}"
-        )
-
-        return result
-
-    # --------------------------------------------------------
-    # Collect raw citations
-    # --------------------------------------------------------
-
-    def _collect_sources(
-        self,
-        prompt_evidence: PromptEvidence,
-    ) -> list[dict[str, Any]]:
-
-        source_map: dict[str, dict[str, Any]] = {}
-
-        for model_name, model_evidence in prompt_evidence.per_model.items():
-
-            for citation in model_evidence.sources:
-
-                url = citation.url
-
-                if not url:
-                    continue
-
-                url = url.strip()
-
-                if not url:
-                    continue
-
-                # Normalize URL for deduplication.
-                normalized_url = self._normalize_url(url)
-
-                if not normalized_url:
-                    continue
-
-                if normalized_url not in source_map:
-
-                    domain = (
-                        citation.domain
-                        or self._extract_domain(normalized_url)
-                    )
-
-                    source_map[normalized_url] = {
-                        "url": normalized_url,
-                        "domain": domain,
-                        "title": citation.title,
-                        "excerpt": citation.excerpt,
-                        "competitor": citation.competitor,
-                        "citation_count": 0,
-                        "cited_by_models": set(),
-                        "citations": [],
-                    }
-
-                source = source_map[normalized_url]
-
-                source["citation_count"] += 1
-
-                source["cited_by_models"].add(
-                    model_name
+    def analyze(self, campaign_id: int, prompt_evidence: Any) -> SourceIntelligence:
+        prompt_id = _public_id(_value(prompt_evidence, "prompt_id", ""))
+        if prompt_id == "":
+            raise ValueError("Selected AImpact prompt has no prompt_id.")
+        sources = _collect_sources(prompt_evidence)
+        occurrences = sum(int(source["citation_count"]) for source in sources)
+        selected = _rank_sources(sources, self.top_n)
+        ranked_sources: list[RankedSource] = []
+        content_analyses: list[AnalyzedSource] = []
+        retry_sources: list[RetrySource] = []
+        for index, source in enumerate(selected, start=1):
+            source_id = f"source_{index:03d}"
+            ranked_sources.append(
+                RankedSource(
+                    source_id=source_id,
+                    rank=index,
+                    url=source["url"],
+                    title=source.get("title"),
+                    citation_count=source["citation_count"],
+                    cited_by_models=list(source["cited_by_models"]),
                 )
-
-                source["citations"].append(
-                    citation
-                )
-
-        # Convert sets to lists.
-        results = []
-
-        for source in source_map.values():
-
-            source["cited_by_models"] = sorted(
-                source["cited_by_models"]
             )
-
-            results.append(source)
-
-        return results
-
-    # --------------------------------------------------------
-    # Rank sources
-    # --------------------------------------------------------
-
-    def _rank_sources(
-        self,
-        sources: list[dict[str, Any]],
-        prompt_analysis: dict[str, Any],
-    ) -> list[dict[str, Any]]:
-
-        key_concepts = {
-            self._clean_text(concept)
-            for concept in prompt_analysis.get(
-                "key_concepts",
-                [],
-            )
-        }
-
-        companies = {
-            self._clean_text(company)
-            for company in prompt_analysis.get(
-                "companies_mentioned",
-                [],
-            )
-        }
-
-        scored_sources = []
-
-        for source in sources:
-
-            score = 0.0
-
-            # ------------------------------------------------
-            # Citation frequency
-            # ------------------------------------------------
-
-            score += source["citation_count"] * 10
-
-            # ------------------------------------------------
-            # Multiple AI models cited it
-            # ------------------------------------------------
-
-            score += len(
-                source["cited_by_models"]
-            ) * 5
-
-            # ------------------------------------------------
-            # Title/excerpt relevance
-            # ------------------------------------------------
-
-            searchable_text = " ".join(
-                [
-                    source.get("title") or "",
-                    source.get("excerpt") or "",
-                    source.get("domain") or "",
-                ]
-            ).lower()
-
-            for concept in key_concepts:
-
-                if concept and concept.lower() in searchable_text:
-                    score += 3
-
-            # ------------------------------------------------
-            # Mentioned company relevance
-            # ------------------------------------------------
-
-            competitor = (
-                source.get("competitor")
-                or ""
-            )
-
-            for company in companies:
-
-                if company and company.lower() in (
-                    competitor.lower()
-                ):
-                    score += 2
-
-            source["_ranking_score"] = score
-
-            scored_sources.append(source)
-
-        scored_sources.sort(
-            key=lambda item: item["_ranking_score"],
-            reverse=True,
+            analysis, retry = self._analyze_source(source_id, source)
+            if analysis is not None:
+                content_analyses.append(analysis)
+            if retry is not None:
+                retry_sources.append(retry)
+        return SourceIntelligence(
+            campaign_id=_public_id(campaign_id),
+            prompt_id=prompt_id,
+            citation_summary=CitationSummary(
+                total_citation_occurrences=occurrences,
+                unique_sources=len(sources),
+            ),
+            ranked_sources=ranked_sources,
+            content_analyses=content_analyses,
+            retry_sources=retry_sources,
         )
-
-        return scored_sources[:MAX_SOURCES]
-
-    # --------------------------------------------------------
-    # Fetch webpage
-    # --------------------------------------------------------
-
-    def _fetch_page(
-        self,
-        url: str,
-    ) -> tuple[str | None, str | None]:
-
-        try:
-
-            headers = {
-                "User-Agent": (
-                    "Mozilla/5.0 "
-                    "(Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 "
-                    "Chrome/154.0 Safari/537.36"
-                )
-            }
-
-            with httpx.Client(
-                timeout=FETCH_TIMEOUT,
-                follow_redirects=True,
-                headers=headers,
-            ) as client:
-
-                response = client.get(url)
-
-                response.raise_for_status()
-
-                content_type = response.headers.get(
-                    "content-type",
-                    "",
-                ).lower()
-
-                if (
-                    "text/html" not in content_type
-                    and "application/xhtml" not in content_type
-                ):
-                    return (
-                        None,
-                        f"Unsupported content type: {content_type}",
-                    )
-
-                html = response.text
-
-                text = self._html_to_text(html)
-
-                if not text.strip():
-                    return (
-                        None,
-                        "Page contained no readable text",
-                    )
-
-                return (
-                    text[:MAX_PAGE_CHARS],
-                    None,
-                )
-
-        except Exception as exc:
-
-            return (
-                None,
-                str(exc),
-            )
-
-    # --------------------------------------------------------
-    # Convert HTML into readable text
-    # --------------------------------------------------------
-
-    def _html_to_text(
-        self,
-        html: str,
-    ) -> str:
-
-        # Remove scripts/styles.
-        html = re.sub(
-            r"<script\b[^>]*>.*?</script>",
-            " ",
-            html,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-
-        html = re.sub(
-            r"<style\b[^>]*>.*?</style>",
-            " ",
-            html,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-
-        html = re.sub(
-            r"<noscript\b[^>]*>.*?</noscript>",
-            " ",
-            html,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-
-        # Preserve headings as separate text.
-        html = re.sub(
-            r"<h[1-6][^>]*>",
-            "\n",
-            html,
-            flags=re.IGNORECASE,
-        )
-
-        html = re.sub(
-            r"</h[1-6]>",
-            "\n",
-            html,
-            flags=re.IGNORECASE,
-        )
-
-        # Paragraphs / list items.
-        html = re.sub(
-            r"<(?:p|li|div|section|article|br)[^>]*>",
-            "\n",
-            html,
-            flags=re.IGNORECASE,
-        )
-
-        # Remove remaining tags.
-        html = re.sub(
-            r"<[^>]+>",
-            " ",
-            html,
-        )
-
-        # Decode common entities.
-        replacements = {
-            "&nbsp;": " ",
-            "&amp;": "&",
-            "&quot;": '"',
-            "&#39;": "'",
-            "&lt;": "<",
-            "&gt;": ">",
-        }
-
-        for old, new in replacements.items():
-            html = html.replace(old, new)
-
-        # Normalize whitespace.
-        html = re.sub(
-            r"[ \t]+",
-            " ",
-            html,
-        )
-
-        html = re.sub(
-            r"\n\s*\n+",
-            "\n",
-            html,
-        )
-
-        return html.strip()
-
-    # --------------------------------------------------------
-    # Claude source analysis
-    # --------------------------------------------------------
 
     def _analyze_source(
         self,
+        source_id: str,
         source: dict[str, Any],
-        prompt_analysis: dict[str, Any],
-        prompt_text: str,
-    ) -> SourceAnalysisItem:
-
-        url = source["url"]
-        domain = source["domain"]
-
-        page_text, fetch_error = self._fetch_page(url)
-
-        if page_text is None:
-
-            print(
-                f"  Fetch failed: {fetch_error}"
-            )
-
-            return SourceAnalysisItem(
-                source_id=self._make_source_id(url),
-                url=url,
-                domain=domain,
+    ) -> tuple[AnalyzedSource | None, RetrySource | None]:
+        fetched = _fetch_page(source["url"])
+        if fetched["status"] != "success":
+            return None, RetrySource(
+                source_id=source_id,
+                url=source["url"],
                 title=source.get("title"),
-                citation_count=source["citation_count"],
-                cited_by_models=source[
-                    "cited_by_models"
-                ],
-                fetch_status="failed",
-                fetch_error=fetch_error,
+                fetch_status=fetched["status"],
             )
 
-        print(
-            f"  Fetched {len(page_text):,} characters"
-        )
-
-        prompt_analysis_json = json.dumps(
-            prompt_analysis,
-            ensure_ascii=False,
-            indent=2,
-        )
-
-        analysis_prompt = f"""
-You are Agent 2 of an agentic content intelligence system.
-
-Your job is to analyze a REAL WEBPAGE that was cited by an AI
-response recorded by AImpact.
-
-IMPORTANT:
-- The URL below came from AImpact's citation data.
-- Do not invent facts about the source.
-- Only extract information supported by the supplied webpage text.
-- Do not copy long passages.
-- Summarize in your own words.
-- "style_profile" means structural/editorial characteristics,
-  NOT instructions to copy the source.
-- Competitors must only be listed when the webpage actually
-  supports that they are competitors or comparable providers.
-- If something cannot be determined, return an empty list or
-  a conservative statement.
-
-USER PROMPT:
-{prompt_text}
-
-AGENT 1 PROMPT ANALYSIS:
-{prompt_analysis_json}
-
-SOURCE URL:
-{url}
-
-SOURCE DOMAIN:
-{domain}
-
-SOURCE TITLE:
-{source.get("title") or ""}
-
-AIMPACT CITATION COUNT:
-{source["citation_count"]}
-
-AIMPACT MODELS THAT CITED THIS SOURCE:
-{json.dumps(source["cited_by_models"])}
-
-WEBPAGE TEXT:
-{page_text}
-
-Return ONLY valid JSON with exactly this structure:
-
-{{
-  "title": "source title",
-  "source_type": "commercial|academic|educational|directory|news|government|unknown",
-  "summary": "short factual summary",
-  "topics": [
-    "topic 1",
-    "topic 2"
-  ],
-  "important_claims": [
-    "claim 1",
-    "claim 2"
-  ],
-  "competitors": [
-    "company or provider"
-  ],
-  "competitor_context": [
-    "Company X is discussed in relation to ..."
-  ],
-  "content_structure": [
-    "service overview",
-    "technical capabilities",
-    "applications",
-    "FAQ"
-  ],
-  "style_profile": [
-    "technical",
-    "authoritative",
-    "evidence-oriented"
-  ],
-  "audience": "description of intended audience",
-  "evidence_density": "low|medium|high",
-  "why_relevant_to_prompt": "why this source helps answer the user prompt"
-}}
-"""
-
+        structure: ContentStructure = fetched["structure"]
         try:
-
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=4000,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": analysis_prompt,
-                    }
-                ],
+            described = self._describe_page(
+                url=fetched["final_url"],
+                title=fetched["title"] or source.get("title") or "",
+                page_text=fetched["text"],
+                structure=structure,
             )
-
-            raw_text = self._extract_response_text(
-                response
-            )
-
-            parsed = self._parse_json(
-                raw_text
-            )
-
-            return SourceAnalysisItem(
-                source_id=self._make_source_id(url),
-                url=url,
-                domain=domain,
-                title=(
-                    parsed.get("title")
-                    or source.get("title")
-                ),
-                citation_count=source[
-                    "citation_count"
-                ],
-                cited_by_models=source[
-                    "cited_by_models"
-                ],
-                source_type=parsed.get(
-                    "source_type",
-                    "unknown",
-                ),
-                summary=parsed.get(
-                    "summary",
-                    "",
-                ),
-                topics=self._ensure_list(
-                    parsed.get("topics")
-                ),
-                important_claims=self._ensure_list(
-                    parsed.get("important_claims")
-                ),
-                competitors=self._ensure_list(
-                    parsed.get("competitors")
-                ),
-                competitor_context=self._ensure_list(
-                    parsed.get("competitor_context")
-                ),
-                content_structure=self._ensure_list(
-                    parsed.get("content_structure")
-                ),
-                style_profile=self._ensure_list(
-                    parsed.get("style_profile")
-                ),
-                audience=parsed.get(
-                    "audience",
-                    "",
-                ),
-                evidence_density=parsed.get(
-                    "evidence_density",
-                    "",
-                ),
-                why_relevant_to_prompt=parsed.get(
-                    "why_relevant_to_prompt",
-                    "",
-                ),
-                fetch_status="success",
-            )
-
         except Exception as exc:
+            print(f"  Style analysis failed for {source_id}: {exc}")
+            described = {
+                "summary": "The page was fetched, but its writing style could not be analyzed.",
+                "main_topics": [],
+                "writing_style": {},
+            }
+        style = described.get("writing_style") or {}
+        return AnalyzedSource(
+            source_id=source_id,
+            url=fetched["final_url"],
+            title=fetched["title"] or source.get("title"),
+            fetch_status="success",
+            content_analysis=ContentAnalysis(
+                summary=str(described.get("summary") or "").strip(),
+                main_topics=_string_list(described.get("main_topics")),
+                content_structure=structure,
+                writing_style=WritingStyle(
+                    tone=str(style.get("tone") or "").strip(),
+                    format=str(style.get("format") or "").strip(),
+                    audience=str(style.get("audience") or "").strip(),
+                    paragraph_style=str(style.get("paragraph_style") or "").strip(),
+                    evidence_style=str(style.get("evidence_style") or "").strip(),
+                ),
+            ),
+        ), None
 
-            print(
-                f"  Claude analysis failed: {exc}"
-            )
-
-            return SourceAnalysisItem(
-                source_id=self._make_source_id(url),
-                url=url,
-                domain=domain,
-                title=source.get("title"),
-                citation_count=source[
-                    "citation_count"
-                ],
-                cited_by_models=source[
-                    "cited_by_models"
-                ],
-                fetch_status="analysis_failed",
-                fetch_error=str(exc),
-            )
-
-    # --------------------------------------------------------
-    # Helpers
-    # --------------------------------------------------------
-
-    @staticmethod
-    def _normalize_url(
+    def _describe_page(
+        self,
         url: str,
-    ) -> str:
-
-        url = url.strip()
-
-        # Remove fragments.
-        url = url.split("#", 1)[0]
-
-        # Remove trailing slash except for root.
-        parsed = urlparse(url)
-
-        if not parsed.scheme:
-            return url
-
-        path = parsed.path.rstrip("/")
-
-        normalized = (
-            f"{parsed.scheme}://"
-            f"{parsed.netloc}"
-            f"{path}"
-        )
-
-        if parsed.query:
-            normalized += f"?{parsed.query}"
-
-        return normalized
-
-    @staticmethod
-    def _extract_domain(
-        url: str,
-    ) -> str:
-
-        try:
-            return urlparse(url).netloc.lower()
-        except Exception:
-            return ""
-
-    @staticmethod
-    def _make_source_id(
-        url: str,
-    ) -> str:
-
-        import hashlib
-
-        return hashlib.sha1(
-            url.encode("utf-8")
-        ).hexdigest()[:12]
-
-    @staticmethod
-    def _clean_text(
-        value: str,
-    ) -> str:
-
-        return " ".join(
-            str(value).lower().split()
-        )
-
-    @staticmethod
-    def _ensure_list(
-        value: Any,
-    ) -> list[str]:
-
-        if isinstance(value, list):
-            return [
-                str(item)
-                for item in value
-                if item
-            ]
-
-        if isinstance(value, str) and value.strip():
-            return [value.strip()]
-
-        return []
-
-    @staticmethod
-    def _extract_response_text(
-        response: Any,
-    ) -> str:
-
-        parts = []
-
-        for block in response.content:
-
-            if getattr(block, "type", None) == "text":
-                parts.append(block.text)
-
-        return "\n".join(parts).strip()
-
-    @staticmethod
-    def _parse_json(
-        text: str,
+        title: str,
+        page_text: str,
+        structure: ContentStructure,
     ) -> dict[str, Any]:
-
-        text = text.strip()
-
-        # Remove markdown code fences.
-        if text.startswith("```"):
-            text = re.sub(
-                r"^```(?:json)?",
-                "",
-                text,
-                flags=re.IGNORECASE,
-            )
-
-            text = re.sub(
-                r"```$",
-                "",
-                text,
-            )
-
-            text = text.strip()
-
-        try:
-            result = json.loads(text)
-
-            if isinstance(result, dict):
-                return result
-
-        except json.JSONDecodeError:
-            pass
-
-        # Try extracting the first JSON object.
-        match = re.search(
-            r"\{.*\}",
-            text,
-            flags=re.DOTALL,
+        system_prompt = """You describe one fetched web page for Agent 2: Source Intelligence.
+Return one JSON object and nothing else:
+{
+  "summary": "",
+  "main_topics": [],
+  "writing_style": {
+    "tone": "",
+    "format": "",
+    "audience": "",
+    "paragraph_style": "",
+    "evidence_style": ""
+  }
+}
+Rules:
+- Describe only the supplied page. Do not say a style, topic, or structure is common, typical, or shared across sources.
+- summary is a short account of what this page itself says.
+- main_topics are topics present on this page.
+- writing_style describes this page's tone, format, audience, paragraph style, and how it uses evidence.
+- Do not treat companies or claims on the page as verified facts about the customer.
+- Do not propose a blog, outline, or content strategy.
+- Do not add sources, URLs, or fields. JSON only."""
+        payload = {
+            "url": url,
+            "title": title,
+            "measured_structure": structure.model_dump(),
+            "page_text": page_text[:MAX_PAGE_CHARS],
+        }
+        response = httpx.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": self.api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": self.model,
+                "max_tokens": 1200,
+                "system": system_prompt,
+                "messages": [{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+            },
+            timeout=60.0,
         )
+        response.raise_for_status()
+        blocks = response.json().get("content") or []
+        text_blocks = [block.get("text", "") for block in blocks if block.get("type") == "text"]
+        if not text_blocks:
+            raise RuntimeError("Claude returned no text for Agent 2.")
+        return _extract_json("\n".join(text_blocks))
 
-        if match:
 
-            result = json.loads(
-                match.group(0)
-            )
+def _fetch_page(url: str) -> dict[str, Any]:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/154.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+    }
+    try:
+        with httpx.Client(timeout=FETCH_TIMEOUT, follow_redirects=True, headers=headers) as client:
+            response = client.get(url)
+            if response.status_code in _BLOCKED_STATUS:
+                return {"status": "blocked"}
+            response.raise_for_status()
+            content_type = response.headers.get("content-type", "").lower()
+            if "html" not in content_type and "xml" not in content_type and content_type:
+                return {"status": "unavailable"}
+            html = response.text[:MAX_HTML_CHARS]
+            structure, title, text = _parse_page(html)
+            if _looks_like_challenge(text, html):
+                return {"status": "blocked"}
+            if not text:
+                return {"status": "unavailable"}
+            return {
+                "status": "success",
+                "final_url": str(response.url),
+                "title": title or None,
+                "text": text,
+                "structure": structure,
+            }
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        return {"status": "blocked" if status in _BLOCKED_STATUS else "unavailable"}
+    except httpx.HTTPError:
+        return {"status": "unavailable"}
 
-            if isinstance(result, dict):
-                return result
 
+def run_agent2(
+    campaign_id: int,
+    prompt_id: int | str,
+    top_n: int | None = None,
+    score_threshold: float = 1000,
+) -> SourceIntelligence:
+    """Run Agent 2 using the temporary AImpact PostgreSQL reader."""
+    from aca.tools.aimpact import get_prompt_evidence
+
+    records = get_prompt_evidence(campaign_id=campaign_id, score_threshold=score_threshold)
+    selected = next((item for item in records if str(_value(item, "prompt_id", "")) == str(prompt_id)), None)
+    if selected is None:
         raise ValueError(
-            "Claude did not return valid JSON"
+            f"Prompt {prompt_id} not found in campaign {campaign_id} "
+            f"with score_threshold={score_threshold}."
         )
+    return SourceIntelligenceAgent(top_n=top_n).analyze(campaign_id, selected)
 
 
-# ============================================================
-# Convenience function
-# ============================================================
+if __name__ == "__main__":
+    import argparse
 
+    parser = argparse.ArgumentParser(description="AImpact Agent 2: Source Intelligence")
+    parser.add_argument("--campaign-id", type=int, required=True)
+    parser.add_argument("--prompt-id", required=True)
+    parser.add_argument("--top-n", type=int, default=TOP_N_SOURCES)
+    parser.add_argument("--score-threshold", type=float, default=1000)
+    parser.add_argument("--output", default="agent2_output.json")
+    args = parser.parse_args()
 
-def run_source_intelligence(
-    prompt_analysis: dict[str, Any],
-    prompt_evidence: PromptEvidence,
-) -> SourceAnalysis:
-
-    agent = SourceIntelligenceAgent()
-
-    return agent.run(
-        prompt_analysis=prompt_analysis,
-        prompt_evidence=prompt_evidence,
-    )
+    result = run_agent2(args.campaign_id, args.prompt_id, args.top_n, args.score_threshold)
+    payload = result.model_dump()
+    with open(args.output, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    print("=" * 68)
+    print("AIMPACT AGENT 2 — SOURCE INTELLIGENCE")
+    print("=" * 68)
+    print(f"Campaign ID: {result.campaign_id}")
+    print(f"Prompt ID: {result.prompt_id}")
+    print(f"Citation occurrences: {result.citation_summary.total_citation_occurrences}")
+    print(f"Unique sources: {result.citation_summary.unique_sources}")
+    print(f"Ranked sources: {len(result.ranked_sources)}")
+    print(f"Content analyses: {len(result.content_analyses)}")
+    print(f"Needs retry: {len(result.retry_sources)}")
+    for source in result.retry_sources:
+        print(f"- {source.source_id} [{source.fetch_status}] {source.url}")
+    print(f"Output saved to: {os.path.abspath(args.output)}")

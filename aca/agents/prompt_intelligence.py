@@ -16,56 +16,12 @@ import os
 import re
 from typing import Any
 
-from anthropic import Anthropic
+import httpx
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field
+
+from aca.models.prompt_intelligence import PromptAnalysis
 
 load_dotenv()
-
-
-class PromptUnderstanding(BaseModel):
-    intent: str
-    topic: str
-    audience: str | None = None
-    user_goal: str
-    key_questions: list[str] = Field(default_factory=list)
-
-
-class AnswerUnderstanding(BaseModel):
-    summary: str
-    key_topics: list[str] = Field(default_factory=list)
-    key_concepts: list[str] = Field(default_factory=list)
-    comparison_criteria: list[str] = Field(default_factory=list)
-
-
-class CompanyMention(BaseModel):
-    name: str
-    context: str
-
-
-class CustomerVisibility(BaseModel):
-    status: str = "unknown"  # mentioned, not_mentioned, mixed, unknown
-    models_mentioning_customer: list[str] = Field(default_factory=list)
-    context: str | None = None
-
-
-class CrossModelPatterns(BaseModel):
-    common_topics: list[str] = Field(default_factory=list)
-    differences: list[str] = Field(default_factory=list)
-
-
-class PromptAnalysis(BaseModel):
-    """Public Agent 1 result. Field order is the output contract."""
-
-    prompt_id: str
-    prompt: str
-    customer_name: str
-    prompt_understanding: PromptUnderstanding
-    answer_understanding: AnswerUnderstanding
-    companies_mentioned: list[CompanyMention] = Field(default_factory=list)
-    customer_visibility: CustomerVisibility
-    cross_model_patterns: CrossModelPatterns = Field(default_factory=CrossModelPatterns)
-    content_opportunities: list[str] = Field(default_factory=list)
 
 
 def _value(obj: Any, key: str, default: Any = None) -> Any:
@@ -184,7 +140,7 @@ class PromptIntelligenceAgent:
         api_key = os.getenv("ANTHROPIC_API_KEY")
         if not api_key:
             raise RuntimeError("ANTHROPIC_API_KEY is not set.")
-        self.client = Anthropic(api_key=api_key)
+        self.api_key = api_key
         self.model = (
             model
             or os.getenv("ANTHROPIC_MODEL_NAME")
@@ -247,13 +203,24 @@ Rules:
             "prompt": prompt,
             "answers": answers,
         }
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=4000,
-            system=system_prompt,
-            messages=[{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+        response = httpx.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": self.api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": self.model,
+                "max_tokens": 4000,
+                "system": system_prompt,
+                "messages": [{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+            },
+            timeout=90.0,
         )
-        text_blocks = [b.text for b in response.content if getattr(b, "type", None) == "text"]
+        response.raise_for_status()
+        blocks = response.json().get("content") or []
+        text_blocks = [block.get("text", "") for block in blocks if block.get("type") == "text"]
         if not text_blocks:
             raise RuntimeError("Claude returned no text for Agent 1.")
         data = _extract_json("\n".join(text_blocks))
