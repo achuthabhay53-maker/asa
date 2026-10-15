@@ -21,7 +21,7 @@ class WriterAgent:
     def __init__(
         self,
         model: str = "claude-haiku-4-5",
-        max_tokens: int = 10000,
+        max_tokens: int = 11000,
     ) -> None:
         api_key = os.getenv("ANTHROPIC_API_KEY")
         if not api_key:
