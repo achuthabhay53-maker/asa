@@ -2,19 +2,19 @@
 """Build Agent 5 input from Agent 1–4 outputs and run the Writer Agent.
 
 Run from the project root:
-    python .\scripts\test_writer_from_pipeline.py
+    python scripts/test_writer_from_pipeline.py
 """
 
 from __future__ import annotations
 
 
 import json
+import argparse
 import re
 import sys
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
-import os
 from dotenv import load_dotenv
 
 
@@ -26,12 +26,12 @@ load_dotenv(ROOT / ".env")
 
 
 
-from aca.models.writer import (
+from aca.models.writer import (  # noqa: E402
     WriterEvidence,
     WriterInput,
     WriterSectionInput,
 )
-from aca.agents.writer import WriterAgent
+from aca.agents.writer import WriterAgent  # noqa: E402
 
 
 
@@ -464,6 +464,22 @@ def build_writing_style(agent4: dict[str, Any]) -> dict[str, str]:
 # ---------------------------------------------------------------------
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Prepare Agent 5 input from saved Agent 1–4 JSON outputs."
+    )
+    parser.add_argument(
+        "--prepare-only",
+        action="store_true",
+        help="Save the prepared WriterInput and exit without calling Agent 5.",
+    )
+    parser.add_argument(
+        "--input-output",
+        type=Path,
+        default=ROOT / "agent5_input.json",
+        help="Path for the serialized WriterInput used by standalone Agent 5 runs.",
+    )
+    args = parser.parse_args()
+
     agent1 = load_json(
         ["agent1_output.json", "agent1_output(1).json"]
     )
@@ -555,11 +571,40 @@ def main() -> None:
             default="Readers researching relevant providers and capabilities",
         ),
         search_intent=first_nonempty(agent4.get("search_intent")),
+        primary_keyword=first_nonempty(
+            agent4.get("primary_keyword"),
+            default=first_nonempty(agent3.get("main_topic"), agent3.get("topic")),
+        ),
+        secondary_keywords=[
+            str(value)
+            for value in as_list(agent4.get("secondary_keywords"))
+            if str(value).strip()
+        ],
+        related_topics=[
+            str(value)
+            for value in as_list(agent4.get("related_topics"))
+            if str(value).strip()
+        ],
+        question_based_queries=[
+            str(value)
+            for value in as_list(agent4.get("question_based_queries"))
+            if str(value).strip()
+        ],
+        faqs=[
+            {"question": str(value).strip(), "answer": ""}
+            for value in as_list(agent4.get("faq_questions"))
+            if isinstance(value, str) and value.strip()
+        ],
         sections=sections,
         writing_style=build_writing_style(agent4),
         unsupported_claims_to_avoid=unsupported_claims,
         evidence=evidence,
     )
+
+    input_path = args.input_output.resolve()
+    input_path.parent.mkdir(parents=True, exist_ok=True)
+    input_path.write_text(writer_input.model_dump_json(indent=2), encoding="utf-8")
+    print(f"[OK] Agent 5 input saved to: {input_path}")
 
     print("\n--- Agent 5 input summary ---")
     print(f"Company: {writer_input.company_name}")
@@ -572,6 +617,14 @@ def main() -> None:
     for item in writer_input.evidence:
         status_counts[item.status] = status_counts.get(item.status, 0) + 1
     print(f"Evidence status counts: {status_counts}")
+
+    if args.prepare_only:
+        print("\nPrepared input only; Agent 5 was not called.")
+        print(
+            "Run only Agent 5 with: "
+            f"python .\\scripts\\run_agent5.py .\\{input_path.name}"
+        )
+        return
 
     print("\nRunning Agent 5...")
     result = WriterAgent().write(writer_input)

@@ -33,23 +33,68 @@ class WriterAgent:
 
     def write(self, writer_input: WriterInput) -> WriterOutput:
         """Generate a reader-focused, evidence-grounded blog post."""
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=self.max_tokens,
-            system=self._system_prompt(),
-            messages=[
-                {
-                    "role": "user",
-                    "content": self._build_user_prompt(writer_input),
-                }
-            ],
-        )
+        user_prompt = self._build_user_prompt(writer_input)
+        result = self._generate_output(user_prompt)
 
-        if response.stop_reason == "max_tokens":
-            raise RuntimeError(
-                "Writer response was truncated. Increase max_tokens "
-                "or reduce the requested article length."
+        allowed_ids = {item.evidence_id for item in writer_input.evidence}
+        self._validate_evidence_references(result, allowed_ids)
+        try:
+            self._validate_seo_requirements(result, writer_input)
+        except RuntimeError as exc:
+            error = str(exc)
+            is_faq_error = "FAQ" in error
+            is_meta_error = "meta_description" in error
+            if not (is_faq_error or is_meta_error):
+                raise
+            repair_instructions = ""
+            if is_faq_error:
+                repair_instructions += (
+                    "Replace unsupported FAQ questions and answers with 3 to 5 "
+                    "questions answerable from the article and supplied evidence. "
+                    "Do not ask about measurable improvements, ROI, outcomes, or "
+                    "statistics unless the supplied evidence explicitly supports them. "
+                    "Keep factual FAQ claims in claims_used with valid evidence IDs. "
+                )
+            if is_meta_error:
+                repair_instructions += (
+                    "Set meta_description to one concise, accurate description "
+                    "between 1 and 160 characters. "
+                )
+            repair_prompt = (
+                user_prompt
+                + "\n\nYour previous draft failed validation: "
+                + error
+                + "\nRevise the full JSON article. "
+                + repair_instructions
+                + "Preserve all required JSON fields, evidence references, and article quality."
             )
+            result = self._generate_output(repair_prompt)
+            self._validate_evidence_references(result, allowed_ids)
+            try:
+                self._validate_seo_requirements(result, writer_input)
+            except RuntimeError as retry_exc:
+                raise RuntimeError(
+                    f"Writer validation failed after one repair attempt: {retry_exc}"
+                ) from retry_exc
+        return result
+
+    def _generate_output(self, user_prompt: str) -> WriterOutput:
+        token_limits = [self.max_tokens, min(self.max_tokens * 2, 32000)]
+        for attempt, token_limit in enumerate(token_limits):
+            response = self.client.messages.create(
+                model=self.model,
+                max_tokens=token_limit,
+                system=self._system_prompt(),
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+            if response.stop_reason != "max_tokens":
+                break
+            if attempt == len(token_limits) - 1:
+                raise RuntimeError(
+                    "Writer response was truncated at "
+                    f"{token_limit:,} output tokens after one retry. "
+                    "Reduce target_word_count or shorten the supplied brief."
+                )
 
         raw_text = "\n".join(
             block.text
@@ -69,25 +114,19 @@ class WriterAgent:
                 f"Writer returned invalid output: {exc}"
             ) from exc
 
-        actual_word_count = len(
-            re.findall(r"\b[\w’'-]+\b", result.article_markdown)
-        )
-
-        # Deduplicate exact repeated warnings without changing their order.
-        unresolved_items = list(dict.fromkeys(result.unresolved_items))
-
-        result = result.model_copy(
+        actual_word_count = len(re.findall(r"\b[\w’'-]+\b", result.article_markdown))
+        return result.model_copy(
             update={
                 "word_count": actual_word_count,
-                "unresolved_items": unresolved_items,
+                "unresolved_items": list(dict.fromkeys(result.unresolved_items)),
             }
         )
 
-        # Validate evidence references against the supplied input.
-        allowed_ids = {
-            item.evidence_id for item in writer_input.evidence
-        }
-
+    @staticmethod
+    def _validate_evidence_references(
+        result: WriterOutput,
+        allowed_ids: set[str],
+    ) -> None:
         for claim in result.claims_used:
             unknown_ids = set(claim.evidence_ids) - allowed_ids
             if unknown_ids:
@@ -103,8 +142,6 @@ class WriterAgent:
                     "Writer section referenced unknown evidence IDs: "
                     + ", ".join(sorted(unknown_ids))
                 )
-
-        return result
 
     @staticmethod
     def _system_prompt() -> str:
@@ -136,6 +173,8 @@ BLOG WRITING APPROACH
 4. Explain the subject, not just the offering.
    Answer the search intent and the questions in the brief. Help readers
    understand the topic and make better-informed decisions.
+   Give a direct, evidence-grounded answer to the main question near the
+   beginning of the article.
 
 5. Use natural, informative headings.
    Follow all required topics in the brief, but do not mechanically copy
@@ -190,28 +229,45 @@ BRIEF AND OUTPUT REQUIREMENTS
 16. Follow the brief's search intent, audience, article objective,
     required topics, style, restrictions, and target word count.
 
-17. Cover every required section and FAQ where appropriate. Optional
-    sections are allowed only when useful and consistent with the brief.
+17. Include a dedicated "Frequently Asked Questions" H2 section in every
+    article, with 3 to 5 generic, relevant H3 questions readers might
+    naturally ask about the topic. Base them on the article, search intent,
+    and available keyword research. Keep answers short, clear, and directly
+    related to the blog; prefer summarizing information already explained.
+    Do not ask about measurable improvements, ROI, performance changes, or
+    outcomes unless the supplied evidence explicitly reports them.
+    Do not invent company-specific facts, capabilities, statistics, or
+    unsupported claims. If an answer cannot be supported reliably, choose
+    another question. FAQs must complement the article, not repeat whole
+    paragraphs or exist merely to insert keywords.
 
-18. Do not force company names, keywords, or product names into every
+18. Use the supplied primary and secondary keywords, search intent,
+    related topics, and question-based queries as SEO/AEO guidance. Integrate
+    relevant terms naturally in the title, opening, and headings where they
+    fit. Never keyword-stuff or invent search metrics.
+
+19. Do not force company names, keywords, or product names into every
     section. Use them naturally.
 
-19. Keep the article useful even when some research questions cannot be
+20. Keep the article useful even when some research questions cannot be
     answered. Do not fill gaps with speculation.
 
-20. In unresolved_items, record important missing evidence, uncertain
+21. In unresolved_items, record important missing evidence, uncertain
     claims, and brief requirements that could not be fulfilled. Avoid
     repeating the same unresolved item.
 
-21. claims_used must list important factual claims actually made in the
+22. claims_used must list important factual claims actually made in the
     article and their supporting evidence IDs and source URLs. Do not
     describe a claim as verified merely because it has an evidence ID.
-    Use an empty evidence_ids list when no supplied evidence supports it.
+    Keep FAQ answers consistent with the article and supplied evidence.
+    When an answer makes a factual claim, include it in claims_used and cite
+    the most relevant supplied evidence IDs when available. Paraphrasing is
+    fine; FAQ wording need not match evidence quotes exactly.
 
-22. brief_coverage must accurately describe what the article actually
+23. brief_coverage must accurately describe what the article actually
     covers. Do not claim a requirement is satisfied if it is missing.
 
-23. Return only one valid JSON object matching the requested output fields.
+24. Return only one valid JSON object matching the requested output fields.
     Do not wrap the JSON in Markdown code fences.
 
 The article_markdown field must contain the complete, publication-readable
@@ -240,16 +296,29 @@ Do not output this planning.
 
 ARTICLE STRUCTURE
 
-- Write an engaging, topic-focused H1 title.
+- Write an engaging, topic-focused H1 title matching the title field.
+- Write a concise, accurate meta description of no more than 160 characters.
 - Begin with an introduction that establishes the reader's problem and
-  explains why the topic matters.
+  explains why the topic matters, then answer the main question directly.
 - Develop the topic in a logical sequence using useful H2 and H3 headings.
 - Introduce company capabilities in context instead of making the whole
   article a company description.
 - Include concrete, evidence-supported details where available.
 - Explain practical implications without inventing benefits or outcomes.
 - End with a concise conclusion and a relevant next step if appropriate.
-- Follow all required brief topics and FAQs. Do not add sections merely
+- Include exactly one H2 titled "Frequently Asked Questions" with 3 to 5
+  generic, relevant H3 questions a reader might naturally ask. Base them on
+  the article's content, search intent, and supplied keyword research. Keep
+  answers short and clear; prefer summarizing the article. Do not ask about
+  measurable improvements, ROI, performance changes, or outcomes unless
+  supplied evidence explicitly reports them. Avoid unsupported company-
+  specific facts, capabilities, or statistics. Pick a different question if
+  the article and supplied evidence cannot answer it reliably.
+  FAQs should complement the article, not repeat whole paragraphs or insert
+  keywords unnaturally. Keep answers grounded in the supplied evidence and
+  include relevant evidence IDs in claims_used when available. Paraphrasing
+  is fine.
+- Follow all required brief topics. Do not add sections merely
   to increase length.
 - Avoid a generic opening such as "{data.company_name} is a leading company"
   unless the brief specifically requires that approach and the claim is
@@ -258,6 +327,9 @@ ARTICLE STRUCTURE
 The blog must fit this particular topic. Do not force every article into
 the same formula or use unsupported anecdotes, hypothetical customer
 stories presented as real, or invented statistics.
+Use primary_keyword, secondary_keywords, related_topics, and
+question_based_queries from the writer input naturally; never add
+unsupported search-volume or ranking metrics.
 
 Return a JSON object with exactly these fields:
 - title: string
@@ -280,8 +352,60 @@ The article_markdown field must contain the complete Markdown article,
 including its H1 title and inline source links where supported.
 
 The meta_description should accurately describe the article in a concise,
-reader-focused way. Do not add unsupported promises or claims.
+reader-focused way, within 160 characters. Do not add unsupported promises
+or claims.
 """
+
+    @staticmethod
+    def _validate_seo_requirements(
+        result: WriterOutput,
+        writer_input: WriterInput,
+    ) -> None:
+        """Enforce article and FAQ structure; evidence IDs are checked separately."""
+        lines = result.article_markdown.splitlines()
+        h1_lines = [line.strip() for line in lines if re.match(r"^#\s+", line)]
+        if len(h1_lines) != 1 or h1_lines[0][2:].strip() != result.title.strip():
+            raise RuntimeError("Writer article must contain one H1 matching its title.")
+        if not result.meta_description.strip() or len(result.meta_description.strip()) > 160:
+            raise RuntimeError("Writer meta_description must contain 1 to 160 characters.")
+
+        faq_heading = re.compile(r"^##\s+Frequently Asked Questions\s*$", re.IGNORECASE)
+        faq_index = next(
+            (index for index, line in enumerate(lines) if faq_heading.match(line.strip())),
+            None,
+        )
+        if faq_index is None:
+            raise RuntimeError("Writer article is missing its Frequently Asked Questions section.")
+        if not any(
+            section.heading.strip().casefold() == "frequently asked questions"
+            for section in result.sections
+        ):
+            raise RuntimeError("Writer sections must include the FAQ section.")
+        faq_end = next(
+            (
+                index
+                for index in range(faq_index + 1, len(lines))
+                if re.match(r"^##\s+", lines[index].strip())
+            ),
+            len(lines),
+        )
+        faq_lines = lines[faq_index + 1:faq_end]
+        question_indexes = [
+            index for index, line in enumerate(faq_lines)
+            if re.match(r"^###\s+", line.strip())
+        ]
+        if not 3 <= len(question_indexes) <= 5:
+            raise RuntimeError("Writer FAQ section must contain 3 to 5 questions.")
+
+        for position, start in enumerate(question_indexes):
+            heading = faq_lines[start].strip()[4:].strip()
+            if not heading.endswith("?"):
+                raise RuntimeError("Each FAQ heading must be phrased as a question.")
+            end = question_indexes[position + 1] if position + 1 < len(question_indexes) else len(faq_lines)
+            answer = "\n".join(faq_lines[start + 1:end]).strip()
+            if not answer:
+                raise RuntimeError(f"FAQ question has no answer: {heading}")
+
 
     @staticmethod
     def _parse_json(raw_text: str) -> dict[str, Any]:

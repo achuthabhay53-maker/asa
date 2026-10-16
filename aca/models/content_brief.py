@@ -32,6 +32,11 @@ class ContentBrief(BaseModel):
     article_objective: str = ""
     target_audience: str = ""
     search_intent: str = ""
+    primary_keyword: str = ""
+    secondary_keywords: list[str] = Field(default_factory=list)
+    related_topics: list[str] = Field(default_factory=list)
+    question_based_queries: list[str] = Field(default_factory=list)
+    faq_questions: list[str] = Field(default_factory=list)
     recommended_title: str = ""
     alternative_titles: list[str] = Field(default_factory=list)
     sections: list[BriefSection] = Field(default_factory=list)

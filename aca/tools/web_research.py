@@ -1,10 +1,10 @@
-"""Agent 3 web search through Vertex AI and direct page extraction."""
+"""Agent 3 web search through Exa and direct page extraction."""
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
 from html.parser import HTMLParser
-from urllib.parse import quote, urlparse
+from urllib.parse import urlparse
 
 import httpx
 from dotenv import load_dotenv
@@ -88,19 +88,18 @@ class _VisibleTextParser(HTMLParser):
 
 
 class WebResearch:
-    """Search with Vertex AI Google Search grounding and extract result pages."""
+    """Search with Exa and extract result pages."""
 
     def __init__(
         self,
         client: httpx.Client | None = None,
         api_key: str | None = None,
-        model: str | None = None,
     ) -> None:
-        self.api_key = api_key or os.getenv("VERTEX_API_KEY")
+        self.api_key = api_key or os.getenv("EXA_API_KEY")
         if not self.api_key:
-            raise RuntimeError("VERTEX_API_KEY is not set.")
-        self.model = model or os.getenv("VERTEX_MODEL_NAME") or "gemini-2.5-flash-lite"
+            raise RuntimeError("EXA_API_KEY is not set.")
         self.client = client or httpx.Client(follow_redirects=True)
+        self._search_contents: dict[str, tuple[str, str | None]] = {}
 
     def search(
         self,
@@ -110,39 +109,27 @@ class WebResearch:
         include_domains: list[str] | None = None,
         exclude_domains: list[str] | None = None,
     ) -> SearchResponse:
-        """Return Google-grounded result URLs for a query."""
+        """Return Exa result URLs for a query."""
         if max_results < 1:
             raise ValueError("max_results must be at least 1.")
+        self._search_contents.clear()
 
-        search_query = query.strip()
-        if include_domains:
-            search_query += " " + " OR ".join(f"site:{domain}" for domain in include_domains)
-        if exclude_domains:
-            search_query += " " + " ".join(f"-site:{domain}" for domain in exclude_domains)
-
-        url = (
-            "https://aiplatform.googleapis.com/v1/publishers/google/models/"
-            f"{quote(self.model, safe='-_.')}:generateContent"
-        )
         payload = {
-            "contents": [{
-                "role": "user",
-                "parts": [{
-                    "text": (
-                        "Use Google Search to find webpages relevant to this query. "
-                        "Return a brief response grounded in those pages.\n\n"
-                        f"Search query: {search_query}"
-                    ),
-                }],
-            }],
-            "tools": [{"googleSearch": {}}],
-            "generationConfig": {"temperature": 1.0, "maxOutputTokens": 512},
+            "query": query.strip(),
+            "type": "fast",
+            "numResults": max_results,
+            "contents": {"text": {"maxCharacters": 12_000}},
         }
+        if include_domains:
+            payload["includeDomains"] = include_domains
+        if exclude_domains:
+            payload["excludeDomains"] = exclude_domains
+
         response = self._call(
-            "Vertex AI Google Search",
+            "Exa search",
             lambda: self.client.post(
-                url,
-                params={"key": self.api_key},
+                "https://api.exa.ai/search",
+                headers={"x-api-key": self.api_key},
                 json=payload,
                 timeout=SEARCH_TIMEOUT_SECONDS,
             ),
@@ -151,14 +138,10 @@ class WebResearch:
             return SearchResponse(results=[], failed=True)
 
         body = response.json()
-        candidates = body.get("candidates") or []
-        grounding = candidates[0].get("groundingMetadata") or {} if candidates else {}
-        chunks = grounding.get("groundingChunks") or []
         results: list[SearchResult] = []
         seen_urls: set[str] = set()
-        for chunk in chunks:
-            web = chunk.get("web") or {}
-            result_url = web.get("uri") or web.get("url")
+        for item in body.get("results") or []:
+            result_url = item.get("url")
             if not isinstance(result_url, str) or not result_url.startswith(("http://", "https://")):
                 continue
             if result_url in seen_urls or not self._matches_domains(
@@ -166,11 +149,19 @@ class WebResearch:
             ):
                 continue
             seen_urls.add(result_url)
-            title = web.get("title")
+            title = item.get("title")
+            published = item.get("publishedDate")
+            text = item.get("text")
+            if isinstance(text, str) and text.strip():
+                self._search_contents[result_url] = (
+                    text.strip(),
+                    str(title) if title else None,
+                )
             results.append(
                 SearchResult(
                     url=result_url,
                     title=str(title) if title else None,
+                    published=str(published) if published else None,
                 )
             )
             if len(results) >= max_results:
@@ -178,7 +169,12 @@ class WebResearch:
         return SearchResponse(results=results)
 
     def extract(self, url: str, *, max_chars: int = 12_000) -> ExtractedPage | None:
-        """Fetch and extract readable text from one search result URL."""
+        """Return Exa-extracted text, falling back to a direct HTTP page fetch."""
+        cached = self._search_contents.get(url)
+        if cached:
+            text, title = cached
+            return ExtractedPage(url=url, text=text[:max_chars], title=title)
+
         response = self._call(
             "Page extraction",
             lambda: self.client.get(
@@ -246,10 +242,15 @@ class WebResearch:
             except httpx.HTTPError as exc:
                 if attempt == _ATTEMPTS - 1:
                     # Do not include exception text: request URLs may contain API keys.
-                    print(f"  {label} failed after {_ATTEMPTS} attempts ({type(exc).__name__}).")
+                    status = (
+                        f"HTTP {exc.response.status_code}"
+                        if isinstance(exc, httpx.HTTPStatusError)
+                        else type(exc).__name__
+                    )
+                    print(f"  {label} failed after {_ATTEMPTS} attempts ({status}).")
         return None
 
 
 def get_web_research() -> WebResearch:
-    """Create the Vertex AI-backed research client from environment settings."""
+    """Create the Exa-backed research client from environment settings."""
     return WebResearch()

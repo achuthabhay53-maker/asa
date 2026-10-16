@@ -15,6 +15,7 @@ from aca.agents.prompt_intelligence import run_agent1
 from aca.agents.source_intelligence import TOP_N_SOURCES, run_agent2
 from aca.agents.content_brief import ContentBriefAgent
 from aca.agents.writer import WriterAgent
+from aca.article_sections import split_article_sections
 from aca.models.ground_truth import ClientInput
 from aca.models.writer import WriterInput, WriterSectionInput, WriterEvidence
 
@@ -196,7 +197,10 @@ def build_writer_input(agent1: Any, agent3: Any, brief: Any) -> WriterInput:
     if not isinstance(style, dict):
         style = as_dict(style)
     faqs = []
-    for faq in b.get("faqs") or b.get("frequently_asked_questions") or []:
+    for faq in b.get("faq_questions") or b.get("faqs") or b.get("frequently_asked_questions") or []:
+        if isinstance(faq, str) and faq.strip():
+            faqs.append({"question": faq.strip(), "answer": ""})
+            continue
         if isinstance(faq, dict):
             q, a = faq.get("question") or faq.get("q"), faq.get("answer") or faq.get("a")
             if q:
@@ -214,6 +218,10 @@ def build_writer_input(agent1: Any, agent3: Any, brief: Any) -> WriterInput:
         article_objective=str(b.get("article_objective") or b.get("objective") or b.get("content_goal") or "Answer the search intent with an evidence-based, useful article."),
         target_audience=str(b.get("target_audience") or understanding.get("audience") or a3.get("target_audience") or "Relevant industry readers"),
         search_intent=str(b.get("search_intent") or a3.get("search_intent") or understanding.get("intent") or ""),
+        primary_keyword=str(b.get("primary_keyword") or a3.get("main_topic") or ""),
+        secondary_keywords=unique(string_list(b.get("secondary_keywords"))),
+        related_topics=unique(string_list(b.get("related_topics"))),
+        question_based_queries=unique(string_list(b.get("question_based_queries"))),
         sections=sections, faqs=faqs,
         internal_links=unique(string_list(b.get("internal_links"))),
         writing_style={str(k): str(v) for k, v in style.items() if v is not None},
@@ -472,10 +480,29 @@ if any(x is not None for x in (a1, a2, a3, a4, a5)):
                 w.metric("Unresolved items", len(unresolved))
                 btabs = st.tabs(["Read blog", "Markdown source", "Evidence & review"])
                 with btabs[0]:
+                    sections = split_article_sections(article)
                     st.markdown(f"### {title}")
                     st.divider()
                     with st.container(border=True):
-                        st.markdown(article)
+                        if sections.introduction:
+                            st.subheader("Introduction")
+                            st.markdown(sections.introduction)
+                        if sections.main_content:
+                            st.subheader("Main content")
+                            st.markdown(sections.main_content)
+                        if sections.conclusion:
+                            st.subheader("Conclusion")
+                            st.markdown(sections.conclusion)
+                        if sections.faqs or sections.faq_fallback:
+                            st.subheader("Frequently Asked Questions")
+                            if sections.faq_intro:
+                                st.markdown(sections.faq_intro)
+                            if sections.faqs:
+                                for question, answer in sections.faqs:
+                                    with st.expander(question):
+                                        st.markdown(answer)
+                            else:
+                                st.markdown(sections.faq_fallback)
                 with btabs[1]:
                     st.code(article, language="markdown")
                     st.download_button("Download blog (.md)", article + "\\n", file_name=f"agent5_article_{prompt_id}.md",

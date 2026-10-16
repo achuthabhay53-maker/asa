@@ -111,7 +111,7 @@ _COMPARE = (
     "competitors",
 )
 _STOP = {
-    "alamar", "biosciences", "that", "with", "from", "this", "have", "has", "been",
+    "a", "an", "the", "that", "with", "from", "this", "have", "has", "been",
     "were", "will", "into", "about", "their", "which", "than", "such", "also",
 }
 
@@ -349,10 +349,13 @@ Return one JSON object:
 Rules:
 - main_topic: Identify the central subject from the user's prompt (e.g., 'Immunology biomarker assay providers and platform capabilities').
 - prompt_scope: Distinguish whether the original prompt describes a broad industry topic, a company-specific capability, or a hybrid. Preserve that distinction rather than forcing every topic to promote the company.
-- is_verified / customer_relevant / intent_valid:
-  * Check whether the customer actually offers, develops, or operates in the space of this prompt.
-  * If the customer is completely unrelated to the topic (e.g. asked about immunology biomarker assays for a shoe company, retail store, or automotive dealer), mark customer_relevant: false, intent_valid: false, and is_verified: false.
-  * If the customer operates in the space (as platform developer, kit provider, assay service, or technology partner), mark is_verified: true, intent_valid: true, and customer_relevant: true.
+- Keep these decisions independent:
+  * intent_valid is true when the user's question is meaningful and answerable, regardless of whether this customer offers what it asks for.
+  * customer_relevant is true only when retrieved evidence supports that this customer offers, develops, or operates in the requested space. A valid question about a service the customer does not offer has intent_valid: true and customer_relevant: false.
+  * is_verified is true only when both intent_valid and customer_relevant are true.
+- Check functional capabilities, not just exact wording. Consider clear equivalents and alternate terms (for example, virtual reality / VR, immersive training, XR, and simulation for VR training), but do not infer a capability from a broad industry association alone.
+- Do not mark the customer irrelevant only because the exact prompt wording is absent from its pages or search results. Use relevant capability pages and equivalent terminology; if evidence is insufficient, say that in reason rather than claiming the question itself is invalid.
+- A valid prompt about an unrelated customer must have intent_valid: true, customer_relevant: false, and is_verified: false.
 - Base your judgment strictly on the retrieved pages and customer facts. Do NOT hallucinate.
 - quote must be an exact contiguous quote from the supplied page text (at least 30 characters) if one is found.
 - JSON only."""
@@ -1335,12 +1338,13 @@ JSON only."""
             return [], True
         pages: list[dict[str, Any]] = []
         for result in response.results:
-            if first_party and _host(result.url) != client_host:
-                continue
-            if not first_party and _host(result.url) == client_host:
-                continue
             page = self.research.extract(result.url, max_chars=PAGE_CHARS)
             if page is None or not page.text.strip():
+                continue
+            page_host = _host(page.url)
+            if first_party and page_host != client_host:
+                continue
+            if not first_party and page_host == client_host:
                 continue
             pages.append({"url": page.url, "text": page.text, "published": _parse_date(result.published)})
             if len(pages) >= PAGES_PER_PASS:
@@ -1843,5 +1847,3 @@ def _assemble(
         banned_claims=banned,
         limitations=list(_LIMITATIONS),
     )
-
-

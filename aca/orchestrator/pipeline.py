@@ -162,7 +162,12 @@ def _build_writer_input(state: PipelineState) -> WriterInput:
         article_objective=brief.article_objective,
         target_audience=brief.target_audience or guide.target_audience,
         search_intent=brief.search_intent or guide.search_intent,
+        primary_keyword=brief.primary_keyword or guide.main_topic,
+        secondary_keywords=brief.secondary_keywords,
+        related_topics=brief.related_topics,
+        question_based_queries=brief.question_based_queries,
         sections=sections,
+        faqs=[{"question": question, "answer": ""} for question in brief.faq_questions],
         writing_style={
             key: ", ".join(value) if isinstance(value, list) else str(value)
             for key, value in writing_style.items()

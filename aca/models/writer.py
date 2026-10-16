@@ -3,7 +3,7 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field
 
 
 class WriterEvidence(BaseModel):
@@ -46,6 +46,10 @@ class WriterInput(BaseModel):
     article_objective: str
     target_audience: str
     search_intent: str = ""
+    primary_keyword: str = ""
+    secondary_keywords: list[str] = Field(default_factory=list)
+    related_topics: list[str] = Field(default_factory=list)
+    question_based_queries: list[str] = Field(default_factory=list)
 
     sections: list[WriterSectionInput] = Field(
         default_factory=list

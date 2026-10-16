@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from aca.agents.ground_truth import GroundTruthAgent
+from aca.agents.ground_truth import GroundTruthAgent, build_prompt_context
 from aca.models.ground_truth import (
     CandidateSubtopic,
     ClientInput,
@@ -15,6 +15,7 @@ from aca.models.ground_truth import (
 )
 from aca.models.prompt_intelligence import PromptAnalysis
 from aca.orchestrator.pipeline import PipelineState, agent3_node
+from aca.tools.web_research import ExtractedPage, SearchResponse, SearchResult
 
 
 def _mock_agent1_data():
@@ -61,6 +62,99 @@ def test_ground_truth_returns_null_when_irrelevant():
         client = ClientInput(company_name="Acme Footwear", website="https://acmefootwear.example.com")
         guide = agent.analyze(agent1, None, client)
         assert guide is None
+
+
+def test_verification_keeps_valid_intent_separate_from_customer_relevance():
+    agent = GroundTruthAgent(api_key="mock-key", model="mock-model", research=object())
+    context = build_prompt_context(
+        {
+            **_mock_agent1_data(),
+            "prompt": "Who provides VR training for medical device companies?",
+            "prompt_understanding": {
+                "intent": "Find providers of virtual reality training for medical devices",
+                "topic": "Medical device training",
+                "audience": "Medical device companies",
+                "user_goal": "Find training providers",
+                "key_questions": [],
+            },
+        },
+        "https://ethosh.com",
+        "Ethosh",
+    )
+    captured_prompt = ""
+
+    def complete(system: str, payload: dict, max_tokens: int) -> dict:
+        nonlocal captured_prompt
+        captured_prompt = system
+        return {
+            "main_topic": "VR training for medical device companies",
+            "search_intent": "Find relevant training providers",
+            "target_audience": "Medical device companies",
+            "prompt_scope": "hybrid",
+            "is_verified": False,
+            "intent_valid": True,
+            "customer_relevant": False,
+            "reason": "The retrieved pages did not establish this customer's VR training capability.",
+        }
+
+    with patch.object(agent, "_collect_pages", return_value=([], False)), \
+         patch.object(agent, "_complete", side_effect=complete):
+        result = agent._understand_prompt_and_verify(
+            context,
+            "Ethosh",
+            "ethosh.com",
+        )
+
+    assert result["intent_valid"] is True
+    assert result["customer_relevant"] is False
+    assert result["is_verified"] is False
+    assert "intent_valid: true and customer_relevant: false" in captured_prompt
+    assert "virtual reality / VR, immersive training, XR, and simulation" in captured_prompt
+
+
+def test_collect_pages_resolves_google_grounding_redirect_before_domain_filter():
+    redirect_url = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/opaque"
+    other_redirect_url = (
+        "https://vertexaisearch.cloud.google.com/grounding-api-redirect/other-opaque"
+    )
+
+    class Research:
+        def search(self, query: str, **kwargs) -> SearchResponse:
+            return SearchResponse(
+                results=[
+                    SearchResult(url=redirect_url, title="Ethosh capability page"),
+                    SearchResult(url=other_redirect_url, title="Other page"),
+                ]
+            )
+
+        def extract(self, url: str, *, max_chars: int) -> ExtractedPage:
+            if url == redirect_url:
+                return ExtractedPage(
+                    url="https://www.ethosh.com/virtual-reality-training",
+                    text="Ethosh provides immersive virtual reality training for medical device teams.",
+                )
+            assert url == other_redirect_url
+            return ExtractedPage(
+                url="https://another-company.example/training",
+                text="This is not an Ethosh page.",
+            )
+
+    agent = GroundTruthAgent(
+        api_key="mock-key",
+        model="mock-model",
+        research=Research(),
+    )
+
+    pages, failed = agent._collect_pages(
+        "VR training for medical device teams",
+        "ethosh.com",
+        "Ethosh",
+        first_party=True,
+    )
+
+    assert failed is False
+    assert len(pages) == 1
+    assert pages[0]["url"] == "https://www.ethosh.com/virtual-reality-training"
 
 
 def test_ground_truth_returns_structured_agent4_package():

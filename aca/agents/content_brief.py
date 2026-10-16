@@ -27,11 +27,23 @@ def _extract_json(text: str) -> dict[str, Any]:
     text = re.sub(r"\s*```\s*$", "", text)
     try:
         data = json.loads(text)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as first_error:
         start, end = text.find("{"), text.rfind("}")
         if start < 0 or end <= start:
-            raise ValueError("Claude did not return a valid JSON object.")
-        data = json.loads(text[start : end + 1])
+            raise ValueError(
+                "Agent 4 did not return a JSON object. "
+                f"Response begins: {text[:500]!r}"
+            ) from first_error
+        try:
+            data = json.loads(text[start : end + 1])
+        except json.JSONDecodeError as exc:
+            snippet_start = max(0, exc.pos - 100)
+            snippet_end = min(len(text), exc.pos + 100)
+            raise ValueError(
+                "Agent 4 returned malformed JSON "
+                f"(line {exc.lineno}, column {exc.colno}): {exc.msg}. "
+                f"Near error: {text[snippet_start:snippet_end]!r}"
+            ) from exc
     if not isinstance(data, dict):
         raise ValueError("Expected a JSON object from Claude.")
     return data
@@ -100,6 +112,18 @@ class ContentBriefAgent:
         gaps = handoff.get("information_still_needed") or handoff.get("research_gaps") or a3.get("research_gaps") or []
         boundaries = handoff.get("boundaries") or a3.get("boundaries") or []
         candidate_subtopics = handoff.get("candidate_subtopics") or a3.get("candidate_subtopics") or []
+        related_topics = [
+            str(value)
+            for subtopic in candidate_subtopics
+            for value in [subtopic.get("title"), subtopic.get("description")]
+            if value
+        ]
+        question_based_queries = [
+            str(question)
+            for subtopic in candidate_subtopics
+            for question in subtopic.get("suggested_questions") or []
+            if question
+        ]
 
         system_prompt = """You are Agent 4: Strategy and Blog Brief Builder in an automated content intelligence workflow.
 Your responsibility is to combine the outputs of Agent 1 (Prompt Understanding), Agent 2 (Content Intelligence), and Agent 3 (Ground Truth and Verification) into a structured, evidence-backed brief for Agent 5 (Writer).
@@ -120,6 +144,8 @@ Your Responsibilities:
    - Heading, section objective, key questions to answer, assigned evidence IDs, and specific guidelines.
 5. Provide writing instructions:
    - Tone, audience level, paragraph structure, and formatting elements (e.g., comparison table, feature lists, FAQ).
+   - Create SEO/AEO guidance from Agent 3's verified topic, candidate subtopics, and suggested questions. Choose one natural primary keyword, related secondary keywords/topics, and question-based queries. Do not invent search-volume or ranking metrics.
+   - Provide 3 to 6 relevant FAQ questions based on search intent and the supplied question-based queries. Use questions answerable from the article's planned evidence-backed content.
 6. Handle missing information & boundaries:
    - Enforce Agent 3's boundaries.
    - Explicitly list unsupported claims that Agent 5 must NOT make.
@@ -129,6 +155,11 @@ Return one JSON object matching this exact schema:
   "article_objective": "Clear statement of what the blog must accomplish and who it is for",
   "target_audience": "Specific audience description",
   "search_intent": "What the reader is trying to learn or evaluate",
+  "primary_keyword": "The central natural-language search phrase derived from the prompt and Agent 3 topic",
+  "secondary_keywords": ["Relevant phrase derived from Agent 3 findings"],
+  "related_topics": ["Relevant related topic grounded in Agent 3 candidate subtopics"],
+  "question_based_queries": ["Relevant question grounded in Agent 3 suggested questions"],
+  "faq_questions": ["Relevant question answerable from evidence-backed article content"],
   "recommended_title": "Compelling, SEO-friendly working title",
   "alternative_titles": ["Alternative title 1", "Alternative title 2"],
   "sections": [
@@ -173,6 +204,9 @@ JSON only."""
             },
             "agent3_ground_truth": {
                 "main_topic": main_topic,
+                "search_intent": a3.get("search_intent") or intent,
+                "related_topics": related_topics,
+                "question_based_queries": question_based_queries,
                 "relevant_findings": relevant_findings,
                 "evidence_items": [
                     {
@@ -198,31 +232,67 @@ JSON only."""
             },
         }
 
+        headers = {
+            "x-api-key": self.api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        user_content = json.dumps(payload, ensure_ascii=False)
+        request = {
+            "model": self.model,
+            "max_tokens": 6096,
+            "system": system_prompt,
+            "messages": [
+                {"role": "user", "content": user_content},
+                {"role": "assistant", "content": "{\n  \"article_objective\":"},
+            ],
+        }
         response = httpx.post(
             "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": self.api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": self.model,
-                "max_tokens": 6096,
-                "system": system_prompt,
-                "messages": [
-                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-                    {"role": "assistant", "content": "{\n  \"article_objective\":"},
-                ],
-            },
+            headers=headers,
+            json=request,
             timeout=120.0,
         )
         response.raise_for_status()
-
-        
-        blocks = response.json().get("content") or []
+        response_data = response.json()
+        blocks = response_data.get("content") or []
         raw = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
-        text = '{\n  "article_objective":' + raw
-        parsed = _extract_json(text)
+        try:
+            parsed = _extract_json('{\n  "article_objective":' + raw)
+        except ValueError as first_error:
+            retry_request = {
+                **request,
+                "max_tokens": 8192,
+                "messages": [{
+                    "role": "user",
+                    "content": (
+                        user_content
+                        + "\n\nReturn the entire response as one syntactically valid JSON "
+                        "object matching the schema. Do not add markdown or commentary."
+                    ),
+                }],
+            }
+            retry = httpx.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers,
+                json=retry_request,
+                timeout=120.0,
+            )
+            retry.raise_for_status()
+            retry_data = retry.json()
+            retry_blocks = retry_data.get("content") or []
+            retry_text = "\n".join(
+                b.get("text", "") for b in retry_blocks if b.get("type") == "text"
+            )
+            try:
+                parsed = _extract_json(retry_text)
+            except ValueError as retry_error:
+                stop_reason = retry_data.get("stop_reason")
+                raise RuntimeError(
+                    "Agent 4 returned invalid JSON after one retry. "
+                    f"stop_reason={stop_reason!r}; first error: {first_error}; "
+                    f"retry error: {retry_error}"
+                ) from retry_error
 
         # Build BriefSection models
         sections = []
@@ -252,6 +322,13 @@ JSON only."""
             article_objective=str(parsed.get("article_objective") or ""),
             target_audience=str(parsed.get("target_audience") or target_audience),
             search_intent=str(parsed.get("search_intent") or intent),
+            primary_keyword=str(parsed.get("primary_keyword") or main_topic),
+            secondary_keywords=[str(value) for value in (parsed.get("secondary_keywords") or [])],
+            related_topics=[str(value) for value in (parsed.get("related_topics") or related_topics)],
+            question_based_queries=[
+                str(value) for value in (parsed.get("question_based_queries") or question_based_queries)
+            ],
+            faq_questions=[str(value) for value in (parsed.get("faq_questions") or [])],
             recommended_title=str(parsed.get("recommended_title") or ""),
             alternative_titles=[str(t) for t in (parsed.get("alternative_titles") or [])],
             sections=sections,
