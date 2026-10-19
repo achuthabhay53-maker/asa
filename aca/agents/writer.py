@@ -46,6 +46,7 @@ class WriterAgent:
             is_meta_error = "meta_description" in error
             if not (is_faq_error or is_meta_error):
                 raise
+
             repair_instructions = ""
             if is_faq_error:
                 repair_instructions += (
@@ -64,29 +65,28 @@ class WriterAgent:
                 user_prompt
                 + "\n\nYour previous draft failed validation: "
                 + error
-                + "\nRevise the full JSON article. "
+                + "\nCorrect the previous draft below and return the complete JSON object. "
                 + repair_instructions
                 + "Preserve all required JSON fields, evidence references, and article quality."
+                + "\n\n<previous_draft>\n"
+                + result.model_dump_json(indent=2)
+                + "\n</previous_draft>"
             )
             result = self._generate_output(repair_prompt)
             self._validate_evidence_references(result, allowed_ids)
-            try:
-                self._validate_seo_requirements(result, writer_input)
-            except RuntimeError as retry_exc:
-                raise RuntimeError(
-                    f"Writer validation failed after one repair attempt: {retry_exc}"
-                ) from retry_exc
+            self._validate_seo_requirements(result, writer_input)
         return result
 
     def _generate_output(self, user_prompt: str) -> WriterOutput:
         token_limits = [self.max_tokens, min(self.max_tokens * 2, 32000)]
         for attempt, token_limit in enumerate(token_limits):
-            response = self.client.messages.create(
+            with self.client.messages.stream(
                 model=self.model,
                 max_tokens=token_limit,
                 system=self._system_prompt(),
                 messages=[{"role": "user", "content": user_prompt}],
-            )
+            ) as stream:
+                response = stream.get_final_message()
             if response.stop_reason != "max_tokens":
                 break
             if attempt == len(token_limits) - 1:
@@ -301,6 +301,8 @@ ARTICLE STRUCTURE
 - Begin with an introduction that establishes the reader's problem and
   explains why the topic matters, then answer the main question directly.
 - Develop the topic in a logical sequence using useful H2 and H3 headings.
+- Aim for the target_word_count in the writer input. Treat it as a writing
+  target, not a hard limit; the complete article may be longer or shorter.
 - Introduce company capabilities in context instead of making the whole
   article a company description.
 - Include concrete, evidence-supported details where available.

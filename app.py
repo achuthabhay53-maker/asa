@@ -7,9 +7,11 @@ import json
 import re
 import time
 import traceback
+from pathlib import Path
 from typing import Any, Callable
 
 import streamlit as st
+from aca.output_storage import clear_agent_outputs, save_agent_output
 from aca.agents.ground_truth import GroundTruthAgent
 from aca.agents.prompt_intelligence import run_agent1
 from aca.agents.source_intelligence import TOP_N_SOURCES, run_agent2
@@ -197,7 +199,7 @@ def build_writer_input(agent1: Any, agent3: Any, brief: Any) -> WriterInput:
     if not isinstance(style, dict):
         style = as_dict(style)
     faqs = []
-    for faq in b.get("faq_questions") or b.get("faqs") or b.get("frequently_asked_questions") or []:
+    for faq in (b.get("faq_questions") or b.get("faqs") or b.get("frequently_asked_questions") or [])[:5]:
         if isinstance(faq, str) and faq.strip():
             faqs.append({"question": faq.strip(), "answer": ""})
             continue
@@ -237,6 +239,7 @@ def build_writer_input(agent1: Any, agent3: Any, brief: Any) -> WriterInput:
 # ------------------------------- STATE ------------------------------
 KEYS = ("agent1", "agent2", "agent3", "agent4", "agent5",
         "run_error", "agent4_error", "agent5_error")
+OUTPUT_DIR = Path(__file__).resolve().parent
 for key in KEYS:
     st.session_state.setdefault(key, None)
 
@@ -244,6 +247,7 @@ for key in KEYS:
 # ------------------------------ INPUT UI ----------------------------
 st.title("✦ AImpact Content Agent")
 st.caption("Prompt intelligence → source research → ground truth → content brief → final blog")
+st.caption("Each valid run refreshes agent1_output.json through agent5_output.json for evaluation.")
 pipeline()
 
 with st.form("run_workflow", border=True):
@@ -255,6 +259,10 @@ with st.form("run_workflow", border=True):
     c4, c5 = st.columns([2, 1])
     customer_name = c4.text_input("Customer name", placeholder="Optional if inferred from Agent 1")
     top_n = c5.number_input("Sources to analyze", min_value=1, max_value=20, value=int(TOP_N_SOURCES), step=1)
+    target_word_count = st.number_input(
+        "Blog target word count", min_value=500, max_value=5000, value=800, step=100,
+        help="Adjust the target as needed. Agent 5 reports the actual word count but will still return the blog if it differs.",
+    )
     submitted = st.form_submit_button("Run Agents 1–5", type="primary", width="stretch")
 
 
@@ -268,15 +276,18 @@ if submitted:
         st.session_state.run_error = "Please enter a customer website."
     else:
         try:
+            clear_agent_outputs(OUTPUT_DIR)
             a1 = run_step(1, "Agent 1 — Prompt Intelligence",
                 "Understanding the prompt, audience, stored AI answers, and customer visibility.",
                 lambda: run_agent1(int(campaign_id), str(prompt_id).strip(), customer_name.strip() or None))
             st.session_state.agent1 = a1
+            save_agent_output(1, as_dict(a1), OUTPUT_DIR)
 
             a2 = run_step(2, "Agent 2 — Source Intelligence",
                 "Analyzing citations, competitor pages, source quality, and content structure.",
                 lambda: run_agent2(int(campaign_id), str(prompt_id).strip(), top_n=int(top_n)))
             st.session_state.agent2 = a2
+            save_agent_output(2, as_dict(a2), OUTPUT_DIR)
 
             effective_name = customer_name.strip() or get_value(a1, "customer_name", default="")
             a3 = run_step(3, "Agent 3 — Ground Truth",
@@ -286,6 +297,7 @@ if submitted:
             if a3 is None:
                 raise RuntimeError("Agent 3 returned no result; Agents 4 and 5 were stopped.")
             st.session_state.agent3 = a3
+            save_agent_output(3, as_dict(a3), OUTPUT_DIR)
             verification = as_dict(a3).get("verification") or {}
             if not verification.get("is_verified", False):
                 st.session_state.run_error = (
@@ -306,13 +318,17 @@ if (submitted and st.session_state.agent1 is not None
             "Preparing article direction, title, outline, and writing constraints.",
             lambda: ContentBriefAgent().build_brief(
                 st.session_state.agent1, st.session_state.agent2, st.session_state.agent3))
+        save_agent_output(4, as_dict(brief), OUTPUT_DIR)
         st.session_state.agent4 = brief
-        writer_input = build_writer_input(st.session_state.agent1, st.session_state.agent3, brief)
+        writer_input = build_writer_input(st.session_state.agent1, st.session_state.agent3, brief).model_copy(
+            update={"target_word_count": int(target_word_count)}
+        )
         if not writer_input.sections:
             raise ValueError("Agent 4 returned no usable sections. Check the ContentBrief model section fields.")
         blog = run_step(5, "Agent 5 — Blog Writer",
             "Generating the article from the brief and Agent 3 evidence.",
             lambda: WriterAgent().write(writer_input))
+        save_agent_output(5, as_dict(blog), OUTPUT_DIR)
         st.session_state.agent5 = blog
     except Exception as exc:
         message = f"{type(exc).__name__}: {exc}"
@@ -488,7 +504,7 @@ if any(x is not None for x in (a1, a2, a3, a4, a5)):
                             st.subheader("Introduction")
                             st.markdown(sections.introduction)
                         if sections.main_content:
-                            st.subheader("Main content")
+                            
                             st.markdown(sections.main_content)
                         if sections.conclusion:
                             st.subheader("Conclusion")
