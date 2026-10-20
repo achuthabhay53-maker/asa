@@ -309,6 +309,36 @@ JSON only."""
                 )
             )
 
+        evidence_urls = {
+            str(item.get("evidence_id")): str(item.get("url") or "")
+            for item in evidence_items
+            if item.get("evidence_id")
+        }
+        for section in sections:
+            unknown_ids = set(section.evidence_ids) - evidence_urls.keys()
+            if unknown_ids:
+                raise RuntimeError(
+                    "Agent 4 referenced unknown evidence IDs: "
+                    + ", ".join(sorted(unknown_ids))
+                )
+            linked_urls = {
+                evidence_urls[evidence_id]
+                for evidence_id in section.evidence_ids
+                if evidence_urls[evidence_id]
+            }
+            unlinked_urls = set(section.source_urls) - linked_urls
+            if unlinked_urls:
+                raise RuntimeError(
+                    f"Agent 4 section {section.heading!r} included source URLs "
+                    "not linked to its evidence IDs: "
+                    + ", ".join(sorted(unlinked_urls))
+                )
+            section.source_urls = [
+                evidence_urls[evidence_id]
+                for evidence_id in section.evidence_ids
+                if evidence_urls[evidence_id]
+            ]
+
         ws = parsed.get("writing_style") or {}
         style_guide = WritingStyleGuide(
             tone=str(ws.get("tone") or "Professional, authoritative, peer-to-peer scientific"),

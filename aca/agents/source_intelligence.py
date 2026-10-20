@@ -27,6 +27,7 @@ from aca.models.source_intelligence import (
     ContentStructure,
     RankedSource,
     RetrySource,
+    SourceFinding,
     SourceIntelligence,
     WritingStyle,
 )
@@ -346,9 +347,28 @@ class SourceIntelligenceAgent:
             described = {
                 "summary": "The page was fetched, but its writing style could not be analyzed.",
                 "main_topics": [],
+                "findings": [],
                 "writing_style": {},
             }
         style = described.get("writing_style") or {}
+        findings = []
+        normalized_page_text = _clean_whitespace(fetched["text"]).casefold()
+        for item in described.get("findings") or []:
+            if not isinstance(item, dict):
+                continue
+            finding = _clean_whitespace(str(item.get("finding") or ""))
+            quote = _clean_whitespace(str(item.get("evidence_quote") or ""))
+            if finding:
+                findings.append(
+                    SourceFinding(
+                        finding=finding,
+                        evidence_quote=quote,
+                        quote_found_on_page=(
+                            len(quote) >= 25
+                            and quote.casefold() in normalized_page_text
+                        ),
+                    )
+                )
         return AnalyzedSource(
             source_id=source_id,
             url=fetched["final_url"],
@@ -357,6 +377,7 @@ class SourceIntelligenceAgent:
             content_analysis=ContentAnalysis(
                 summary=str(described.get("summary") or "").strip(),
                 main_topics=_string_list(described.get("main_topics")),
+                findings=findings,
                 content_structure=structure,
                 writing_style=WritingStyle(
                     tone=str(style.get("tone") or "").strip(),
@@ -380,6 +401,12 @@ Return one JSON object and nothing else:
 {
   "summary": "",
   "main_topics": [],
+  "findings": [
+    {
+      "finding": "One concrete observation about this page",
+      "evidence_quote": "Exact contiguous quote copied from page_text"
+    }
+  ],
   "writing_style": {
     "tone": "",
     "format": "",
@@ -392,6 +419,10 @@ Rules:
 - Describe only the supplied page. Do not say a style, topic, or structure is common, typical, or shared across sources.
 - summary is a short account of what this page itself says.
 - main_topics are topics present on this page.
+- findings are concrete factual observations about the page's content. Include
+  an exact contiguous evidence_quote copied from page_text for each finding.
+  Quotes must be at least 25 characters. Do not create a finding if no quote
+  directly supports it.
 - writing_style describes this page's tone, format, audience, paragraph style, and how it uses evidence.
 - Do not treat companies or claims on the page as verified facts about the customer.
 - Do not propose a blog, outline, or content strategy.

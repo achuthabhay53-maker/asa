@@ -109,8 +109,23 @@ def test_pipeline_passes_brief_seo_research_and_faqs_to_writer():
                 "How is procedural simulation used?",
                 "Who uses immersive training?",
             ],
-            sections=[BriefSection(heading="How it works")],
+            sections=[
+                BriefSection(
+                    heading="How it works",
+                    level="H2",
+                    section_objective="Explain the process to a first-time reader.",
+                    topics_and_questions=[
+                        "What happens during a training session?",
+                        "How is feedback provided?",
+                    ],
+                    evidence_ids=["ev-001"],
+                    guidelines_and_gaps=[
+                        "Do not claim measured outcomes without evidence."
+                    ],
+                )
+            ],
         ),
+        target_word_count=1200,
     )
 
     writer_input = _build_writer_input(state)
@@ -121,6 +136,20 @@ def test_pipeline_passes_brief_seo_research_and_faqs_to_writer():
     assert writer_input.question_based_queries == [
         "How does immersive training work?"
     ]
+    section = writer_input.sections[0]
+    assert section.heading == "How it works"
+    assert section.level == 2
+    assert section.objective == "Explain the process to a first-time reader."
+    assert section.topics == [
+        "What happens during a training session?",
+        "How is feedback provided?",
+    ]
+    assert section.questions_to_answer == section.topics
+    assert section.evidence_ids == ["ev-001"]
+    assert section.guidelines == [
+        "Do not claim measured outcomes without evidence."
+    ]
+    assert writer_input.target_word_count == 1200
     assert [faq["question"] for faq in writer_input.faqs] == [
         "What is immersive training?",
         "How is procedural simulation used?",
@@ -170,13 +199,18 @@ def test_pipeline_hands_typed_outputs_through_all_five_agents(monkeypatch):
     monkeypatch.setattr(workflow, "ContentBriefAgent", FakeContentBriefAgent)
     monkeypatch.setattr(workflow, "WriterAgent", FakeWriterAgent)
 
-    result = workflow.run_workflow(
-        campaign_id=1,
-        prompt_id="prompt-1",
-        website="https://example.com",
-        top_n=2,
-        max_questions=3,
+    snapshots = workflow.build_pipeline().stream(
+        PipelineState(
+            campaign_id=1,
+            prompt_id="prompt-1",
+            website="https://example.com",
+            top_n=2,
+            max_questions=3,
+            target_word_count=1250,
+        ),
+        stream_mode="values",
     )
+    result = PipelineState.model_validate(list(snapshots)[-1])
 
     assert [call[0] for call in calls] == [
         "agent1", "agent2", "agent3_init", "agent3", "agent4", "agent5"
@@ -193,6 +227,10 @@ def test_pipeline_hands_typed_outputs_through_all_five_agents(monkeypatch):
     writer_input = calls[5][1]
     assert writer_input.company_name == "Example Bio"
     assert writer_input.sections[0].heading == outputs["agent4"].sections[0].heading
+    assert writer_input.sections[0].objective == outputs["agent4"].sections[0].section_objective
+    assert writer_input.sections[0].topics == outputs["agent4"].sections[0].topics_and_questions
+    assert writer_input.sections[0].guidelines == outputs["agent4"].sections[0].guidelines_and_gaps
+    assert writer_input.target_word_count == 1250
     assert writer_input.evidence[0].evidence_id == "ev-001"
     assert writer_input.evidence[0].status == "verified"
     assert writer_input.evidence[0].source_url == "https://example.com/atlas-panel"

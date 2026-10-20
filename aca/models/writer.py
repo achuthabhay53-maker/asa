@@ -79,6 +79,7 @@ class WriterClaim(BaseModel):
     claim: str
     evidence_ids: list[str] = Field(default_factory=list)
     source_urls: list[str] = Field(default_factory=list)
+    supporting_evidence: list[WriterEvidence] = Field(default_factory=list)
 
 
 class WrittenSection(BaseModel):

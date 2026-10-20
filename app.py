@@ -1,25 +1,19 @@
-"""AImpact Content Agent: interactive five-agent Streamlit workflow.
-Run from D:\\ACA2\\ASA with: streamlit run streamlit_app.py
+"""AImpact Content Agent: Streamlit UI for the LangGraph workflow.
+
+Run with: streamlit run app.py
 """
 from __future__ import annotations
 
 import json
-import re
-import time
 import traceback
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import streamlit as st
-from aca.output_storage import clear_agent_outputs, save_agent_output
-from aca.agents.ground_truth import GroundTruthAgent
-from aca.agents.prompt_intelligence import run_agent1
-from aca.agents.source_intelligence import TOP_N_SOURCES, run_agent2
-from aca.agents.content_brief import ContentBriefAgent
-from aca.agents.writer import WriterAgent
 from aca.article_sections import split_article_sections
-from aca.models.ground_truth import ClientInput
-from aca.models.writer import WriterInput, WriterSectionInput, WriterEvidence
+from aca.agents.source_intelligence import TOP_N_SOURCES
+from aca.output_storage import clear_agent_outputs, save_agent_output
+from aca.orchestrator.pipeline import PipelineState, build_pipeline
 
 
 # ------------------------------- UI ---------------------------------
@@ -40,16 +34,6 @@ def as_dict(value: Any) -> dict:
     if hasattr(value, "model_dump"):
         return value.model_dump(mode="json")
     return value if isinstance(value, dict) else {}
-
-
-def get_value(obj: Any, *names: str, default=None):
-    data = as_dict(obj)
-    for name in names:
-        if data.get(name) is not None:
-            return data[name]
-        if hasattr(obj, name) and getattr(obj, name) is not None:
-            return getattr(obj, name)
-    return default
 
 
 def string_list(value: Any) -> list[str]:
@@ -90,27 +74,6 @@ def bullets(items: list[str], empty="Nothing available."):
         st.caption(empty)
 
 
-def run_step(number: int, name: str, description: str, callback: Callable[[], Any]):
-    """Progress indicates step status; actual internal model progress isn't exposed."""
-    start = time.perf_counter()
-    with st.status(f"Step {number}/5 · {name}", state="running", expanded=True) as status:
-        st.write(description)
-        bar = st.progress(5, text="Starting…")
-        message = st.empty()
-        try:
-            bar.progress(35, text="Working…")
-            result = callback()
-            elapsed = time.perf_counter() - start
-            bar.progress(100, text="Completed")
-            message.success(f"Completed in {elapsed:.1f} seconds.")
-            status.update(label=f"Step {number}/5 · {name} complete", state="complete", expanded=False)
-            return result
-        except Exception as exc:
-            message.error(f"{type(exc).__name__}: {exc}")
-            status.update(label=f"Step {number}/5 · {name} failed", state="error", expanded=True)
-            raise
-
-
 def pipeline():
     st.subheader("Workflow pipeline")
     steps = [
@@ -130,110 +93,6 @@ def pipeline():
             else:
                 st.info(f"○ {name}")
             st.caption(desc)
-
-
-# ---------------------- AGENT 3 -> WRITER EVIDENCE ------------------
-def build_writer_evidence(guide: Any) -> list[WriterEvidence]:
-    data = as_dict(guide)
-    facts = data.get("verified_facts") or []
-    evidence = data.get("evidence") or []
-    by_id: dict[str, list[dict]] = {}
-    for fact in facts:
-        for evidence_id in fact.get("evidence_ids") or []:
-            by_id.setdefault(str(evidence_id), []).append(fact)
-
-    output = []
-    for ev in evidence:
-        eid = str(ev.get("evidence_id") or "").strip()
-        if not eid:
-            continue
-        related = by_id.get(eid, [])
-        if related:
-            fact = related[0]
-            claim = str(fact.get("statement") or ev.get("quote") or "")
-            status = str(fact.get("status") or "inconclusive").lower()
-            if status not in {"verified", "contradicted", "not_found", "inconclusive"}:
-                status = "inconclusive"
-        else:
-            claim, status = str(ev.get("quote") or ""), "inconclusive"
-        output.append(WriterEvidence(
-            evidence_id=eid, claim=claim, status=status,
-            evidence_quote=ev.get("quote"), source_url=ev.get("url")
-        ))
-    return output
-
-
-def build_writer_input(agent1: Any, agent3: Any, brief: Any) -> WriterInput:
-    b, a1, a3 = as_dict(brief), as_dict(agent1), as_dict(agent3)
-    understanding = a1.get("prompt_understanding") or {}
-    company = a3.get("company") or {}
-    company_name = (
-        get_value(brief, "company_name", "customer_name")
-        or company.get("name") or a1.get("customer_name") or "Customer"
-    )
-    company_url = get_value(brief, "company_url", "website") or company.get("website")
-    raw_sections = b.get("sections") or b.get("outline") or b.get("brief_sections") or []
-    sections = []
-    for raw in raw_sections:
-        s = as_dict(raw)
-        heading = str(s.get("heading") or s.get("title") or s.get("name") or "").strip()
-        if not heading:
-            continue
-        level = s.get("level", 2)
-        if isinstance(level, str):
-            m = re.search(r"\\d+", level)
-            level = int(m.group()) if m else 2
-        try:
-            level = max(1, min(6, int(level or 2)))
-        except (ValueError, TypeError):
-            level = 2
-        sections.append(WriterSectionInput(
-            heading=heading, level=level,
-            objective=str(s.get("objective") or s.get("description") or s.get("purpose") or ""),
-            topics=unique(string_list(s.get("topics")) + string_list(s.get("key_points")) + string_list(s.get("subtopics"))),
-            questions_to_answer=unique(string_list(s.get("questions_to_answer")) + string_list(s.get("questions")) + string_list(s.get("suggested_questions"))),
-            evidence_ids=unique(string_list(s.get("evidence_ids")) + string_list(s.get("verified_fact_ids"))),
-            guidelines=unique(string_list(s.get("guidelines")) + string_list(s.get("instructions")) + string_list(s.get("constraints"))),
-        ))
-    style = b.get("writing_style") or b.get("writing_style_guide") or b.get("style_guide") or {}
-    if not isinstance(style, dict):
-        style = as_dict(style)
-    faqs = []
-    for faq in (b.get("faq_questions") or b.get("faqs") or b.get("frequently_asked_questions") or [])[:5]:
-        if isinstance(faq, str) and faq.strip():
-            faqs.append({"question": faq.strip(), "answer": ""})
-            continue
-        if isinstance(faq, dict):
-            q, a = faq.get("question") or faq.get("q"), faq.get("answer") or faq.get("a")
-            if q:
-                faqs.append({"question": str(q), "answer": str(a or "")})
-    target_count = b.get("target_word_count") or b.get("recommended_word_count") or b.get("word_count_target")
-    try:
-        target_count = int(target_count) if target_count else None
-    except (ValueError, TypeError):
-        target_count = None
-    return WriterInput(
-        company_name=str(company_name),
-        company_url=str(company_url) if company_url else None,
-        title=str(b.get("title") or b.get("recommended_title") or b.get("article_title") or understanding.get("topic") or a1.get("prompt") or "Research article"),
-        meta_description=str(b.get("meta_description") or b.get("seo_meta_description") or ""),
-        article_objective=str(b.get("article_objective") or b.get("objective") or b.get("content_goal") or "Answer the search intent with an evidence-based, useful article."),
-        target_audience=str(b.get("target_audience") or understanding.get("audience") or a3.get("target_audience") or "Relevant industry readers"),
-        search_intent=str(b.get("search_intent") or a3.get("search_intent") or understanding.get("intent") or ""),
-        primary_keyword=str(b.get("primary_keyword") or a3.get("main_topic") or ""),
-        secondary_keywords=unique(string_list(b.get("secondary_keywords"))),
-        related_topics=unique(string_list(b.get("related_topics"))),
-        question_based_queries=unique(string_list(b.get("question_based_queries"))),
-        sections=sections, faqs=faqs,
-        internal_links=unique(string_list(b.get("internal_links"))),
-        writing_style={str(k): str(v) for k, v in style.items() if v is not None},
-        unsupported_claims_to_avoid=unique(
-            string_list(b.get("unsupported_claims_to_avoid") or b.get("claims_to_avoid") or b.get("prohibited_claims"))
-            + string_list(b.get("research_gaps"))
-        ),
-        evidence=build_writer_evidence(agent3),
-        target_word_count=target_count,
-    )
 
 
 # ------------------------------- STATE ------------------------------
@@ -266,7 +125,7 @@ with st.form("run_workflow", border=True):
     submitted = st.form_submit_button("Run Agents 1–5", type="primary", width="stretch")
 
 
-# ---------------------------- RUN AGENTS 1-3 -------------------------
+# --------------------------- RUN WORKFLOW ----------------------------
 if submitted:
     for key in KEYS:
         st.session_state[key] = None
@@ -275,68 +134,72 @@ if submitted:
     elif not str(company_link).strip():
         st.session_state.run_error = "Please enter a customer website."
     else:
+        state = PipelineState(
+            campaign_id=int(campaign_id),
+            prompt_id=str(prompt_id).strip(),
+            website=company_link.strip(),
+            company_name=customer_name.strip(),
+            top_n=int(top_n),
+            max_questions=3,
+            target_word_count=int(target_word_count),
+        )
         try:
             clear_agent_outputs(OUTPUT_DIR)
-            a1 = run_step(1, "Agent 1 — Prompt Intelligence",
-                "Understanding the prompt, audience, stored AI answers, and customer visibility.",
-                lambda: run_agent1(int(campaign_id), str(prompt_id).strip(), customer_name.strip() or None))
-            st.session_state.agent1 = a1
-            save_agent_output(1, as_dict(a1), OUTPUT_DIR)
+            outputs = (
+                ("prompt_analysis", "agent1", 1, "Agent 1 — Prompt Intelligence"),
+                ("source_analysis", "agent2", 2, "Agent 2 — Source Intelligence"),
+                ("guide", "agent3", 3, "Agent 3 — Ground Truth"),
+                ("content_brief", "agent4", 4, "Agent 4 — Content Brief"),
+                ("written_article", "agent5", 5, "Agent 5 — Blog Writer"),
+            )
+            completed = set()
+            with st.status("Running the LangGraph workflow", state="running", expanded=True) as status:
+                progress = st.progress(0, text="Starting workflow…")
+                try:
+                    for snapshot in build_pipeline().stream(state, stream_mode="values"):
+                        state = PipelineState.model_validate(snapshot)
+                        for state_field, session_key, output_number, label in outputs:
+                            result = getattr(state, state_field)
+                            if result is not None and session_key not in completed:
+                                st.session_state[session_key] = result
+                                save_agent_output(output_number, as_dict(result), OUTPUT_DIR)
+                                completed.add(session_key)
+                                st.write(f"✓ {label} complete")
+                        progress.progress(
+                            min(100, len(completed) * 20),
+                            text=f"{len(completed)} of 5 agents complete",
+                        )
 
-            a2 = run_step(2, "Agent 2 — Source Intelligence",
-                "Analyzing citations, competitor pages, source quality, and content structure.",
-                lambda: run_agent2(int(campaign_id), str(prompt_id).strip(), top_n=int(top_n)))
-            st.session_state.agent2 = a2
-            save_agent_output(2, as_dict(a2), OUTPUT_DIR)
-
-            effective_name = customer_name.strip() or get_value(a1, "customer_name", default="")
-            a3 = run_step(3, "Agent 3 — Ground Truth",
-                "Verifying prompt/customer relevance and collecting evidence and research gaps.",
-                lambda: GroundTruthAgent(max_questions=3).analyze(
-                    a1, a2, ClientInput(company_name=effective_name, website=company_link.strip())))
-            if a3 is None:
-                raise RuntimeError("Agent 3 returned no result; Agents 4 and 5 were stopped.")
-            st.session_state.agent3 = a3
-            save_agent_output(3, as_dict(a3), OUTPUT_DIR)
-            verification = as_dict(a3).get("verification") or {}
-            if not verification.get("is_verified", False):
-                st.session_state.run_error = (
-                    "Agent 3 verification failed. Agents 4 and 5 were not run. "
-                    + str(verification.get("reason") or "")
-                )
+                    if state.errors:
+                        message = " ".join(state.errors)
+                        if state.guide is None or (
+                            state.guide.verification is None
+                            or not state.guide.verification.is_verified
+                        ):
+                            st.session_state.run_error = message
+                        elif state.content_brief is None or not state.content_brief.sections:
+                            st.session_state.agent4_error = message
+                        else:
+                            st.session_state.agent5_error = message
+                        status.update(label="LangGraph workflow stopped", state="error", expanded=True)
+                    elif len(completed) == 5:
+                        progress.progress(100, text="All agents complete")
+                        status.update(label="LangGraph workflow complete", state="complete", expanded=False)
+                    else:
+                        raise RuntimeError("Workflow ended before all agents completed without reporting an error.")
+                except Exception as exc:
+                    message = f"{type(exc).__name__}: {exc}"
+                    if state.prompt_analysis is None or state.source_analysis is None or state.guide is None:
+                        st.session_state.run_error = message
+                    elif state.content_brief is None:
+                        st.session_state.agent4_error = message
+                    else:
+                        st.session_state.agent5_error = message
+                    status.update(label="LangGraph workflow failed", state="error", expanded=True)
+                    traceback.print_exc()
         except Exception as exc:
             st.session_state.run_error = f"{type(exc).__name__}: {exc}"
             traceback.print_exc()
-
-
-# ---------------------------- RUN AGENTS 4-5 -------------------------
-if (submitted and st.session_state.agent1 is not None
-        and st.session_state.agent2 is not None and st.session_state.agent3 is not None
-        and st.session_state.run_error is None):
-    try:
-        brief = run_step(4, "Agent 4 — Content Brief",
-            "Preparing article direction, title, outline, and writing constraints.",
-            lambda: ContentBriefAgent().build_brief(
-                st.session_state.agent1, st.session_state.agent2, st.session_state.agent3))
-        save_agent_output(4, as_dict(brief), OUTPUT_DIR)
-        st.session_state.agent4 = brief
-        writer_input = build_writer_input(st.session_state.agent1, st.session_state.agent3, brief).model_copy(
-            update={"target_word_count": int(target_word_count)}
-        )
-        if not writer_input.sections:
-            raise ValueError("Agent 4 returned no usable sections. Check the ContentBrief model section fields.")
-        blog = run_step(5, "Agent 5 — Blog Writer",
-            "Generating the article from the brief and Agent 3 evidence.",
-            lambda: WriterAgent().write(writer_input))
-        save_agent_output(5, as_dict(blog), OUTPUT_DIR)
-        st.session_state.agent5 = blog
-    except Exception as exc:
-        message = f"{type(exc).__name__}: {exc}"
-        if st.session_state.agent4 is None:
-            st.session_state.agent4_error = message
-        else:
-            st.session_state.agent5_error = message
-        traceback.print_exc()
 
 
 # ---------------------------- STATUS & RESULTS -----------------------
@@ -406,10 +269,31 @@ if any(x is not None for x in (a1, a2, a3, a4, a5)):
             with st.expander("Source page analysis"):
                 for item in d.get("content_analyses") or []:
                     ca = item.get("content_analysis") or {}
-                    st.markdown(f"**{item.get('title') or item.get('url') or item.get('source_id')}**")
+                    st.markdown(
+                        f"**{item.get('source_id', '')} · "
+                        f"{item.get('title') or item.get('url') or 'Source'}**"
+                    )
                     st.caption(item.get("url") or "")
                     st.write(ca.get("summary") or "—")
                     bullets(string_list(ca.get("main_topics")))
+                    for finding in ca.get("findings") or []:
+                        finding_data = as_dict(finding)
+                        st.markdown(f"**Finding:** {finding_data.get('finding', '')}")
+                        if finding_data.get("quote_found_on_page"):
+                            st.markdown(f"> {finding_data.get('evidence_quote', '')}")
+                            st.caption(
+                                "The quote matches fetched page text; check the source "
+                                "to assess whether it supports the finding."
+                            )
+                        else:
+                            st.warning(
+                                "No exact supporting quote was confirmed in fetched page text."
+                            )
+                            if finding_data.get("evidence_quote"):
+                                st.caption(
+                                    f"Unmatched quote returned by analysis: "
+                                    f"{finding_data['evidence_quote']}"
+                                )
             show_json("Agent 2 JSON", a2)
             download_json("Download Agent 2 JSON", a2, f"agent2_{prompt_id}.json", "dl_a2")
 
@@ -435,12 +319,37 @@ if any(x is not None for x in (a1, a2, a3, a4, a5)):
                     st.caption(f"Evidence status: {sub.get('evidence_status', sub.get('support_status', 'unknown'))}")
                     st.write(sub.get("description") or "")
                     bullets(string_list(sub.get("suggested_questions")))
+                    subtopic_evidence_ids = string_list(sub.get("evidence_ids"))
+                    if subtopic_evidence_ids:
+                        st.caption("Evidence IDs: " + ", ".join(subtopic_evidence_ids))
             facts = d.get("verified_facts") or []
             st.subheader(f"Verified facts ({len(facts)})")
+            evidence_by_id = {
+                str(item.get("evidence_id")): item
+                for item in d.get("evidence") or []
+                if item.get("evidence_id")
+            }
             if facts:
                 st.dataframe([{"ID": f.get("fact_id"), "Statement": f.get("statement"), "Status": f.get("status"),
+                               "Evidence IDs": ", ".join(string_list(f.get("evidence_ids"))),
                                "Confidence": f.get("confidence"), "Boundary": f.get("wording_boundary")} for f in facts],
                              hide_index=True, width="stretch")
+                for fact in facts:
+                    fact_evidence = [
+                        evidence_by_id[evidence_id]
+                        for evidence_id in string_list(fact.get("evidence_ids"))
+                        if evidence_id in evidence_by_id
+                    ]
+                    with st.expander(f"Evidence for {fact.get('fact_id', 'fact')}"):
+                        st.write(fact.get("statement") or "")
+                        if fact_evidence:
+                            for item in fact_evidence:
+                                st.markdown(f"**{item.get('evidence_id')}** · {item.get('source_type', '')}")
+                                st.markdown(f"> {item.get('quote', '')}")
+                                if item.get("url"):
+                                    st.markdown(f"[Open source]({item['url']})")
+                        else:
+                            st.warning("No evidence reference is attached to this finding.")
             with st.expander(f"Evidence quotes ({len(d.get('evidence') or [])})"):
                 for ev in d.get("evidence") or []:
                     st.markdown(f"**{ev.get('evidence_id', '')} · {ev.get('source_type', '')}**")
@@ -468,8 +377,30 @@ if any(x is not None for x in (a1, a2, a3, a4, a5)):
                 s = as_dict(raw)
                 with st.container(border=True):
                     st.markdown(f"**{i}. {s.get('heading') or s.get('title') or s.get('name') or 'Section'}**")
-                    st.write(s.get("objective") or s.get("description") or s.get("purpose") or "")
-                    bullets(unique(string_list(s.get("topics")) + string_list(s.get("key_points"))))
+                    st.write(
+                        s.get("section_objective")
+                        or s.get("objective")
+                        or s.get("description")
+                        or s.get("purpose")
+                        or ""
+                    )
+                    bullets(unique(
+                        string_list(s.get("topics_and_questions"))
+                        + string_list(s.get("topics"))
+                        + string_list(s.get("key_points"))
+                    ))
+                    evidence_ids = string_list(s.get("evidence_ids"))
+                    source_urls = string_list(s.get("source_urls"))
+                    if evidence_ids:
+                        st.caption("Evidence IDs: " + ", ".join(evidence_ids))
+                    if source_urls:
+                        st.markdown("**Sources**")
+                    for url in source_urls:
+                        st.markdown(f"- [Source]({url})")
+                    guidelines = s.get("guidelines_and_gaps") or s.get("guidelines") or []
+                    if guidelines:
+                        st.markdown("**Guidelines and evidence limits**")
+                        bullets(string_list(guidelines))
             show_json("Agent 4 JSON", a4)
             download_json("Download Agent 4 JSON", a4, f"agent4_brief_{prompt_id}.json", "dl_a4")
 
@@ -533,8 +464,21 @@ if any(x is not None for x in (a1, a2, a3, a4, a5)):
                                 ids = string_list(c.get("evidence_ids"))
                                 if ids:
                                     st.caption("Evidence IDs: " + ", ".join(ids))
-                                for url in string_list(c.get("source_urls")):
-                                    st.markdown(f"- [{url}]({url})")
+                                supporting_evidence = c.get("supporting_evidence") or []
+                                if not supporting_evidence:
+                                    st.warning(
+                                        "No supplied evidence is attached to this claim; "
+                                        "review it before publication."
+                                    )
+                                for reference in supporting_evidence:
+                                    evidence = as_dict(reference)
+                                    st.markdown(
+                                        f"**{evidence.get('evidence_id')} · "
+                                        f"{evidence.get('status', 'unknown')}**"
+                                    )
+                                    st.markdown(f"> {evidence.get('evidence_quote') or 'No quote available.'}")
+                                    if evidence.get("source_url"):
+                                        st.markdown(f"[Open source]({evidence['source_url']})")
                     else:
                         st.caption("No structured claims returned.")
                     st.subheader("Unresolved items")

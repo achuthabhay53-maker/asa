@@ -109,6 +109,69 @@ def test_content_brief_retries_once_when_model_returns_malformed_json(monkeypatc
     assert "syntactically valid JSON" in requests[1]["messages"][0]["content"]
 
 
+def test_content_brief_links_section_urls_to_valid_evidence_ids(monkeypatch):
+    output = {
+        "article_objective": "Plan article",
+        "sections": [
+            {
+                "heading": "Evidence-based section",
+                "evidence_ids": ["ev_001"],
+                "source_urls": ["https://example.com/evidence"],
+            }
+        ]
+    }
+    response_text = json.dumps(output)[len('{"article_objective":'):]
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        @staticmethod
+        def json():
+            return {"content": [{"type": "text", "text": response_text}]}
+
+    monkeypatch.setattr(
+        "aca.agents.content_brief.httpx.post",
+        lambda *_args, **_kwargs: FakeResponse(),
+    )
+    agent1, agent2, agent3 = _brief_inputs()
+    agent3["evidence"] = [
+        {
+            "evidence_id": "ev_001",
+            "url": "https://example.com/evidence",
+            "quote": "A directly sourced evidence excerpt.",
+        }
+    ]
+
+    brief = ContentBriefAgent(api_key="test").build_brief(agent1, agent2, agent3)
+
+    assert brief.sections[0].evidence_ids == ["ev_001"]
+    assert brief.sections[0].source_urls == ["https://example.com/evidence"]
+
+
+def test_content_brief_rejects_unknown_evidence_ids(monkeypatch):
+    output = {
+        "article_objective": "Plan article",
+        "sections": [{"heading": "Unsupported", "evidence_ids": ["ev_missing"]}],
+    }
+    response_text = json.dumps(output)[len('{"article_objective":'):]
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        @staticmethod
+        def json():
+            return {"content": [{"type": "text", "text": response_text}]}
+
+    monkeypatch.setattr(
+        "aca.agents.content_brief.httpx.post",
+        lambda *_args, **_kwargs: FakeResponse(),
+    )
+    with pytest.raises(RuntimeError, match="unknown evidence IDs"):
+        ContentBriefAgent(api_key="test").build_brief(*_brief_inputs())
+
+
 def test_extract_json_reports_error_location_and_context():
     with pytest.raises(ValueError, match=r"line 1, column"):
         _extract_json('{"article_objective": ]}')

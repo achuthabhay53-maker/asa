@@ -213,6 +213,35 @@ def test_writer_repairs_faq_after_evidence_validation_failure():
     assert "Do not ask about measurable improvements" in prompts[1]
 
 
+def test_writer_attaches_source_quote_and_status_to_each_claim():
+    result = WriterAgent._attach_supporting_evidence(
+        _writer_output(),
+        _writer_input().evidence,
+    )
+
+    claim = result.claims_used[0]
+    assert claim.evidence_ids == ["ev_001"]
+    assert claim.source_urls == ["https://example.com/training"]
+    assert len(claim.supporting_evidence) == 1
+    assert claim.supporting_evidence[0].evidence_quote == _writer_input().evidence[0].evidence_quote
+    assert claim.supporting_evidence[0].status == "verified"
+
+
+def test_writer_rejects_claim_url_not_linked_to_its_evidence_id():
+    result = _writer_output().model_copy(
+        update={
+            "claims_used": [
+                _writer_output().claims_used[0].model_copy(
+                    update={"source_urls": ["https://unrelated.example/source"]}
+                )
+            ]
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="not linked to its evidence IDs"):
+        WriterAgent._attach_supporting_evidence(result, _writer_input().evidence)
+
+
 def test_writer_repairs_invalid_meta_description():
     invalid = _writer_output().model_copy(
         update={"meta_description": "x" * 161}

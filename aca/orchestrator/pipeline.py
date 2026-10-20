@@ -37,6 +37,7 @@ class PipelineState(BaseModel):
     company_name: str = ""
     top_n: int = TOP_N_SOURCES
     max_questions: int = MAX_QUESTIONS
+    target_word_count: int | None = None
     prompt_analysis: PromptAnalysis | None = None
     source_analysis: SourceIntelligence | None = None
     guide: GroundTruthGuide | None = None
@@ -174,6 +175,7 @@ def _build_writer_input(state: PipelineState) -> WriterInput:
         },
         unsupported_claims_to_avoid=brief.unsupported_claims_to_avoid,
         evidence=evidence,
+        target_word_count=state.target_word_count,
     )
 
 
@@ -246,6 +248,7 @@ def run_workflow(
     company_name: str = "",
     top_n: int = TOP_N_SOURCES,
     max_questions: int = MAX_QUESTIONS,
+    target_word_count: int | None = None,
 ) -> PipelineState:
     """Run the entire workflow from a single input: campaign_id, prompt_id, website."""
     initial_state = PipelineState(
@@ -255,6 +258,7 @@ def run_workflow(
         company_name=company_name.strip(),
         top_n=top_n,
         max_questions=max_questions,
+        target_word_count=target_word_count,
     )
     pipeline = build_pipeline()
     final_dict = pipeline.invoke(initial_state)

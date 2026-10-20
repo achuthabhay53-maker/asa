@@ -14,7 +14,7 @@ from typing import Any
 import anthropic
 from pydantic import ValidationError
 
-from aca.models.writer import WriterInput, WriterOutput
+from aca.models.writer import WriterEvidence, WriterInput, WriterOutput
 
 
 class WriterAgent:
@@ -75,6 +75,7 @@ class WriterAgent:
             result = self._generate_output(repair_prompt)
             self._validate_evidence_references(result, allowed_ids)
             self._validate_seo_requirements(result, writer_input)
+        result = self._attach_supporting_evidence(result, writer_input.evidence)
         return result
 
     def _generate_output(self, user_prompt: str) -> WriterOutput:
@@ -142,6 +143,41 @@ class WriterAgent:
                     "Writer section referenced unknown evidence IDs: "
                     + ", ".join(sorted(unknown_ids))
                 )
+
+    @staticmethod
+    def _attach_supporting_evidence(
+        result: WriterOutput,
+        evidence: list[WriterEvidence],
+    ) -> WriterOutput:
+        evidence_by_id = {item.evidence_id: item for item in evidence}
+        claims = []
+        for claim in result.claims_used:
+            referenced = [
+                evidence_by_id[evidence_id]
+                for evidence_id in dict.fromkeys(claim.evidence_ids)
+            ]
+            referenced_urls = {
+                item.source_url for item in referenced if item.source_url
+            }
+            unlinked_urls = set(claim.source_urls) - referenced_urls
+            if unlinked_urls:
+                raise RuntimeError(
+                    "Writer claim included source URLs not linked to its evidence IDs: "
+                    + ", ".join(sorted(unlinked_urls))
+                )
+            claims.append(
+                claim.model_copy(
+                    update={
+                        "source_urls": [
+                            item.source_url
+                            for item in referenced
+                            if item.source_url
+                        ],
+                        "supporting_evidence": referenced,
+                    }
+                )
+            )
+        return result.model_copy(update={"claims_used": claims})
 
     @staticmethod
     def _system_prompt() -> str:

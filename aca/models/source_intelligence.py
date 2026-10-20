@@ -22,8 +22,15 @@ class WritingStyle(BaseModel):
 class ContentAnalysis(BaseModel):
     summary: str = ""
     main_topics: list[str] = Field(default_factory=list)
+    findings: list["SourceFinding"] = Field(default_factory=list)
     content_structure: ContentStructure = Field(default_factory=ContentStructure)
     writing_style: WritingStyle = Field(default_factory=WritingStyle)
+
+
+class SourceFinding(BaseModel):
+    finding: str
+    evidence_quote: str = ""
+    quote_found_on_page: bool = False
 
 
 class RankedSource(BaseModel):

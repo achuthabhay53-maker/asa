@@ -1,40 +1,28 @@
-# Web framework
-fastapi==0.115.*
+ # Runtime
+ streamlit==1.49.*
+ fastapi==0.115.*
 uvicorn[standard]==0.32.*
 pydantic==2.9.*
 pydantic-settings==2.6.*
 httpx==0.27.*
+python-dotenv==1.2.*
 
-# ORM / DB
+# Database
 SQLAlchemy==2.0.*
 psycopg[binary]==3.2.*
-alembic==1.13.*
 
-# Orchestration
+# Agents and orchestration
 langgraph==0.2.*
+langchain-core==0.3.*
 
-# LLM (Claude only)
+# LLM and search
 anthropic==0.39.*
-
-# Search
 tavily-python==0.5.*
-
-# Observability
-langfuse==2.52.*
-opentelemetry-sdk==1.28.*
-opentelemetry-exporter-otlp==1.28.*
-
-# Auth / crypto
-bcrypt==4.2.*
-boto3==1.35.*                  # KMS / Secrets Manager
 
 # Scheduling
 apscheduler==3.10.*
 
-# Demo
-streamlit==1.40.*
-
-# Dev
+# Development and tests
 pytest==8.3.*
 pytest-asyncio==0.24.*
 ruff==0.7.*
