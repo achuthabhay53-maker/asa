@@ -21,6 +21,7 @@ class WriterEvidence(BaseModel):
     ]
     evidence_quote: str | None = None
     source_url: str | None = None
+    wording_boundary: str | None = None
 
 
 class WriterSectionInput(BaseModel):
@@ -94,6 +95,7 @@ class WriterOutput(BaseModel):
     """Structured output returned by Agent 5."""
 
     title: str
+    seo_title: str = ""
     meta_description: str = ""
     article_markdown: str
     word_count: int = Field(ge=0)

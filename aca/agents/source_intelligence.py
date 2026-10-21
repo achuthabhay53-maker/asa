@@ -498,7 +498,7 @@ def run_agent2(
     campaign_id: int,
     prompt_id: int | str,
     top_n: int | None = None,
-    score_threshold: float = 1000,
+    score_threshold: float = 70,
 ) -> SourceIntelligence:
     """Run Agent 2 using the temporary AImpact PostgreSQL reader."""
     from aca.tools.aimpact import get_prompt_evidence
@@ -520,7 +520,7 @@ if __name__ == "__main__":
     parser.add_argument("--campaign-id", type=int, required=True)
     parser.add_argument("--prompt-id", required=True)
     parser.add_argument("--top-n", type=int, default=TOP_N_SOURCES)
-    parser.add_argument("--score-threshold", type=float, default=1000)
+    parser.add_argument("--score-threshold", type=float, default=70)
     parser.add_argument("--output", default="agent2_output.json")
     args = parser.parse_args()
 

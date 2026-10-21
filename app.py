@@ -414,6 +414,13 @@ if any(x is not None for x in (a1, a2, a3, a4, a5)):
             d = as_dict(a5)
             article = str(d.get("article_markdown") or "").strip()
             title = str(d.get("title") or "Final Blog")
+            if d.get("seo_title"):
+                st.caption(f"SEO title ({len(d['seo_title'])}/60): {d['seo_title']}")
+            if d.get("meta_description"):
+                st.caption(
+                    f"Meta description ({len(d['meta_description'])}/155): "
+                    f"{d['meta_description']}"
+                )
             if not article:
                 st.warning("Agent 5 returned an empty article_markdown field.")
             else:
@@ -476,6 +483,11 @@ if any(x is not None for x in (a1, a2, a3, a4, a5)):
                                         f"**{evidence.get('evidence_id')} · "
                                         f"{evidence.get('status', 'unknown')}**"
                                     )
+                                    if evidence.get("wording_boundary"):
+                                        st.warning(
+                                            "Wording boundary: "
+                                            + str(evidence["wording_boundary"])
+                                        )
                                     st.markdown(f"> {evidence.get('evidence_quote') or 'No quote available.'}")
                                     if evidence.get("source_url"):
                                         st.markdown(f"[Open source]({evidence['source_url']})")

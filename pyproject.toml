@@ -4,6 +4,9 @@ version = "0.1.0"
 description = "AImpact Content Agent — multi-agent workflow that closes GEO gaps."
 requires-python = ">=3.11"
 
+[project.optional-dependencies]
+llm-eval = ["deepeval==3.1.0", "pydantic==2.9.*"]
+
 [tool.ruff]
 line-length = 110
 target-version = "py311"

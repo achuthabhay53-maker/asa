@@ -10,6 +10,7 @@ into a structured, evidence-backed content brief for Agent 5 (Writer).
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from typing import Any
@@ -20,6 +21,7 @@ from dotenv import load_dotenv
 from aca.models.content_brief import BriefSection, ContentBrief, WritingStyleGuide
 
 load_dotenv()
+logger = logging.getLogger(__name__)
 
 
 def _extract_json(text: str) -> dict[str, Any]:
@@ -138,7 +140,7 @@ Your Responsibilities:
    - Select 4 to 6 focused, high-value sections (H2s and optional H3s).
    - Use competitor topics and structure (from Agent 2) as inspiration, but tailor strictly to the customer's verified strengths.
 3. Map verified evidence:
-   - Explicitly assign relevant evidence IDs (e.g. "ev_001") and source URLs to the appropriate sections.
+   - Explicitly assign relevant evidence IDs (e.g. "ev_001") and only the source URLs belonging to those evidence IDs to each section.
    - Every factual claim made in a section must be traceable to Agent 3's evidence.
 4. Define each section:
    - Heading, section objective, key questions to answer, assigned evidence IDs, and specific guidelines.
@@ -328,10 +330,11 @@ JSON only."""
             }
             unlinked_urls = set(section.source_urls) - linked_urls
             if unlinked_urls:
-                raise RuntimeError(
-                    f"Agent 4 section {section.heading!r} included source URLs "
-                    "not linked to its evidence IDs: "
-                    + ", ".join(sorted(unlinked_urls))
+                logger.warning(
+                    "Agent 4 section %r included source URLs not linked to its "
+                    "evidence IDs; dropping them: %s",
+                    section.heading,
+                    ", ".join(sorted(unlinked_urls)),
                 )
             section.source_urls = [
                 evidence_urls[evidence_id]

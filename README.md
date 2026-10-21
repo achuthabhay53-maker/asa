@@ -70,6 +70,78 @@ Run tests:
 pytest
 ```
 
+## Evaluate real agent outputs
+
+The offline pytest tests use synthetic fixtures to check schemas and workflow
+handoffs. For quality evaluation, `scripts/evaluate_agent_outputs.py` instead
+loads actual saved Agent 1–5 JSON outputs, validates their schemas, and scores
+them with Claude using DeepEval G-Eval. It also runs a Faithfulness check on
+Agent 5's tracked claims against Agent 3's evidence quotes. It does not rerun
+the agents. By default, it reads `agent1_output.json` through
+`agent5_output.json` from the repository root and writes
+`agent_quality_report.json`.
+
+The Streamlit app (`streamlit run app.py`) refreshes those five agent output
+files for every valid run. It clears the previous run's files before starting,
+then saves each agent's JSON as that agent completes. If a run stops early,
+only the completed agents' files remain, so the evaluator will report missing
+outputs instead of combining results from different runs.
+
+The Streamlit form defaults Agent 5's target to 800 words; adjust the
+`Blog target word count` field from 500 to 5,000 as needed. The target guides
+the draft but is not a pass/fail limit: the app still displays the article and
+reports its actual word count if Claude writes more or less. Agent 5 streams
+Claude responses to support long requests and the app passes no more than five
+FAQ questions from Agent 4 into the Writer.
+Agent 5 returns a separate SEO title (up to 60 characters) and meta
+description (up to 155 characters), alongside the H1 and article Markdown.
+If Claude returns invalid metadata, Agent 5 creates a short fallback from the
+article title instead of failing the blog run.
+Agent 5 also includes at least one useful Markdown table, based only on
+information in the brief and supplied evidence. Unsupported details are
+marked as unspecified rather than guessed.
+The Writer receives Agent 3's evidence wording boundaries. Before returning
+the article, it flags numerical statements that lack a matching verified quote
+and context with an inline `[VERIFY: ...]` note and an `unresolved_items` entry.
+It also records claims without verified support and FAQ answers outside the
+40–50 word target there. These checks are review aids, not proof of factual
+accuracy; review the evidence and article before publishing.
+
+Install the optional evaluator into a separate environment:
+
+```powershell
+python -m venv .venv-llm-eval
+.\.venv-llm-eval\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv-llm-eval\Scripts\python.exe -m pip install -e ".[llm-eval]"
+```
+
+The evaluator reads `ANTHROPIC_API_KEY` and `ANTHROPIC_MODEL_NAME` from `.env`.
+Run it after the five real Agent output files have been produced:
+
+```powershell
+.\.venv-llm-eval\Scripts\python.exe scripts\evaluate_agent_outputs.py
+```
+
+To score another set of outputs, supply all five files explicitly:
+
+```powershell
+.\.venv-llm-eval\Scripts\python.exe scripts\evaluate_agent_outputs.py `
+  --agent1 path\to\agent1_output.json `
+  --agent2 path\to\agent2_output.json `
+  --agent3 path\to\agent3_output.json `
+  --agent4 path\to\agent4_output.json `
+  --agent5 path\to\agent5_output.json `
+  --report path\to\agent_quality_report.json
+```
+
+The command makes Claude judge calls and may incur API costs. It reports a
+0–1 score and reason for each agent, plus Agent 5 Faithfulness; scores below
+the default `0.7` threshold are marked `REVIEW` and make the command exit with
+status 1. Change the judge with `--judge-model` or adjust the threshold with
+`--threshold 0.6`. Treat these model-judged scores as review signals rather
+than deterministic proof of factual correctness. No judge evaluations are run
+by ordinary pytest.
+
 ---
 
 ## The 30-second pitch

@@ -115,6 +115,7 @@ def agent3_output(*, verified: bool = True) -> GroundTruthGuide:
                 fact_id="fact-001",
                 statement=EVIDENCE_QUOTE,
                 evidence_ids=["ev-001"],
+                wording_boundary="Do not infer clinical outcomes from this assay description.",
             )
         ],
     )
@@ -180,6 +181,11 @@ Sample compatibility is one factor to check when planning a study.
 Compare the panel scope, sample requirements, and evidence available for
 the intended study.
 
+| Decision factor | Evidence-based consideration |
+| --- | --- |
+| Panel scope | Check whether the measured targets fit the study question. |
+| Sample compatibility | Confirm the sample type in the supplied assay evidence. |
+
 ## Conclusion
 
 Match the assay and sample type to the study question, then verify important
@@ -203,6 +209,7 @@ claims about the assay.
 """
     return WriterOutput(
         title="A Guide to Serum Immune-Marker Profiling",
+        seo_title="Serum Immune-Marker Profiling Guide",
         meta_description="A practical guide to evaluating serum immune-marker profiling approaches.",
         article_markdown=article,
         word_count=len(article.split()),

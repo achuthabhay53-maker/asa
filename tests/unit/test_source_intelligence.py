@@ -1,3 +1,4 @@
+from aca.agents import source_intelligence
 from aca.agents.source_intelligence import SourceIntelligenceAgent
 from aca.models.source_intelligence import ContentStructure
 
@@ -46,3 +47,28 @@ def test_source_findings_mark_only_exact_page_quotes_as_matched(monkeypatch):
     assert findings[0].evidence_quote == page_text
     assert analyzed.source_id == "source_001"
     assert analyzed.url == "https://example.com/page"
+
+
+def test_run_agent2_uses_same_low_score_threshold_as_agent1(monkeypatch):
+    observed = {}
+    prompt_evidence = {"prompt_id": "selected-prompt", "sources": []}
+
+    def get_prompt_evidence(**kwargs):
+        observed.update(kwargs)
+        return [prompt_evidence]
+
+    class FakeSourceAgent:
+        def __init__(self, top_n=None):
+            pass
+
+        def analyze(self, campaign_id, selected):
+            assert selected is prompt_evidence
+            return "analyzed"
+
+    monkeypatch.setattr("aca.tools.aimpact.get_prompt_evidence", get_prompt_evidence)
+    monkeypatch.setattr(source_intelligence, "SourceIntelligenceAgent", FakeSourceAgent)
+
+    result = source_intelligence.run_agent2(1, "selected-prompt")
+
+    assert result == "analyzed"
+    assert observed == {"campaign_id": 1, "score_threshold": 70}

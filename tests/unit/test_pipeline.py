@@ -59,6 +59,9 @@ def test_shared_agent_outputs_satisfy_schema_and_evidence_contracts():
         )
     )
     assert isinstance(writer_input, WriterInput)
+    assert writer_input.evidence[0].wording_boundary == (
+        "Do not infer clinical outcomes from this assay description."
+    )
     assert article.title == brief.recommended_title
     assert len(article.meta_description) <= 160
     WriterAgent._validate_seo_requirements(article, writer_input)

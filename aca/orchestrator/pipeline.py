@@ -134,6 +134,7 @@ def _build_writer_input(state: PipelineState) -> WriterInput:
                 status=status,
                 evidence_quote=item.quote,
                 source_url=item.url,
+                wording_boundary=fact.wording_boundary if fact else None,
             )
         )
 
