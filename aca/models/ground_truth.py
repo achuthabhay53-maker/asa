@@ -184,6 +184,7 @@ class PromptVerification(BaseModel):
     is_verified: bool
     intent_valid: bool
     customer_relevant: bool
+    human_review_required: bool = False
     reason: str | None = None
     evidence: list[Evidence] = Field(default_factory=list)
 
@@ -294,7 +295,6 @@ class GroundTruthGuide(BaseModel):
     structured_headings: list[HeadingItem] = Field(default_factory=list, exclude=True)
     related_topics: list[str] = Field(default_factory=list, exclude=True)
     evidence_backed_topics: list[EvidenceBackedTopic] = Field(default_factory=list, exclude=True)
-
 
 
 

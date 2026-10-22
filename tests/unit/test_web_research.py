@@ -2,6 +2,7 @@ import json
 
 import httpx
 
+from aca.tools import web_research
 from aca.tools.web_research import WebResearch
 
 
@@ -77,3 +78,43 @@ def test_extract_fetches_and_parses_page_directly():
     assert page.url == "https://example.com/article"
     assert page.title == "Example Article"
     assert page.text == "Useful title Readable page text."
+
+
+def test_web_research_retries_rate_limit_and_respects_retry_after(monkeypatch):
+    attempts = []
+    delays = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        attempts.append(request)
+        if len(attempts) == 1:
+            return httpx.Response(
+                429,
+                headers={"Retry-After": "0"},
+                request=request,
+            )
+        return httpx.Response(200, json={"results": []}, request=request)
+
+    monkeypatch.setattr(web_research.time, "sleep", delays.append)
+    with httpx.Client(transport=httpx.MockTransport(handle)) as client:
+        result = WebResearch(client=client, api_key="test-key").search("retry test")
+
+    assert result.failed is False
+    assert len(attempts) == 2
+    assert delays == [0.0]
+
+
+def test_web_research_does_not_retry_non_transient_client_error(monkeypatch):
+    attempts = []
+    delays = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        attempts.append(request)
+        return httpx.Response(400, request=request)
+
+    monkeypatch.setattr(web_research.time, "sleep", delays.append)
+    with httpx.Client(transport=httpx.MockTransport(handle)) as client:
+        result = WebResearch(client=client, api_key="test-key").search("bad request")
+
+    assert result.failed is True
+    assert len(attempts) == 1
+    assert not delays

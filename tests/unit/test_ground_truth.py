@@ -1,9 +1,14 @@
 """Unit tests for Agent 3: Ground Truth & Research Discovery."""
+
 from __future__ import annotations
 
 from unittest.mock import patch
 
-from aca.agents.ground_truth import GroundTruthAgent, build_prompt_context
+from aca.agents.ground_truth import (
+    GroundTruthAgent,
+    _EvidenceRegistry,
+    build_prompt_context,
+)
 from aca.models.ground_truth import (
     CandidateSubtopic,
     ClientInput,
@@ -45,27 +50,43 @@ def _mock_agent1_data():
     }
 
 
-def test_ground_truth_returns_null_when_irrelevant():
-    """If customer is not relevant or intent is invalid, Agent 3 must return None (null)."""
+def test_ground_truth_returns_typed_negative_verification_when_irrelevant():
     agent = GroundTruthAgent(api_key="mock-key", model="mock-model")
 
     mock_understanding = {
         "main_topic": "Footwear fashion",
+        "search_intent": "Find footwear fashion brands",
+        "target_audience": "Consumers",
+        "prompt_scope": "company_specific",
         "is_verified": False,
         "intent_valid": False,
         "customer_relevant": False,
         "reason": "Customer is an apparel footwear brand with no relation to immunology biomarker assays.",
+        "quote": "",
+        "source_url": "",
+        "retrieved_pages": [],
     }
 
     with patch.object(agent, "_understand_prompt_and_verify", return_value=mock_understanding):
         agent1 = _mock_agent1_data()
         client = ClientInput(company_name="Acme Footwear", website="https://acmefootwear.example.com")
-        guide = agent.analyze(agent1, None, client)
-        assert guide is None
+        guide = agent.analyze(agent1, client)
+        assert guide.verification is not None
+        assert guide.verification.is_verified is False
+        assert guide.verification.intent_valid is False
 
 
 def test_verification_keeps_valid_intent_separate_from_customer_relevance():
-    agent = GroundTruthAgent(api_key="mock-key", model="mock-model", research=object())
+    class EmptyResearch:
+        @staticmethod
+        def extract(_url):
+            return None
+
+    agent = GroundTruthAgent(
+        api_key="mock-key",
+        model="mock-model",
+        research=EmptyResearch(),
+    )
     context = build_prompt_context(
         {
             **_mock_agent1_data(),
@@ -97,8 +118,10 @@ def test_verification_keeps_valid_intent_separate_from_customer_relevance():
             "reason": "The retrieved pages did not establish this customer's VR training capability.",
         }
 
-    with patch.object(agent, "_collect_pages", return_value=([], False)), \
-         patch.object(agent, "_complete", side_effect=complete):
+    with (
+        patch.object(agent, "_collect_pages", return_value=([], False)),
+        patch.object(agent, "_complete", side_effect=complete),
+    ):
         result = agent._understand_prompt_and_verify(
             context,
             "Ethosh",
@@ -112,11 +135,123 @@ def test_verification_keeps_valid_intent_separate_from_customer_relevance():
     assert "virtual reality / VR, immersive training, XR, and simulation" in captured_prompt
 
 
+def test_verification_rejects_missing_or_non_boolean_flags():
+    invalid = {
+        "main_topic": "VR training",
+        "search_intent": "Find providers",
+        "target_audience": "Medical device teams",
+        "prompt_scope": "hybrid",
+        "reason": "Evidence was found.",
+        "is_verified": "false",
+        "intent_valid": True,
+        "customer_relevant": True,
+        "quote": "A sufficiently long exact quote from a retrieved page.",
+        "source_url": "https://example.com/page",
+        "retrieved_pages": [],
+    }
+
+    try:
+        GroundTruthAgent._validate_understanding(invalid)
+    except ValueError as exc:
+        assert "boolean field 'is_verified'" in str(exc)
+    else:
+        raise AssertionError("Non-boolean verification flags must be rejected.")
+
+
+def test_evidence_registry_deduplicates_only_same_quote_and_canonical_source():
+    quote = "The platform supports a measured multiplex protein analysis workflow."
+    pages = [
+        {
+            "url": "HTTPS://WWW.Example.com:443/product/#details",
+            "text": quote,
+            "source_type": "company_website",
+        },
+        {
+            "url": "https://example.org/review",
+            "text": quote,
+            "source_type": "reputable_external",
+        },
+    ]
+    registry = _EvidenceRegistry("example.com")
+
+    first = registry.register_quote(quote, pages)
+    duplicate_same_source = registry.register_quote(
+        quote,
+        [{"url": "https://www.example.com/product", "text": quote}],
+    )
+    same_quote_other_source = registry.register_quote(quote, pages[1:])
+    fabricated = registry.register_quote(
+        "A paraphrased sentence that was never on either page.",
+        pages,
+    )
+
+    assert first == duplicate_same_source == "ev_001"
+    assert same_quote_other_source == "ev_002"
+    assert fabricated is None
+    assert [item.url for item in registry.items] == [
+        "HTTPS://WWW.Example.com:443/product/#details",
+        "https://example.org/review",
+    ]
+
+
+def test_optional_research_failure_is_logged_as_warning_and_returned():
+    class BrokenResearch:
+        @staticmethod
+        def search(*_args, **_kwargs):
+            raise TimeoutError("temporary research timeout")
+
+    agent = GroundTruthAgent(
+        api_key="mock-key",
+        model="mock-model",
+        research=BrokenResearch(),
+    )
+
+    pages, failed = agent._collect_optional_pages(
+        "assay capabilities",
+        "example.com",
+        "Example",
+        first_party=True,
+    )
+
+    assert pages == []
+    assert failed is True
+    assert any(
+        "optional first-party research retrieval failed" in warning.casefold() for warning in agent._warnings
+    )
+
+
+def test_verified_relevance_without_exact_quote_requires_human_review():
+    uncertain = {
+        "main_topic": "VR training",
+        "search_intent": "Find providers",
+        "target_audience": "Medical device teams",
+        "prompt_scope": "hybrid",
+        "reason": "The model says this is relevant.",
+        "is_verified": True,
+        "intent_valid": True,
+        "customer_relevant": True,
+        "quote": "A model-invented quote that is not on the page.",
+        "source_url": "https://example.com/page",
+        "retrieved_pages": [
+            {
+                "url": "https://example.com/page",
+                "text": "The retrieved page does not contain that claim.",
+            }
+        ],
+    }
+
+    validated = GroundTruthAgent._validate_understanding(uncertain)
+
+    assert validated["intent_valid"] is True
+    assert validated["customer_relevant"] is True
+    assert validated["is_verified"] is True
+    assert validated["human_review_required"] is True
+    assert "Human review is required" in validated["reason"]
+
+
 def test_collect_pages_resolves_google_grounding_redirect_before_domain_filter():
     redirect_url = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/opaque"
-    other_redirect_url = (
-        "https://vertexaisearch.cloud.google.com/grounding-api-redirect/other-opaque"
-    )
+    other_redirect_url = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/other-opaque"
 
     class Research:
         def search(self, query: str, **kwargs) -> SearchResponse:
@@ -172,6 +307,13 @@ def test_ground_truth_returns_structured_agent4_package():
         "reason": "Alamar Biosciences develops NULISA immunology assay panels and ARGO instruments.",
         "quote": "NULISAseq Immune 340 Panel provides deep profiling of immunology biomarkers.",
         "source_url": "https://alamarbio.com/immune-340",
+        "retrieved_pages": [
+            {
+                "url": "https://alamarbio.com/immune-340",
+                "text": "NULISAseq Immune 340 Panel provides deep profiling of immunology biomarkers.",
+                "published": None,
+            }
+        ],
     }
 
     mock_guide = GroundTruthGuide(
@@ -255,13 +397,14 @@ def test_ground_truth_returns_structured_agent4_package():
         ),
     )
 
-    with patch.object(agent, "_understand_prompt_and_verify", return_value=mock_understanding), \
-         patch.object(agent, "_research_topic", return_value=([], [], [])), \
-         patch.object(agent, "_discover_subtopics_and_evidence", return_value=mock_guide):
-
+    with (
+        patch.object(agent, "_understand_prompt_and_verify", return_value=mock_understanding),
+        patch.object(agent, "_research_topic", return_value=([], [], [])),
+        patch.object(agent, "_discover_subtopics_and_evidence", return_value=mock_guide),
+    ):
         agent1 = _mock_agent1_data()
         client = ClientInput(company_name="Alamar Biosciences", website="https://alamarbio.com")
-        guide = agent.analyze(agent1, None, client)
+        guide = agent.analyze(agent1, client)
 
         assert guide is not None
         assert isinstance(guide, GroundTruthGuide)
@@ -287,7 +430,7 @@ def test_ground_truth_returns_structured_agent4_package():
 
 
 def test_pipeline_agent3_node_handles_null():
-    """PipelineState agent3_node returns guide=None and error description when Agent 3 returns None."""
+    """A negative verification outcome is preserved as a typed business result."""
     agent1_data = _mock_agent1_data()
     state = PipelineState(
         campaign_id=81,
@@ -297,8 +440,16 @@ def test_pipeline_agent3_node_handles_null():
         prompt_analysis=PromptAnalysis.model_validate(agent1_data),
     )
 
-    with patch.object(GroundTruthAgent, "analyze", return_value=None):
+    rejected_guide = GroundTruthGuide(
+        verification=PromptVerification(
+            is_verified=False,
+            intent_valid=True,
+            customer_relevant=False,
+            reason="Customer relevance was not evidenced.",
+        )
+    )
+    with patch.object(GroundTruthAgent, "analyze", return_value=rejected_guide):
         result = agent3_node(state)
-        assert result.get("guide") is None
+        assert result.get("guide") is rejected_guide
         assert "errors" in result
-        assert "no blog content can be written" in result["errors"][0]
+        assert "verification did not pass" in result["errors"][0]

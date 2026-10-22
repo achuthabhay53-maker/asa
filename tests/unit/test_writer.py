@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from aca.agents.writer import WriterAgent
+from aca.agents.reviewer import ReviewerAgent
 from aca.models.writer import (
     WriterClaim,
     WriterEvidence,
@@ -72,18 +73,169 @@ def _writer_input() -> WriterInput:
 
 
 def test_independent_writer_example_has_faq_and_enough_synthetic_evidence():
-    example_path = (
-        Path(__file__).resolve().parents[2]
-        / "scripts"
-        / "agent5_input.example.json"
-    )
-    writer_input = WriterInput.model_validate_json(
-        example_path.read_text(encoding="utf-8")
-    )
+    example_path = Path(__file__).resolve().parents[2] / "scripts" / "agent5_input.example.json"
+    writer_input = WriterInput.model_validate_json(example_path.read_text(encoding="utf-8"))
 
     assert len(writer_input.faqs) == 3
     assert len(writer_input.evidence) >= 3
     assert all(item.evidence_quote for item in writer_input.evidence)
+
+
+def test_reviewer_removes_unapproved_source_urls_and_flags_claims():
+    from tests.agent_fixtures import agent5_output
+
+    draft = agent5_output().model_copy(
+        update={
+            "article_markdown": (
+                "# Draft\n\n[Approved](https://example.com/atlas-panel) "
+                "[Unknown](https://not-approved.example/page)"
+            ),
+            "claims_used": [
+                WriterClaim(
+                    claim="Example Bio provides an unsupported feature.",
+                    claim_scope="company_specific",
+                    evidence_ids=["ev-001", "fabricated-id"],
+                    source_urls=[
+                        "https://example.com/atlas-panel",
+                        "https://not-approved.example/page",
+                    ],
+                    support_status="unsupported",
+                )
+            ],
+        }
+    )
+    evidence = [
+        WriterEvidence(
+            evidence_id="ev-001",
+            claim="Approved product fact",
+            status="verified",
+            evidence_quote="Example Bio's Atlas panel quantifies 120 immune-related proteins in serum samples.",
+            source_url="https://example.com/atlas-panel",
+        )
+    ]
+
+    sanitized = ReviewerAgent._sanitize_revised_blog(draft, evidence)
+
+    assert "[Approved](https://example.com/atlas-panel)" in sanitized.article_markdown
+    assert "Unknown" in sanitized.article_markdown
+    assert "not-approved.example" not in sanitized.article_markdown
+    assert sanitized.claims_used[0].evidence_ids == ["ev-001"]
+    assert sanitized.claims_used[0].support_status == "unsupported"
+    assert any("needs human verification" in item for item in sanitized.unresolved_items)
+
+
+def test_reviewer_returns_the_complete_edited_blog():
+    draft = _writer_output()
+    long_meta_description = (
+        "Custom VR surgical simulations & clinical training for medical device companies. "
+        "Ethosh delivers 8–12 week implementations with enterprise analytics. Learn more."
+    )
+    revised_article = draft.article_markdown.replace(
+        "VR training can give medical device teams",
+        "Immersive VR training can give medical device teams",
+        1,
+    )
+    response = SimpleNamespace(
+        stop_reason="end_turn",
+        content=[
+            SimpleNamespace(
+                type="text",
+                text=json.dumps(
+                    {
+                        "summary": "Made one clarity improvement.",
+                        "findings": [],
+                        "title": draft.title,
+                        "seo_title": draft.seo_title,
+                        "meta_description": long_meta_description,
+                        "article_markdown": revised_article,
+                        "unresolved_items": [],
+                    }
+                ),
+            )
+        ],
+    )
+    calls = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        return response
+
+    reviewer = ReviewerAgent.__new__(ReviewerAgent)
+    reviewer.model = "test"
+    reviewer.max_tokens = 16384
+    reviewer.client = SimpleNamespace(messages=SimpleNamespace(create=create))
+
+    result = reviewer.review(_writer_input(), draft)
+
+    assert result.revised_blog.article_markdown == revised_article
+    assert len(long_meta_description) > 155
+    assert len(result.revised_blog.meta_description) <= 155
+    assert result.revised_blog.meta_description.startswith("Custom VR surgical simulations")
+    assert any(
+        "meta description exceeded 155 characters" in item for item in result.revised_blog.unresolved_items
+    )
+    assert len(calls) == 1
+    assert calls[0]["max_tokens"] == 16384
+    request = json.loads(calls[0]["messages"][0]["content"])
+    assert "article_markdown" in request["draft"]
+    assert "sections" in request
+    assert set(request["draft"]["claims_used"][0]) == {
+        "claim",
+        "claim_scope",
+        "evidence_ids",
+        "support_status",
+    }
+
+
+def test_reviewer_normalizes_empty_meta_description_without_failing_review():
+    blog = _writer_output().model_copy(update={"meta_description": "   "})
+
+    normalized = ReviewerAgent._normalize_revised_metadata(blog)
+
+    assert normalized.meta_description == blog.title
+    assert any("empty meta description" in item for item in normalized.unresolved_items)
+
+
+def test_reviewer_reports_when_full_blog_response_is_truncated():
+    calls = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(stop_reason="max_tokens", content=[])
+
+    reviewer = ReviewerAgent.__new__(ReviewerAgent)
+    reviewer.model = "test"
+    reviewer.max_tokens = 16384
+    reviewer.client = SimpleNamespace(messages=SimpleNamespace(create=create))
+
+    with pytest.raises(RuntimeError, match="truncated at 16,384 output tokens"):
+        reviewer.review(_writer_input(), _writer_output())
+
+    assert len(calls) == 1
+
+
+def test_reviewer_rebuilds_writer_sections_from_compact_markdown_response():
+    from aca.models.reviewer import RevisedBlog
+
+    draft = _writer_output()
+    revision = RevisedBlog(
+        title=draft.title,
+        seo_title=draft.seo_title,
+        meta_description=draft.meta_description,
+        article_markdown=draft.article_markdown,
+        claims_used=draft.claims_used,
+        unresolved_items=draft.unresolved_items,
+        brief_coverage=draft.brief_coverage,
+    )
+
+    rebuilt = ReviewerAgent._build_writer_output(draft, revision)
+
+    assert rebuilt.article_markdown == draft.article_markdown
+    assert [section.heading for section in rebuilt.sections] == [
+        "How the training works",
+        "Frequently Asked Questions",
+    ]
+    assert all(section.content_markdown for section in rebuilt.sections)
 
 
 def _writer_output(
@@ -162,7 +314,9 @@ def test_writer_accepts_paraphrased_faq_answer_supported_by_article_and_evidence
 
 
 def test_writer_accepts_five_faqs():
-    five_faqs = _ARTICLE + """
+    five_faqs = (
+        _ARTICLE
+        + """
 ### What do learners practice?
 
 Learners practice procedures in interactive simulation.
@@ -171,6 +325,7 @@ Learners practice procedures in interactive simulation.
 
 It gives medical device teams a simulated way to practice procedures.
 """
+    )
     WriterAgent._validate_seo_requirements(_writer_output(five_faqs), _writer_input())
 
 
@@ -194,14 +349,10 @@ def test_writer_accepts_numerical_claim_linked_to_verified_quote_and_context():
         evidence_id="ev_metric",
         claim="An 80% cost reduction was measured in the pilot workflow.",
         status="verified",
-        evidence_quote=(
-            "The pilot workflow reported an 80% cost reduction in measured costs."
-        ),
+        evidence_quote=("The pilot workflow reported an 80% cost reduction in measured costs."),
         source_url="https://example.com/results",
     )
-    article = _writer_output(
-        "# Results\n\nThe pilot workflow reported an 80% cost reduction."
-    ).model_copy(
+    article = _writer_output("# Results\n\nThe pilot workflow reported an 80% cost reduction.").model_copy(
         update={
             "claims_used": [
                 WriterClaim(
@@ -227,9 +378,7 @@ def test_writer_marks_supported_metric_with_source_limitation():
         source_url="https://example.com/results",
         wording_boundary="This is a company-reported claim, not independently verified.",
     )
-    result = _writer_output(
-        "# Results\n\nThe pilot reported an 80% cost reduction."
-    ).model_copy(
+    result = _writer_output("# Results\n\nThe pilot reported an 80% cost reduction.").model_copy(
         update={
             "claims_used": [
                 WriterClaim(
@@ -243,9 +392,7 @@ def test_writer_marks_supported_metric_with_source_limitation():
     audited = WriterAgent._flag_unsupported_numeric_claims(result, [evidence])
 
     assert "preserve source limitation" in audited.article_markdown
-    assert any(
-        "not independently verified" in item for item in audited.unresolved_items
-    )
+    assert any("not independently verified" in item for item in audited.unresolved_items)
 
 
 def test_writer_flags_faq_answers_outside_word_count_target():
@@ -255,20 +402,18 @@ def test_writer_flags_faq_answers_outside_word_count_target():
 
 
 def test_writer_surfaces_evidence_wording_boundaries_for_review():
-    evidence = _writer_input().evidence[0].model_copy(
-        update={
-            "wording_boundary": (
-                "This is a company-reported benefit, not independently verified."
-            )
-        }
+    evidence = (
+        _writer_input()
+        .evidence[0]
+        .model_copy(
+            update={"wording_boundary": ("This is a company-reported benefit, not independently verified.")}
+        )
     )
     result = WriterAgent._attach_supporting_evidence(_writer_output(), [evidence])
 
     audited = WriterAgent._audit_claims_and_faqs(result)
 
-    assert any(
-        "not independently verified" in item for item in audited.unresolved_items
-    )
+    assert any("not independently verified" in item for item in audited.unresolved_items)
 
 
 def test_writer_does_not_block_faqs_for_outcome_wording():
@@ -298,10 +443,12 @@ def test_writer_repairs_faq_after_evidence_validation_failure():
         def stream(**kwargs):
             prompts.append(kwargs["messages"][0]["content"])
             payload = json.dumps(next(outputs))
-            return _FakeMessageStream(SimpleNamespace(
-                stop_reason="end_turn",
-                content=[SimpleNamespace(type="text", text=payload)],
-            ))
+            return _FakeMessageStream(
+                SimpleNamespace(
+                    stop_reason="end_turn",
+                    content=[SimpleNamespace(type="text", text=payload)],
+                )
+            )
 
     agent = WriterAgent.__new__(WriterAgent)
     agent.client = SimpleNamespace(messages=FakeMessages())
@@ -324,43 +471,231 @@ def test_writer_attaches_source_quote_and_status_to_each_claim():
     claim = result.claims_used[0]
     assert claim.evidence_ids == ["ev_001"]
     assert claim.source_urls == ["https://example.com/training"]
+    assert claim.citation_status == "linked"
+    assert claim.support_status == "not_assessed"
+    assert any("No claim-level evidence assessment" in item for item in claim.validation_notes)
     assert len(claim.supporting_evidence) == 1
     assert claim.supporting_evidence[0].evidence_quote == _writer_input().evidence[0].evidence_quote
     assert claim.supporting_evidence[0].status == "verified"
 
 
-def test_writer_rejects_claim_url_not_linked_to_its_evidence_id():
+def test_writer_drops_claim_url_not_linked_to_its_evidence_id_and_reports_it():
     result = _writer_output().model_copy(
         update={
             "claims_used": [
-                _writer_output().claims_used[0].model_copy(
-                    update={"source_urls": ["https://unrelated.example/source"]}
+                _writer_output()
+                .claims_used[0]
+                .model_copy(update={"source_urls": ["https://unrelated.example/source"]})
+            ]
+        }
+    )
+
+    attached = WriterAgent._attach_supporting_evidence(result, _writer_input().evidence)
+
+    assert attached.claims_used[0].source_urls == ["https://example.com/training"]
+    assert any(
+        "URLs not linked to supplied evidence" in item and "https://unrelated.example/source" in item
+        for item in attached.unresolved_items
+    )
+    assert attached.claims_used[0].citation_status == "mismatch"
+
+
+def test_citation_mismatch_does_not_change_claim_support_assessment():
+    result = _writer_output().model_copy(
+        update={
+            "claims_used": [
+                _writer_output()
+                .claims_used[0]
+                .model_copy(
+                    update={
+                        "source_urls": ["https://unrelated.example/source"],
+                        "support_status": "partially_supported",
+                    }
                 )
             ]
         }
     )
 
-    with pytest.raises(RuntimeError, match="not linked to its evidence IDs"):
-        WriterAgent._attach_supporting_evidence(result, _writer_input().evidence)
+    attached = WriterAgent._attach_supporting_evidence(
+        result,
+        _writer_input().evidence,
+    )
+
+    assert attached.claims_used[0].citation_status == "mismatch"
+    assert attached.claims_used[0].support_status == "partially_supported"
+
+
+@pytest.mark.parametrize(
+    ("support_status", "expected_warning"),
+    [
+        ("partially_supported", "supports only part"),
+        ("unsupported", "does not support this claim"),
+        ("contradicted", "directly contradicts"),
+        ("inconclusive", "incomplete or ambiguous"),
+    ],
+)
+def test_writer_reports_distinct_company_claim_evidence_assessments(support_status, expected_warning):
+    claim = _writer_output().claims_used[0].model_copy(update={"support_status": support_status})
+    audited = WriterAgent._audit_claims_and_faqs(_writer_output().model_copy(update={"claims_used": [claim]}))
+
+    assert any(expected_warning in warning for warning in audited.unresolved_items)
+
+
+def test_writer_accepts_equivalent_url_formatting_from_registered_evidence():
+    result = _writer_output().model_copy(
+        update={
+            "claims_used": [
+                _writer_output()
+                .claims_used[0]
+                .model_copy(update={"source_urls": ["HTTPS://EXAMPLE.COM:443/training/#procedure"]})
+            ]
+        }
+    )
+
+    attached = WriterAgent._attach_supporting_evidence(
+        result,
+        _writer_input().evidence,
+    )
+
+    assert attached.claims_used[0].citation_status == "linked"
+    assert attached.claims_used[0].source_urls == ["https://example.com/training"]
+    assert not attached.unresolved_items
+
+
+def test_writer_marks_claim_without_evidence_as_missing_and_reviewable():
+    result = _writer_output().model_copy(
+        update={"claims_used": [WriterClaim(claim="An unreferenced claim about company capability.")]}
+    )
+
+    attached = WriterAgent._attach_supporting_evidence(
+        result,
+        _writer_input().evidence,
+    )
+
+    assert attached.claims_used[0].citation_status == "missing"
+    assert attached.claims_used[0].supporting_evidence == []
+    assert any("no registered evidence IDs" in item for item in attached.unresolved_items)
+
+
+def test_writer_does_not_require_customer_evidence_for_generic_context():
+    result = _writer_output("# Industry context\n").model_copy(
+        update={
+            "claims_used": [
+                WriterClaim(
+                    claim="Healthcare professionals often benefit from hands-on product demonstrations.",
+                    claim_scope="industry_context",
+                )
+            ]
+        }
+    )
+
+    attached = WriterAgent._attach_supporting_evidence(result, [])
+    audited = WriterAgent._audit_claims_and_faqs(attached)
+
+    assert audited.claims_used[0].citation_status == "missing"
+    assert not audited.unresolved_items
+
+
+def test_writer_keeps_company_evidence_requirements():
+    result = _writer_output("# Company capabilities\n").model_copy(
+        update={
+            "claims_used": [
+                WriterClaim(
+                    claim="Example provides VR surgical simulations.",
+                    claim_scope="company_specific",
+                )
+            ]
+        }
+    )
+
+    attached = WriterAgent._attach_supporting_evidence(result, [])
+    audited = WriterAgent._audit_claims_and_faqs(attached)
+
+    assert any("no registered evidence IDs" in item for item in audited.unresolved_items)
+
+
+def test_writer_returns_blog_when_generated_claim_has_unlinked_url():
+    generated = _writer_output().model_copy(
+        update={
+            "claims_used": [
+                _writer_output()
+                .claims_used[0]
+                .model_copy(update={"source_urls": ["https://www.ethosh.com/"]})
+            ]
+        }
+    )
+
+    class FakeMessages:
+        @staticmethod
+        def stream(**_kwargs):
+            payload = json.dumps(generated.model_dump(mode="json"))
+            response = SimpleNamespace(
+                stop_reason="end_turn",
+                content=[SimpleNamespace(type="text", text=payload)],
+            )
+            return _FakeMessageStream(response)
+
+    agent = WriterAgent.__new__(WriterAgent)
+    agent.client = SimpleNamespace(messages=FakeMessages())
+    agent.model = "test"
+    agent.max_tokens = 1000
+
+    result = agent.write(_writer_input())
+
+    assert result.article_markdown == _ARTICLE.strip()
+    assert "https://www.ethosh.com/" not in result.claims_used[0].source_urls
+    assert any("https://www.ethosh.com/" in item for item in result.unresolved_items)
+
+
+def test_writer_drops_unknown_evidence_ids_and_reports_them():
+    result = _writer_output().model_copy(
+        update={
+            "claims_used": [
+                _writer_output().claims_used[0],
+                WriterClaim(
+                    claim="A separate claim with a fabricated evidence reference.",
+                    evidence_ids=["invented-evidence"],
+                ),
+            ]
+        }
+    )
+
+    sanitized = WriterAgent._sanitize_evidence_references(
+        result,
+        _writer_input().evidence,
+    )
+
+    assert len(sanitized.claims_used) == 2
+    assert sanitized.claims_used[0].evidence_ids == ["ev_001"]
+    assert sanitized.claims_used[0].citation_status == "not_checked"
+    assert sanitized.claims_used[1].evidence_ids == []
+    assert sanitized.claims_used[1].citation_status == "mismatch"
+    assert any("invented-evidence" in item for item in sanitized.unresolved_items)
 
 
 def test_writer_keeps_blog_when_metadata_exceeds_seo_limits():
-    invalid = _writer_output().model_copy(
-        update={
-            "seo_title": "A very long SEO title that exceeds the sixty character limit",
-            "meta_description": "x" * 161,
-        }
-    ).model_dump(mode="json")
+    invalid = (
+        _writer_output()
+        .model_copy(
+            update={
+                "seo_title": "A very long SEO title that exceeds the sixty character limit",
+                "meta_description": "x" * 161,
+            }
+        )
+        .model_dump(mode="json")
+    )
     calls = []
 
     class FakeMessages:
         @staticmethod
         def stream(**kwargs):
             calls.append(kwargs)
-            return _FakeMessageStream(SimpleNamespace(
-                stop_reason="end_turn",
-                content=[SimpleNamespace(type="text", text=json.dumps(invalid))],
-            ))
+            return _FakeMessageStream(
+                SimpleNamespace(
+                    stop_reason="end_turn",
+                    content=[SimpleNamespace(type="text", text=json.dumps(invalid))],
+                )
+            )
 
     agent = WriterAgent.__new__(WriterAgent)
     agent.client = SimpleNamespace(messages=FakeMessages())
@@ -377,9 +712,7 @@ def test_writer_keeps_blog_when_metadata_exceeds_seo_limits():
 
 def test_writer_returns_blog_even_when_it_exceeds_word_count_target():
     title = "A Practical Guide to Effective Team Training"
-    writer_input = _writer_input().model_copy(
-        update={"target_word_count": 800, "title": title}
-    )
+    writer_input = _writer_input().model_copy(update={"target_word_count": 800, "title": title})
     article = (
         f"# {title}\n\n"
         + "Clear guidance helps teams understand processes and make informed decisions. " * 180
@@ -453,9 +786,7 @@ def test_writer_reports_when_retry_is_still_truncated():
         @staticmethod
         def stream(**kwargs):
             token_limits.append(kwargs["max_tokens"])
-            return _FakeMessageStream(
-                SimpleNamespace(stop_reason="max_tokens", content=[])
-            )
+            return _FakeMessageStream(SimpleNamespace(stop_reason="max_tokens", content=[]))
 
     agent = WriterAgent.__new__(WriterAgent)
     agent.client = SimpleNamespace(messages=FakeMessages())
@@ -473,7 +804,10 @@ def test_writer_reports_when_retry_is_still_truncated():
     [
         ("# VR Training for Medical Device Teams\n\nNo FAQ.", "missing its Frequently Asked Questions"),
         (
-            _ARTICLE.replace("### Who can use this training?\n\nMedical device teams can use immersive training to practice procedures.\n", ""),
+            _ARTICLE.replace(
+                "### Who can use this training?\n\nMedical device teams can use immersive training to practice procedures.\n",
+                "",
+            ),
             "3 to 5 questions",
         ),
         (
@@ -560,10 +894,12 @@ def test_writer_repairs_article_when_table_is_missing():
         "| Training approach | Immersive training supports procedural practice. |\n\n",
         "",
     )
-    outputs = iter([
-        _writer_output(article_without_table).model_dump(mode="json"),
-        _writer_output().model_dump(mode="json"),
-    ])
+    outputs = iter(
+        [
+            _writer_output(article_without_table).model_dump(mode="json"),
+            _writer_output().model_dump(mode="json"),
+        ]
+    )
     calls = []
 
     class FakeMessages:
@@ -573,9 +909,7 @@ def test_writer_repairs_article_when_table_is_missing():
             return _FakeMessageStream(
                 SimpleNamespace(
                     stop_reason="end_turn",
-                    content=[
-                        SimpleNamespace(type="text", text=json.dumps(next(outputs)))
-                    ],
+                    content=[SimpleNamespace(type="text", text=json.dumps(next(outputs)))],
                 )
             )
 

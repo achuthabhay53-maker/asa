@@ -9,6 +9,7 @@ from aca.models.writer import WriterInput
 from aca.orchestrator import pipeline as workflow
 from aca.orchestrator.pipeline import PipelineState, _build_writer_input, build_pipeline
 from aca.agents.writer import WriterAgent
+from aca.models.reviewer import ReviewOutput
 from ..agent_fixtures import (
     agent1_output,
     agent2_output,
@@ -29,23 +30,15 @@ def test_shared_agent_outputs_satisfy_schema_and_evidence_contracts():
     assert prompt.prompt_understanding.topic
     assert prompt.prompt_id == sources.prompt_id == "prompt-1"
     assert sources.citation_summary.unique_sources == len(sources.ranked_sources)
-    assert {
-        source.source_id for source in sources.content_analyses
-    } <= {
+    assert {source.source_id for source in sources.content_analyses} <= {
         source.source_id for source in sources.ranked_sources
     }
 
     evidence_ids = {item.evidence_id for item in guide.evidence}
     assert guide.verification is not None and guide.verification.is_verified
-    assert all(
-        set(fact.evidence_ids) <= evidence_ids
-        for fact in guide.verified_facts
-    )
+    assert all(set(fact.evidence_ids) <= evidence_ids for fact in guide.verified_facts)
     assert 4 <= len(brief.sections) <= 6
-    assert all(
-        set(section.evidence_ids) <= evidence_ids
-        for section in brief.sections
-    )
+    assert all(set(section.evidence_ids) <= evidence_ids for section in brief.sections)
 
     writer_input = _build_writer_input(
         PipelineState(
@@ -71,12 +64,12 @@ def test_shared_agent_outputs_satisfy_schema_and_evidence_contracts():
     )
 
 
-def test_pipeline_graph_contains_all_five_agents():
+def test_pipeline_graph_contains_five_core_agents_and_optional_reviewer():
     mermaid = build_pipeline().get_graph().draw_mermaid()
 
     for agent in range(1, 6):
         assert f"agent{agent}(agent{agent})" in mermaid
-    assert "agent6" not in mermaid
+    assert "agent6(agent6)" in mermaid
 
     assert "agent1 --> agent2;" in mermaid
     assert "agent2 --> agent3;" in mermaid
@@ -122,9 +115,7 @@ def test_pipeline_passes_brief_seo_research_and_faqs_to_writer():
                         "How is feedback provided?",
                     ],
                     evidence_ids=["ev-001"],
-                    guidelines_and_gaps=[
-                        "Do not claim measured outcomes without evidence."
-                    ],
+                    guidelines_and_gaps=["Do not claim measured outcomes without evidence."],
                 )
             ],
         ),
@@ -136,9 +127,7 @@ def test_pipeline_passes_brief_seo_research_and_faqs_to_writer():
     assert writer_input.primary_keyword == "immersive training"
     assert writer_input.secondary_keywords == ["procedural simulation"]
     assert writer_input.related_topics == ["training design"]
-    assert writer_input.question_based_queries == [
-        "How does immersive training work?"
-    ]
+    assert writer_input.question_based_queries == ["How does immersive training work?"]
     section = writer_input.sections[0]
     assert section.heading == "How it works"
     assert section.level == 2
@@ -149,9 +138,7 @@ def test_pipeline_passes_brief_seo_research_and_faqs_to_writer():
     ]
     assert section.questions_to_answer == section.topics
     assert section.evidence_ids == ["ev-001"]
-    assert section.guidelines == [
-        "Do not claim measured outcomes without evidence."
-    ]
+    assert section.guidelines == ["Do not claim measured outcomes without evidence."]
     assert writer_input.target_word_count == 1200
     assert [faq["question"] for faq in writer_input.faqs] == [
         "What is immersive training?",
@@ -182,8 +169,8 @@ def test_pipeline_hands_typed_outputs_through_all_five_agents(monkeypatch):
         def __init__(self, max_questions):
             calls.append(("agent3_init", max_questions))
 
-        def analyze(self, prompt, sources, client):
-            calls.append(("agent3", prompt, sources, client))
+        def analyze(self, prompt, client):
+            calls.append(("agent3", prompt, client))
             return outputs["agent3"]
 
     class FakeContentBriefAgent:
@@ -215,13 +202,11 @@ def test_pipeline_hands_typed_outputs_through_all_five_agents(monkeypatch):
     )
     result = PipelineState.model_validate(list(snapshots)[-1])
 
-    assert [call[0] for call in calls] == [
-        "agent1", "agent2", "agent3_init", "agent3", "agent4", "agent5"
-    ]
+    assert [call[0] for call in calls] == ["agent1", "agent2", "agent3_init", "agent3", "agent4", "agent5"]
     assert calls[0][1:] == (1, "prompt-1", None)
     assert calls[1][1:] == (1, "prompt-1", 2)
-    assert calls[3][1:3] == (outputs["agent1"], outputs["agent2"])
-    assert calls[3][3] == ClientInput(
+    assert calls[3][1] == outputs["agent1"]
+    assert calls[3][2] == ClientInput(
         company_name="Example Bio",
         website="https://example.com",
     )
@@ -274,7 +259,7 @@ def test_failed_agent3_verification_stops_before_agents4_and5(monkeypatch):
     assert result.written_article is None
     assert calls == []
     assert result.errors == [
-        "Agent 3 verification failed. Agents 4 and 5 were not run. "
+        "Prompt/customer verification did not pass; Agents 4 and 5 were skipped. "
         "The requested capability was not verified."
     ]
 
@@ -390,3 +375,36 @@ def test_workflow_resumes_at_first_missing_agent_output(monkeypatch):
     assert calls == ["agent2", "agent3", "agent4", "agent5"]
     assert final["prompt_analysis"] == outputs["agent1"]
     assert final["written_article"] == outputs["agent5"]
+
+
+def test_requested_review_runs_only_after_existing_five_agent_outputs(monkeypatch):
+    draft = agent5_output()
+    review = ReviewOutput(summary="Reviewed and revised.", revised_blog=draft)
+    calls = []
+
+    class FakeReviewerAgent:
+        def review(self, writer_input, existing_draft):
+            calls.append((writer_input, existing_draft))
+            return review
+
+    monkeypatch.setattr(workflow, "ReviewerAgent", FakeReviewerAgent)
+
+    result = build_pipeline().invoke(
+        PipelineState(
+            campaign_id=1,
+            prompt_id="prompt-1",
+            website="https://example.com",
+            company_name="Example Bio",
+            prompt_analysis=agent1_output(),
+            source_analysis=agent2_output(),
+            guide=agent3_output(),
+            content_brief=agent4_output(),
+            written_article=draft,
+            review_requested=True,
+        )
+    )
+
+    assert result["review_output"] == review
+    assert len(calls) == 1
+    assert calls[0][1] == draft
+    assert calls[0][0].company_name == "Example Bio"

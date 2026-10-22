@@ -10,6 +10,7 @@ The model's own knowledge is not evidence.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from datetime import date, datetime
@@ -18,6 +19,7 @@ from urllib.parse import urlparse
 
 import httpx
 from dotenv import load_dotenv
+from aca.evidence import canonicalize_evidence_url
 from aca.models.ground_truth import (
     Agent4HandoffPackage,
     CandidateSubtopic,
@@ -60,6 +62,7 @@ load_dotenv()
 MAX_QUESTIONS = 6
 PAGES_PER_PASS = 2
 PAGE_CHARS = 12_000
+logger = logging.getLogger(__name__)
 
 _STANDING_BANS = [
     "industry leader",
@@ -125,6 +128,55 @@ class CheckedClaim(NamedTuple):
     statement: str | None
     wording_limit: str | None
     asked_claim: str
+
+
+class _EvidenceRegistry:
+    def __init__(self, client_host: str) -> None:
+        self.client_host = client_host
+        self.items: list[EvidenceItem] = []
+        self._ids_by_quote_and_url: dict[tuple[str, str], str] = {}
+
+    def register_quote(
+        self,
+        quote: str,
+        pages: list[dict[str, Any]],
+        preferred_source_type: str | None = None,
+    ) -> str | None:
+        cleaned_quote = _clean(quote)
+        if len(cleaned_quote) < 25:
+            return None
+        for page in pages:
+            url = str(page.get("url") or "")
+            canonical_url = canonicalize_evidence_url(url)
+            if not canonical_url or not _quote_in_page(cleaned_quote, str(page.get("text") or "")):
+                continue
+            key = (cleaned_quote.casefold(), canonical_url)
+            if key in self._ids_by_quote_and_url:
+                return self._ids_by_quote_and_url[key]
+            evidence_id = f"ev_{len(self.items) + 1:03d}"
+            source_type = (
+                page.get("source_type")
+                or preferred_source_type
+                or (
+                    "company_website"
+                    if _host(url) == self.client_host
+                    else "reputable_external"
+                )
+            )
+            self.items.append(
+                EvidenceItem(
+                    evidence_id=evidence_id,
+                    url=url,
+                    quote=cleaned_quote,
+                    source_type=source_type,
+                    domain=_host(url),
+                    page_title=page.get("title"),
+                    published=page.get("published"),
+                )
+            )
+            self._ids_by_quote_and_url[key] = evidence_id
+            return evidence_id
+        return None
 
 
 def _dump(value: Any) -> Any:
@@ -269,26 +321,42 @@ class GroundTruthAgent:
         self.api_key = api_key
         self.model = model or os.getenv("ANTHROPIC_MODEL_NAME") or "claude-haiku-4-5-20251001"
         self.research = research or get_web_research()
+        self._warnings: list[str] = []
 
     def analyze(
         self,
         agent1: Any,
-        agent2: Any,
         client: ClientInput,
-    ) -> GroundTruthGuide | None:
+    ) -> GroundTruthGuide:
+        self._warnings = []
         context = build_prompt_context(agent1, client.website, client.company_name)
         client_name = context.customer.company_name
         client_host = _host(context.customer.website)
         if not client_host:
             raise ValueError("The website must include a host, for example https://alamarbio.com.")
-        del agent2  # cited-page topics are analyzed separately
 
         # Step 1: Understand the original prompt & verify relevance
         understanding = self._understand_prompt_and_verify(context, client_name, client_host)
-        if not understanding.get("is_verified", False):
-            reason = understanding.get("reason", "Customer is not relevant or prompt intent is invalid.")
-            print(f"Agent 3: Intent is invalid or customer '{client_name}' is not relevant to '{context.original_prompt}'. Reason: {reason}. Returning null and stopping.")
-            return None
+        understanding = self._validate_understanding(understanding)
+        if not understanding["is_verified"]:
+            return GroundTruthGuide(
+                topic=understanding["main_topic"],
+                main_topic=understanding["main_topic"],
+                search_intent=understanding["search_intent"],
+                target_audience=understanding["target_audience"],
+                prompt_scope=understanding["prompt_scope"],
+                verification=PromptVerification(
+                    is_verified=False,
+                    intent_valid=understanding["intent_valid"],
+                    customer_relevant=understanding["customer_relevant"],
+                    human_review_required=understanding["human_review_required"],
+                    reason=understanding["reason"],
+                ),
+                boundaries=[
+                    "The request did not pass prompt/customer relevance verification; "
+                    "no content research or writing was performed."
+                ] + self._warnings,
+            )
 
         # Step 2: Research the specific topic (Company website vs. Reputable external sources)
         research_pages, checked_pairs, banned = self._research_topic(
@@ -302,6 +370,68 @@ class GroundTruthAgent:
 
         # Step 4: Return structured output ready for Agent 4
         return guide
+
+    @staticmethod
+    def _validate_understanding(data: dict[str, Any]) -> dict[str, Any]:
+        """Require explicit verification flags and valid types from Agent 3's model."""
+        if not isinstance(data, dict):
+            raise ValueError("Agent 3 verification output must be a JSON object.")
+        flags = ("is_verified", "intent_valid", "customer_relevant")
+        for key in flags:
+            if type(data.get(key)) is not bool:
+                raise ValueError(
+                    f"Agent 3 verification output requires boolean field {key!r}."
+                )
+        expected_verified = data["intent_valid"] and data["customer_relevant"]
+        if data["is_verified"] != expected_verified:
+            raise ValueError(
+                "Agent 3 verification output is inconsistent: is_verified must "
+                "equal intent_valid and customer_relevant."
+            )
+
+        for key in ("main_topic", "search_intent", "target_audience", "reason"):
+            if not isinstance(data.get(key), str):
+                raise ValueError(
+                    f"Agent 3 verification output requires string field {key!r}."
+                )
+        if not data["main_topic"].strip():
+            raise ValueError("Agent 3 verification output has an empty main_topic.")
+        if not data["search_intent"].strip() or not data["target_audience"].strip():
+            raise ValueError(
+                "Agent 3 verification output requires search_intent and target_audience."
+            )
+        if data.get("prompt_scope") not in {
+            "broad_industry",
+            "company_specific",
+            "hybrid",
+        }:
+            raise ValueError("Agent 3 verification output has an invalid prompt_scope.")
+        if not isinstance(data.get("quote"), str) or not isinstance(
+            data.get("source_url"), str
+        ):
+            raise ValueError(
+                "Agent 3 verification output requires string quote and source_url fields."
+            )
+        data["human_review_required"] = False
+        if data["customer_relevant"]:
+            source_url = canonicalize_evidence_url(data["source_url"])
+            quote = data["quote"]
+            pages = data.get("retrieved_pages")
+            supported_by_retrieved_page = isinstance(pages, list) and any(
+                isinstance(page, dict)
+                and canonicalize_evidence_url(str(page.get("url") or "")) == source_url
+                and _quote_in_page(quote, str(page.get("text") or ""))
+                for page in pages
+            )
+            if not source_url or not supported_by_retrieved_page:
+                data = data.copy()
+                data["human_review_required"] = True
+                data["reason"] = (
+                    data["reason"].strip()
+                    + " Human review is required: customer relevance did not have "
+                    "an exact matching quote from the retrieved source page."
+                ).strip()
+        return data
 
     def _understand_prompt_and_verify(
         self,
@@ -323,8 +453,14 @@ class GroundTruthAgent:
                 root_page = self.research.extract(f"https://{client_host}")
                 if root_page and root_page.text.strip():
                     retrieved_pages.append({"url": root_page.url, "text": root_page.text, "published": None})
-            except Exception:
-                pass
+            except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
+                logger.warning(
+                    "Agent 3 root-page fallback failed (%s).",
+                    type(exc).__name__,
+                )
+                self._warnings.append(
+                    "Company root-page fallback failed during prompt verification."
+                )
 
         packed = [
             {"url": page["url"], "text": page["text"][:PAGE_CHARS]}
@@ -368,28 +504,8 @@ Rules:
             "retrieved_pages": packed,
         }
 
-        try:
-            data = self._complete(system, payload, max_tokens=1500)
-        except Exception as exc:
-            print(f"  Prompt understanding/verification LLM failed: {exc}")
-            return {
-                "main_topic": context.original_prompt,
-                "search_intent": context.prompt_understanding.intent or context.original_prompt,
-                "target_audience": context.prompt_understanding.audience or "Industry professionals",
-                "prompt_scope": "hybrid",
-                "is_verified": False,
-                "intent_valid": False,
-                "customer_relevant": False,
-                "reason": f"Verification failed: {exc}",
-                "quote": "",
-                "source_url": "",
-                "retrieved_pages": retrieved_pages,
-            }
-
-        is_verified = bool(data.get("is_verified", False))
-        intent_valid = bool(data.get("intent_valid", False))
-        customer_relevant = bool(data.get("customer_relevant", False))
-        data["is_verified"] = is_verified and intent_valid and customer_relevant
+        data = self._complete(system, payload, max_tokens=1500)
+        data = dict(data)
         data["retrieved_pages"] = retrieved_pages
         return data
 
@@ -419,7 +535,9 @@ Rules:
         # 1. Company Website: Search products, assays, services, capabilities
         main_topic = understanding.get("main_topic") or context.original_prompt
         fp_query = f"{main_topic} products assays services technology".strip()
-        fp_pages, _ = self._collect_pages(fp_query, client_host, client_name, first_party=True)
+        fp_pages, _ = self._collect_optional_pages(
+            fp_query, client_host, client_name, first_party=True
+        )
         for p in fp_pages:
             u = p.get("url")
             if u and u not in seen_urls:
@@ -433,7 +551,9 @@ Rules:
 
         # 2. Reputable External: Broader industry context, benchmarks, applications
         ext_query = f"{main_topic} workflow technology comparison review".strip()
-        ext_pages, _ = self._collect_pages(ext_query, client_host, client_name, first_party=False)
+        ext_pages, _ = self._collect_optional_pages(
+            ext_query, client_host, client_name, first_party=False
+        )
         for p in ext_pages:
             u = p.get("url")
             if u and u not in seen_urls:
@@ -446,7 +566,17 @@ Rules:
                 })
 
         # Check capability questions for exact factual grounding
-        questions = self._questions(context)[: self.max_questions]
+        try:
+            questions = self._questions(context)[: self.max_questions]
+        except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+            logger.warning(
+                "Agent 3 capability-question generation failed (%s).",
+                type(exc).__name__,
+            )
+            self._warnings.append(
+                "Capability-question generation failed; those optional checks were skipped."
+            )
+            questions = []
         pairs: list[tuple[dict[str, str], CheckedClaim]] = []
         for opportunity in self._opportunity_claims(context):
             if opportunity.get("relevance") == "low" and opportunity.get("relevance_to_topic") == "low":
@@ -485,6 +615,32 @@ Rules:
 
         return all_pages, pairs, banned
 
+    def _collect_optional_pages(
+        self,
+        claim: str,
+        client_host: str,
+        client_name: str,
+        first_party: bool,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        try:
+            pages, failed = self._collect_pages(
+                claim, client_host, client_name, first_party
+            )
+        except (httpx.HTTPError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            logger.warning(
+                "Agent 3 optional research retrieval failed (%s).",
+                type(exc).__name__,
+            )
+            self._warnings.append(
+                f"Optional {'first-party' if first_party else 'external'} research retrieval failed."
+            )
+            return [], True
+        if failed:
+            self._warnings.append(
+                f"Optional {'first-party' if first_party else 'external'} search returned no usable results."
+            )
+        return pages, failed
+
     def _discover_subtopics_and_evidence(
         self,
         context: PromptContext,
@@ -504,7 +660,11 @@ Rules:
         v_ev: list[Evidence] = []
         if v_quote and v_url:
             for p in research_pages:
-                if p["url"] == v_url and _quote_in_page(v_quote, p["text"]):
+                if (
+                    canonicalize_evidence_url(p["url"])
+                    == canonicalize_evidence_url(v_url)
+                    and _quote_in_page(v_quote, p["text"])
+                ):
                     v_ev.append(Evidence(
                         url=v_url,
                         quote=v_quote,
@@ -513,11 +673,13 @@ Rules:
                     ))
                     break
 
+        understanding = self._validate_understanding(understanding)
         verification = PromptVerification(
-            is_verified=bool(understanding.get("is_verified", True)),
-            intent_valid=bool(understanding.get("intent_valid", True)),
-            customer_relevant=bool(understanding.get("customer_relevant", True)),
-            reason=str(understanding.get("reason") or "Verified"),
+            is_verified=understanding["is_verified"],
+            intent_valid=understanding["intent_valid"],
+            customer_relevant=understanding["customer_relevant"],
+            human_review_required=understanding["human_review_required"],
+            reason=understanding["reason"],
             evidence=v_ev,
         )
 
@@ -564,7 +726,7 @@ Return one JSON object with exactly these keys:
   "verified_facts": [
     {
       "statement": "Concrete factual statement",
-      "category": "company_capability | product_technology | industry_context | regulatory_certification | service_scope",
+      "category": "company_capability | product_technology | regulatory_certification | service_scope",
       "evidence_type": "company_website | reputable_external",
       "confidence": "high | medium",
       "wording_boundary": "What the evidence does NOT support (or empty string if no boundary)",
@@ -592,6 +754,8 @@ Rules:
    - Do NOT expand the scope. Agent 4 decides whether to include optional topics.
 
 2. Evidence Grounding for Facts:
+   - The primary verification target is a claim specifically about the named company, its products, services, capabilities, processes, or results. Do not classify general industry context or educational explanations as company facts.
+   - Do not create a research gap solely because a generic industry statement lacks evidence about the named company. Keep useful industry context separate from company-specific facts and gaps.
    - A verified_fact MUST include a non-empty evidence_quote that is verbatim from the supplied research_evidence.
    - If you cannot find an exact quote for a claim, do NOT include it as a verified_fact. Either omit it or add it as a research_gap.
    - wording_boundary must state what the quote does NOT support if the claim could be read more broadly than the quote.
@@ -639,68 +803,26 @@ Rules:
         try:
             # 8192 tokens gives enough room for a rich subtopic JSON response
             data = self._complete(system, payload, max_tokens=8192)
-        except Exception as exc:
-            print(f"  Subtopic discovery LLM failed: {exc}")
+        except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+            logger.warning(
+                "Agent 3 subtopic discovery failed (%s); falling back to checked facts.",
+                type(exc).__name__,
+            )
+            self._warnings.append(
+                "Subtopic discovery failed; only independently checked claims are included."
+            )
             data = {}
 
         # 1. Build EvidenceItem registry
-        evidence_items: list[EvidenceItem] = []
-        evidence_map: dict[str, str] = {}  # quote_norm -> evidence_id
+        evidence_registry = _EvidenceRegistry(client_host)
+        evidence_items = evidence_registry.items
 
         def add_evidence(quote: str, preferred_source_type: str | None = None) -> str | None:
-            q_clean = _clean(quote)
-            if len(q_clean) < 25:
-                return None
-            key = q_clean.lower()
-            if key in evidence_map:
-                return evidence_map[key]
-
-            # Find matching page
-            for p in research_pages:
-                if _quote_in_page(q_clean, p["text"]):
-                    ev_id = f"ev_{len(evidence_items) + 1:03d}"
-                    stype = p.get("source_type") or preferred_source_type or ("company_website" if _host(p["url"]) == client_host else "reputable_external")
-                    item = EvidenceItem(
-                        evidence_id=ev_id,
-                        url=p["url"],
-                        quote=q_clean,
-                        source_type=stype,
-                        domain=_host(p["url"]),
-                        page_title=p.get("title"),
-                        published=p.get("published"),
-                    )
-                    evidence_items.append(item)
-                    evidence_map[key] = ev_id
-                    return ev_id
-            return None
-
-        # Seed evidence from known checked facts.
-        # Fix A: Force-register every checked-fact quote as an EvidenceItem even if
-        # the verbatim text is not found in the scraped pages (checked-fact quotes come
-        # from the checking LLM which may paraphrase slightly). We use the source URL
-        # from the checked evidence object to construct the item directly.
-        def _force_register_evidence(
-            quote: str, url: str, source_tier: str
-        ) -> str | None:
-            """Register a quote unconditionally using its known URL, bypassing page-text match."""
-            q_clean = _clean(quote)
-            if len(q_clean) < 25:
-                return None
-            key = q_clean.lower()
-            if key in evidence_map:
-                return evidence_map[key]
-            ev_id = f"ev_{len(evidence_items) + 1:03d}"
-            stype: str = "company_website" if source_tier == "first_party" or _host(url) == client_host else "reputable_external"
-            item = EvidenceItem(
-                evidence_id=ev_id,
-                url=url,
-                quote=q_clean,
-                source_type=stype,
-                domain=_host(url),
+            return evidence_registry.register_quote(
+                quote,
+                research_pages,
+                preferred_source_type,
             )
-            evidence_items.append(item)
-            evidence_map[key] = ev_id
-            return ev_id
 
         # Map checked-fact quote -> evidence_id so facts can be linked back
         checked_fact_ev_map: dict[str, list[str]] = {}  # fact_id -> [ev_id, ...]
@@ -708,8 +830,6 @@ Rules:
             ev_ids_for_fact: list[str] = []
             for ev in f.evidence:
                 eid = add_evidence(ev.quote, "company_website" if ev.source_tier == "first_party" else "reputable_external")
-                if eid is None and ev.url:
-                    eid = _force_register_evidence(ev.quote, ev.url, ev.source_tier)
                 if eid:
                     ev_ids_for_fact.append(eid)
             checked_fact_ev_map[f.fact_id] = ev_ids_for_fact
@@ -717,25 +837,19 @@ Rules:
             ev_ids_for_fact = []
             for ev in l.evidence:
                 eid = add_evidence(ev.quote, "company_website" if ev.source_tier == "first_party" else "reputable_external")
-                if eid is None and ev.url:
-                    eid = _force_register_evidence(ev.quote, ev.url, ev.source_tier)
                 if eid:
                     ev_ids_for_fact.append(eid)
             checked_fact_ev_map[l.fact_id] = ev_ids_for_fact
 
         # 2. Parse candidate subtopics
         # Build a quick lookup: quote_norm -> fact_id for verified_fact_ids linking
-        fact_quote_index: dict[str, str] = {}
+        fact_quote_index: dict[str, set[str]] = {}
         for f in checked_guide.can_write:
             for ev in f.evidence:
-                fact_quote_index[_clean(ev.quote).lower()] = f.fact_id
+                fact_quote_index.setdefault(_clean(ev.quote).casefold(), set()).add(f.fact_id)
         for l in checked_guide.can_write_with_limits:
             for ev in l.evidence:
-                fact_quote_index[_clean(ev.quote).lower()] = l.fact_id
-
-        # Build a valid set of fact IDs to validate references against
-        # (populated after verified_facts are built — used in gap linkage below)
-        valid_fact_id_set: set[str] = set()
+                fact_quote_index.setdefault(_clean(ev.quote).casefold(), set()).add(l.fact_id)
 
         candidate_subtopics: list[CandidateSubtopic] = []
         for idx, item in enumerate(data.get("candidate_subtopics") or [], start=1):
@@ -752,9 +866,10 @@ Rules:
                 if ev_id:
                     ev_ids.append(ev_id)
                 # Cross-link to a verified fact if the same quote grounds one
-                q_key = _clean(str(q)).lower()
-                if q_key in fact_quote_index:
-                    fid = fact_quote_index[q_key]
+                q_key = _clean(str(q)).casefold()
+                matching_fact_ids = fact_quote_index.get(q_key, set())
+                if len(matching_fact_ids) == 1:
+                    fid = next(iter(matching_fact_ids))
                     if fid not in vfact_ids:
                         vfact_ids.append(fid)
 
@@ -813,23 +928,17 @@ Rules:
             q = str(item.get("evidence_quote") or "")
             ev_id = add_evidence(q) if q else None
 
-            # If add_evidence failed (quote not verbatim in pages), try force-register
-            if ev_id is None and q:
-                # Try to find the URL from research_pages by partial text match
-                q_clean = _clean(q)
-                for p in research_pages:
-                    if len(q_clean) >= 20 and q_clean[:40].lower() in p["text"].lower():
-                        ev_id = _force_register_evidence(q, p["url"], "first_party" if _host(p["url"]) == client_host else "other")
-                        break
-
             ev_type = str(item.get("evidence_type") or "company_website").strip().lower()
             if ev_type not in {"company_website", "reputable_external"}:
                 ev_type = "company_website"
             boundary = _clean(str(item.get("wording_boundary") or ""))
 
-            # Fix 1: A fact with no evidence is not verified — downgrade confidence
-            # and add a wording boundary explaining it needs evidence.
-            has_evidence = bool(ev_id)
+            has_evidence = bool(
+                ev_id
+                and _safe_narrow(statement, q, statement)
+            )
+            if not has_evidence:
+                ev_id = None
             confidence: str
             if has_evidence:
                 confidence = str(item.get("confidence") or "high").strip().lower()
@@ -837,6 +946,10 @@ Rules:
                     confidence = "high"
             else:
                 confidence = "low"
+                self._warnings.append(
+                    "An Agent 3 fact was not accepted as verified because its quote "
+                    "did not both match a retrieved page and support the statement."
+                )
                 if not boundary:
                     boundary = "No verbatim evidence quote found; treat as unverified until sourced."
 
@@ -848,11 +961,10 @@ Rules:
                 evidence_type=ev_type,
                 evidence_ids=[ev_id] if ev_id else [],
                 confidence=confidence,
+                status="verified" if has_evidence else "inconclusive",
                 wording_boundary=boundary if boundary else None,
             ))
-            valid_fact_id_set.add(fact_id)
 
-        # Fix 1 continued: Also update valid_fact_id_set from fallback facts
         # Add checked facts if LLM verified_facts was sparse
         if not verified_facts:
             for idx, f in enumerate(checked_guide.can_write, start=1):
@@ -865,8 +977,8 @@ Rules:
                     evidence_type="company_website",
                     evidence_ids=ev_ids_f,
                     confidence="high" if ev_ids_f else "low",
+                    status="verified" if ev_ids_f else "inconclusive",
                 ))
-                valid_fact_id_set.add(fact_id)
             offset = len(verified_facts)
             for idx, l in enumerate(checked_guide.can_write_with_limits, start=offset + 1):
                 ev_ids_l = checked_fact_ev_map.get(l.fact_id, [])
@@ -878,9 +990,9 @@ Rules:
                     evidence_type="company_website",
                     evidence_ids=ev_ids_l,
                     confidence="medium" if ev_ids_l else "low",
+                    status="verified" if ev_ids_l else "inconclusive",
                     wording_boundary=l.wording_limit,
                 ))
-                valid_fact_id_set.add(fact_id)
 
         # Fix B (post-fact): Re-link LLM-emitted facts to checked_fact_ev_map evidence.
         # The LLM may emit a fact whose statement matches a checked claim; re-use those
@@ -1079,9 +1191,11 @@ Rules:
                 continue
             seen_claims.add(st)
             urls = [ev.url for ev in evidence_items if ev.evidence_id in vf.evidence_ids and ev.url]
-            if not urls:
-                urls = [f"https://{client_host}"]
-            status = "verified" if vf.evidence_ids else "needs_human_review"
+            status = (
+                "verified"
+                if vf.evidence_ids and vf.status == "verified"
+                else "needs_human_review"
+            )
             relevant_findings.append(
                 CompanyTalkingPoint(
                     claim=st,
@@ -1095,10 +1209,16 @@ Rules:
             if not st or st in seen_claims:
                 continue
             seen_claims.add(st)
+            evidence_ids = checked_fact_ev_map.get(cw.fact_id, [])
+            urls = [
+                ev.url
+                for ev in evidence_items
+                if ev.evidence_id in evidence_ids and ev.url
+            ]
             relevant_findings.append(
                 CompanyTalkingPoint(
                     claim=st,
-                    source_urls=[f"https://{client_host}"],
+                    source_urls=urls,
                     verification_status="needs_human_review",
                 )
             )
@@ -1108,11 +1228,18 @@ Rules:
             if not st or st in seen_claims:
                 continue
             seen_claims.add(st)
+            evidence_ids = checked_fact_ev_map.get(cw.fact_id, [])
             relevant_findings.append(
                 CompanyTalkingPoint(
                     claim=st,
-                    source_urls=[f"https://{client_host}"],
-                    verification_status="verified",
+                    source_urls=[
+                        ev.url
+                        for ev in evidence_items
+                        if ev.evidence_id in evidence_ids and ev.url
+                    ],
+                    verification_status=(
+                        "verified" if evidence_ids else "needs_human_review"
+                    ),
                 )
             )
 
@@ -1123,6 +1250,9 @@ Rules:
             "Do not invent technical specifications, certifications, or performance metrics.",
             "Flag claims that need further research or human verification.",
         ]
+        for warning in self._warnings:
+            if warning not in boundaries:
+                boundaries.append(warning)
 
         # 3. Filtered candidate subtopics
         filtered_subtopics = [
@@ -1236,13 +1366,17 @@ Rules:
     ) -> CheckedClaim:
         topic = question["topic"]
         claim = question["claim"]
-        first_pages, first_failed = self._collect_pages(claim, client_host, client_name, first_party=True)
+        first_pages, first_failed = self._collect_optional_pages(
+            claim, client_host, client_name, first_party=True
+        )
         checked = self._read_pages(claim, client_name, first_pages) if first_pages else []
         usable = [item for item in checked if item["support"] != "none"]
         retrieved = [page["url"] for page in first_pages]
         search_failed = first_failed and not first_pages
         if not usable:
-            web_pages, web_failed = self._collect_pages(claim, client_host, client_name, first_party=False)
+            web_pages, web_failed = self._collect_optional_pages(
+                claim, client_host, client_name, first_party=False
+            )
             retrieved.extend(page["url"] for page in web_pages)
             if web_pages:
                 checked.extend(self._read_pages(claim, client_name, web_pages))
@@ -1286,8 +1420,14 @@ JSON only."""
         }
         try:
             data = self._complete(system, payload, max_tokens=2500)
-        except Exception as exc:
-            print(f"  Opportunity claims failed: {exc}")
+        except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+            logger.warning(
+                "Agent 3 content-opportunity assessment failed (%s).",
+                type(exc).__name__,
+            )
+            self._warnings.append(
+                "Content-opportunity assessment failed; original opportunities were treated as unverified."
+            )
             data = {}
         by_text: dict[str, dict[str, Any]] = {}
         for item in data.get("items") or []:
@@ -1377,8 +1517,14 @@ Rules:
                 {"client_name": client_name, "claim": claim, "pages": packed},
                 max_tokens=1200,
             )
-        except Exception as exc:
-            print(f"  Evidence read failed: {exc}")
+        except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+            logger.warning(
+                "Agent 3 evidence assessment failed (%s) for one claim.",
+                type(exc).__name__,
+            )
+            self._warnings.append(
+                "One optional evidence assessment failed; the affected claim was left unresolved."
+            )
             return []
         by_url = {page["url"]: page for page in pages}
         checked: list[dict[str, Any]] = []

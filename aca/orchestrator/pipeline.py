@@ -1,14 +1,18 @@
-"""LangGraph flow for the five-agent content workflow.
+"""LangGraph flow for the content workflow.
 
-    agent1 -> agent2 -> agent3 -> agent4 -> agent5
+    agent1 -> agent2 -> agent3 -> agent4 -> agent5 -> optional agent6
 
 The workflow resumes at the first incomplete agent. The website is the
-caller's input.
+caller's input. Agent 6 runs only when requested.
 """
+
 from __future__ import annotations
 
+import logging
 import re
-from typing import Any
+import time
+from typing import Any, Callable
+from uuid import uuid4
 
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field
@@ -16,11 +20,13 @@ from pydantic import BaseModel, Field
 from aca.agents.content_brief import ContentBriefAgent
 from aca.agents.ground_truth import MAX_QUESTIONS, GroundTruthAgent
 from aca.agents.prompt_intelligence import run_agent1
+from aca.agents.reviewer import ReviewerAgent
 from aca.agents.source_intelligence import TOP_N_SOURCES, run_agent2
 from aca.agents.writer import WriterAgent
 from aca.models.content_brief import ContentBrief
 from aca.models.ground_truth import ClientInput, GroundTruthGuide
 from aca.models.prompt_intelligence import PromptAnalysis
+from aca.models.reviewer import ReviewOutput
 from aca.models.source_intelligence import SourceIntelligence
 from aca.models.writer import (
     WriterEvidence,
@@ -29,8 +35,11 @@ from aca.models.writer import (
     WriterSectionInput,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class PipelineState(BaseModel):
+    run_id: str = Field(default_factory=lambda: uuid4().hex)
     campaign_id: int
     prompt_id: str
     website: str
@@ -38,25 +47,66 @@ class PipelineState(BaseModel):
     top_n: int = TOP_N_SOURCES
     max_questions: int = MAX_QUESTIONS
     target_word_count: int | None = None
+    review_requested: bool = False
     prompt_analysis: PromptAnalysis | None = None
     source_analysis: SourceIntelligence | None = None
     guide: GroundTruthGuide | None = None
     content_brief: ContentBrief | None = None
     written_article: WriterOutput | None = None
+    review_output: ReviewOutput | None = None
     errors: list[str] = Field(default_factory=list)
 
 
+def _run_stage(
+    state: PipelineState,
+    stage: str,
+    operation: Callable[[], Any],
+) -> Any:
+    started = time.perf_counter()
+    logger.info(
+        "run_id=%s stage=%s status=started",
+        state.run_id,
+        stage,
+    )
+    try:
+        result = operation()
+    except Exception as exc:
+        logger.exception(
+            "run_id=%s stage=%s status=failed error_type=%s duration_ms=%.1f",
+            state.run_id,
+            stage,
+            type(exc).__name__,
+            (time.perf_counter() - started) * 1000,
+        )
+        raise
+    logger.info(
+        "run_id=%s stage=%s status=success duration_ms=%.1f",
+        state.run_id,
+        stage,
+        (time.perf_counter() - started) * 1000,
+    )
+    return result
+
+
 def agent1_node(state: PipelineState) -> dict[str, Any]:
-    result = run_agent1(
-        state.campaign_id,
-        state.prompt_id,
-        state.company_name.strip() or None,
+    result = _run_stage(
+        state,
+        "agent1",
+        lambda: run_agent1(
+            state.campaign_id,
+            state.prompt_id,
+            state.company_name.strip() or None,
+        ),
     )
     return {"prompt_analysis": result, "company_name": result.customer_name}
 
 
 def agent2_node(state: PipelineState) -> dict[str, Any]:
-    result = run_agent2(state.campaign_id, state.prompt_id, top_n=state.top_n)
+    result = _run_stage(
+        state,
+        "agent2",
+        lambda: run_agent2(state.campaign_id, state.prompt_id, top_n=state.top_n),
+    )
     return {"source_analysis": result}
 
 
@@ -66,23 +116,25 @@ def agent3_node(state: PipelineState) -> dict[str, Any]:
     if state.prompt_analysis is None:
         return {"errors": ["Agent 1 output is missing."]}
     name = state.company_name.strip() or state.prompt_analysis.customer_name
-    guide = GroundTruthAgent(max_questions=state.max_questions).analyze(
-        state.prompt_analysis,
-        state.source_analysis,
-        ClientInput(company_name=name, website=state.website),
+    guide = _run_stage(
+        state,
+        "agent3",
+        lambda: GroundTruthAgent(max_questions=state.max_questions).analyze(
+            state.prompt_analysis,
+            ClientInput(company_name=name, website=state.website),
+        ),
     )
-    if guide is None:
-        return {
-            "guide": None,
-            "errors": [
-                "Prompt intent is invalid or customer is not relevant to the requested topic. Stopped as no blog content can be written."
-            ],
-        }
     if guide.verification is None or not guide.verification.is_verified:
         reason = guide.verification.reason if guide.verification else "Verification result is missing."
+        logger.info(
+            "run_id=%s stage=agent3 status=needs_review",
+            state.run_id,
+        )
         return {
             "guide": guide,
-            "errors": [f"Agent 3 verification failed. Agents 4 and 5 were not run. {reason}"],
+            "errors": [
+                "Prompt/customer verification did not pass; Agents 4 and 5 were skipped. " f"{reason}"
+            ],
         }
     return {"guide": guide}
 
@@ -93,10 +145,14 @@ def agent4_node(state: PipelineState) -> dict[str, Any]:
     if state.guide.verification is None or not state.guide.verification.is_verified:
         raise RuntimeError("Agent 3 verification must pass before running Agent 4.")
 
-    brief = ContentBriefAgent().build_brief(
-        state.prompt_analysis,
-        state.source_analysis,
-        state.guide,
+    brief = _run_stage(
+        state,
+        "agent4",
+        lambda: ContentBriefAgent().build_brief(
+            state.prompt_analysis,
+            state.source_analysis,
+            state.guide,
+        ),
     )
     if not brief.sections:
         return {
@@ -184,7 +240,24 @@ def agent5_node(state: PipelineState) -> dict[str, Any]:
     writer_input = _build_writer_input(state)
     if not writer_input.sections:
         raise RuntimeError("Agent 4 returned no usable sections. Agent 5 was not run.")
-    return {"written_article": WriterAgent().write(writer_input)}
+    article = _run_stage(
+        state,
+        "agent5",
+        lambda: WriterAgent().write(writer_input),
+    )
+    return {"written_article": article}
+
+
+def agent6_node(state: PipelineState) -> dict[str, Any]:
+    if state.written_article is None:
+        raise RuntimeError("Agent 5 output is required before running Agent 6.")
+    writer_input = _build_writer_input(state)
+    reviewed = _run_stage(
+        state,
+        "agent6",
+        lambda: ReviewerAgent().review(writer_input, state.written_article),
+    )
+    return {"review_output": reviewed}
 
 
 def _entry(state: PipelineState) -> str:
@@ -202,15 +275,13 @@ def _entry(state: PipelineState) -> str:
         return END
     if state.written_article is None:
         return "agent5"
+    if state.review_requested and state.review_output is None:
+        return "agent6"
     return END
 
 
 def _after_agent3(state: PipelineState) -> str:
-    if (
-        state.guide is None
-        or state.guide.verification is None
-        or not state.guide.verification.is_verified
-    ):
+    if state.guide is None or state.guide.verification is None or not state.guide.verification.is_verified:
         return END
     return "agent4"
 
@@ -221,24 +292,32 @@ def _after_agent4(state: PipelineState) -> str:
     return "agent5"
 
 
+def _after_agent5(state: PipelineState) -> str:
+    if state.review_requested and state.review_output is None:
+        return "agent6"
+    return END
+
+
 def build_pipeline():
-    """Compile the five-agent content workflow."""
+    """Compile the content workflow; Agent 6 runs only when explicitly requested."""
     graph = StateGraph(PipelineState)
     graph.add_node("agent1", agent1_node)
     graph.add_node("agent2", agent2_node)
     graph.add_node("agent3", agent3_node)
     graph.add_node("agent4", agent4_node)
     graph.add_node("agent5", agent5_node)
+    graph.add_node("agent6", agent6_node)
     graph.add_conditional_edges(
         START,
         _entry,
-        ["agent1", "agent2", "agent3", "agent4", "agent5", END],
+        ["agent1", "agent2", "agent3", "agent4", "agent5", "agent6", END],
     )
     graph.add_edge("agent1", "agent2")
     graph.add_edge("agent2", "agent3")
     graph.add_conditional_edges("agent3", _after_agent3, ["agent4", END])
     graph.add_conditional_edges("agent4", _after_agent4, ["agent5", END])
-    graph.add_edge("agent5", END)
+    graph.add_conditional_edges("agent5", _after_agent5, ["agent6", END])
+    graph.add_edge("agent6", END)
     return graph.compile()
 
 

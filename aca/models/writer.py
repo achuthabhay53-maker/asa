@@ -78,9 +78,24 @@ class WriterClaim(BaseModel):
     """A material factual claim used in the article."""
 
     claim: str
+    claim_scope: Literal[
+        "company_specific",
+        "industry_context",
+        "general_education",
+    ] = "company_specific"
     evidence_ids: list[str] = Field(default_factory=list)
     source_urls: list[str] = Field(default_factory=list)
     supporting_evidence: list[WriterEvidence] = Field(default_factory=list)
+    citation_status: Literal["not_checked", "linked", "mismatch", "missing"] = "not_checked"
+    support_status: Literal[
+        "not_assessed",
+        "supported",
+        "partially_supported",
+        "unsupported",
+        "contradicted",
+        "inconclusive",
+    ] = "not_assessed"
+    validation_notes: list[str] = Field(default_factory=list)
 
 
 class WrittenSection(BaseModel):

@@ -2,7 +2,12 @@
 from __future__ import annotations
 
 import os
+import logging
+import random
+import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from urllib.parse import urlparse
 
@@ -15,6 +20,8 @@ SEARCH_TIMEOUT_SECONDS = 30
 EXTRACT_TIMEOUT_SECONDS = 60
 _ATTEMPTS = 2
 _MAX_HTML_CHARS = 1_000_000
+_MAX_RETRY_AFTER_SECONDS = 30
+logger = logging.getLogger(__name__)
 _BLOCK_ELEMENTS = {
     "article", "aside", "blockquote", "br", "dd", "div", "dl", "dt",
     "h1", "h2", "h3", "h4", "h5", "h6", "li", "main", "ol", "p",
@@ -240,15 +247,50 @@ class WebResearch:
                 response.raise_for_status()
                 return response
             except httpx.HTTPError as exc:
-                if attempt == _ATTEMPTS - 1:
-                    # Do not include exception text: request URLs may contain API keys.
-                    status = (
-                        f"HTTP {exc.response.status_code}"
-                        if isinstance(exc, httpx.HTTPStatusError)
-                        else type(exc).__name__
+                response = exc.response if isinstance(exc, httpx.HTTPStatusError) else None
+                status_code = response.status_code if response is not None else None
+                retryable_status = status_code in {408, 425, 429} or (
+                    status_code is not None and 500 <= status_code < 600
+                )
+                retryable_error = response is None
+                if attempt + 1 >= _ATTEMPTS or not (
+                    retryable_status or retryable_error
+                ):
+                    logger.warning(
+                        "%s failed after %d attempt(s) (%s).",
+                        label,
+                        attempt + 1,
+                        f"HTTP {status_code}" if status_code else type(exc).__name__,
                     )
-                    print(f"  {label} failed after {_ATTEMPTS} attempts ({status}).")
+                    return None
+
+                delay = WebResearch._retry_delay(response, attempt)
+                time.sleep(delay)
         return None
+
+    @staticmethod
+    def _retry_delay(
+        response: httpx.Response | None,
+        attempt: int,
+    ) -> float:
+        if response is not None:
+            retry_after = response.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    return min(
+                        _MAX_RETRY_AFTER_SECONDS,
+                        max(0.0, float(retry_after)),
+                    )
+                except ValueError:
+                    try:
+                        retry_at = parsedate_to_datetime(retry_after)
+                        if retry_at.tzinfo is None:
+                            retry_at = retry_at.replace(tzinfo=timezone.utc)
+                        delay = (retry_at - datetime.now(timezone.utc)).total_seconds()
+                        return min(_MAX_RETRY_AFTER_SECONDS, max(0.0, delay))
+                    except (TypeError, ValueError, OverflowError):
+                        pass
+        return min(2.0, 0.25 * (2**attempt)) + random.uniform(0.0, 0.1)
 
 
 def get_web_research() -> WebResearch:

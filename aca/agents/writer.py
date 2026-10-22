@@ -14,6 +14,7 @@ from typing import Any
 import anthropic
 from pydantic import ValidationError
 
+from aca.evidence import canonicalize_evidence_url
 from aca.models.writer import WriterEvidence, WriterInput, WriterOutput
 
 
@@ -36,8 +37,7 @@ class WriterAgent:
         user_prompt = self._build_user_prompt(writer_input)
         result = self._generate_output(user_prompt)
 
-        allowed_ids = {item.evidence_id for item in writer_input.evidence}
-        self._validate_evidence_references(result, allowed_ids)
+        result = self._sanitize_evidence_references(result, writer_input.evidence)
         result = self._normalize_metadata(result)
         try:
             self._validate_seo_requirements(result, writer_input)
@@ -63,7 +63,7 @@ class WriterAgent:
                 + "\n</previous_draft>"
             )
             result = self._generate_output(repair_prompt)
-            self._validate_evidence_references(result, allowed_ids)
+            result = self._sanitize_evidence_references(result, writer_input.evidence)
             result = self._normalize_metadata(result)
             self._validate_seo_requirements(result, writer_input)
         result = self._attach_supporting_evidence(result, writer_input.evidence)
@@ -197,17 +197,36 @@ class WriterAgent:
         unresolved = list(result.unresolved_items)
         for claim in result.claims_used:
             evidence = claim.supporting_evidence
-            if not evidence:
-                warning = f"Claim needs evidence review: {claim.claim}"
+            if claim.claim_scope != "company_specific":
+                continue
+            support_messages = {
+                "partially_supported": (
+                    "Supplied evidence supports only part of this claim; narrow or "
+                    "qualify it"
+                ),
+                "unsupported": (
+                    "Supplied evidence does not support this claim; that does not "
+                    "by itself mean the claim is false"
+                ),
+                "contradicted": (
+                    "Supplied evidence directly contradicts this claim; resolve "
+                    "the conflict before publication"
+                ),
+                "inconclusive": (
+                    "Supplied evidence is incomplete or ambiguous and cannot settle "
+                    "this claim"
+                ),
+                "not_assessed": "Claim-level evidence support was not assessed",
+            }
+            message = support_messages.get(claim.support_status)
+            if message:
+                warning = f"{message}: {claim.claim}"
                 if warning not in unresolved:
                     unresolved.append(warning)
-            elif any(item.status != "verified" for item in evidence):
-                warning = (
-                    f"Claim has evidence that is not fully verified; review its "
-                    f"wording and limitations: {claim.claim}"
-                )
-                if warning not in unresolved:
-                    unresolved.append(warning)
+            if claim.citation_status in {"mismatch", "missing"}:
+                for note in claim.validation_notes:
+                    if note not in unresolved:
+                        unresolved.append(note)
             for item in evidence:
                 if item.wording_boundary:
                     warning = (
@@ -337,39 +356,154 @@ class WriterAgent:
                 )
 
     @staticmethod
+    def _sanitize_evidence_references(
+        result: WriterOutput,
+        evidence: list[WriterEvidence],
+    ) -> WriterOutput:
+        """Drop model-invented evidence IDs while keeping the draft reviewable."""
+        allowed_ids = {item.evidence_id for item in evidence}
+        unresolved = list(result.unresolved_items)
+        claims = []
+        for claim in result.claims_used:
+            unknown_ids = sorted(set(claim.evidence_ids) - allowed_ids)
+            validation_notes = list(claim.validation_notes)
+            if unknown_ids:
+                warning = (
+                    "Writer referenced evidence IDs that were not supplied; "
+                    f"they were removed from claim {claim.claim!r}: "
+                    + ", ".join(unknown_ids)
+                )
+                if warning not in unresolved:
+                    unresolved.append(warning)
+                validation_notes.append(warning)
+            claims.append(
+                claim.model_copy(
+                    update={
+                        "evidence_ids": [
+                            evidence_id
+                            for evidence_id in dict.fromkeys(claim.evidence_ids)
+                            if evidence_id in allowed_ids
+                        ],
+                        "citation_status": (
+                            "mismatch"
+                            if unknown_ids
+                            else "not_checked"
+                        ),
+                        "validation_notes": list(dict.fromkeys(validation_notes)),
+                    }
+                )
+            )
+
+        sections = []
+        for section in result.sections:
+            unknown_ids = sorted(set(section.evidence_ids_used) - allowed_ids)
+            if unknown_ids:
+                warning = (
+                    "Writer section "
+                    f"{section.heading!r} referenced evidence IDs that were not "
+                    "supplied; they were removed: "
+                    + ", ".join(unknown_ids)
+                )
+                if warning not in unresolved:
+                    unresolved.append(warning)
+            sections.append(
+                section.model_copy(
+                    update={
+                        "evidence_ids_used": [
+                            evidence_id
+                            for evidence_id in dict.fromkeys(section.evidence_ids_used)
+                            if evidence_id in allowed_ids
+                        ]
+                    }
+                )
+            )
+
+        return result.model_copy(
+            update={
+                "claims_used": claims,
+                "sections": sections,
+                "unresolved_items": unresolved,
+            }
+        )
+
+    @staticmethod
     def _attach_supporting_evidence(
         result: WriterOutput,
         evidence: list[WriterEvidence],
     ) -> WriterOutput:
         evidence_by_id = {item.evidence_id: item for item in evidence}
         claims = []
+        unresolved = list(result.unresolved_items)
         for claim in result.claims_used:
             referenced = [
                 evidence_by_id[evidence_id]
                 for evidence_id in dict.fromkeys(claim.evidence_ids)
             ]
             referenced_urls = {
-                item.source_url for item in referenced if item.source_url
+                canonicalize_evidence_url(item.source_url): item.source_url
+                for item in referenced
+                if item.source_url and canonicalize_evidence_url(item.source_url)
             }
-            unlinked_urls = set(claim.source_urls) - referenced_urls
+            unlinked_urls = {
+                url
+                for url in claim.source_urls
+                if not canonicalize_evidence_url(url)
+                or canonicalize_evidence_url(url) not in referenced_urls
+            }
+            validation_notes = list(claim.validation_notes)
             if unlinked_urls:
-                raise RuntimeError(
-                    "Writer claim included source URLs not linked to its evidence IDs: "
+                warning = (
+                    "Writer returned source URLs not linked to supplied evidence "
+                    f"for claim {claim.claim!r}; those URLs were removed: "
                     + ", ".join(sorted(unlinked_urls))
+                )
+                if warning not in unresolved:
+                    unresolved.append(warning)
+                validation_notes.append(warning)
+            elif not referenced and claim.claim_scope == "company_specific":
+                warning = (
+                    "Writer claim has no registered evidence IDs; treat it as "
+                    f"unsupported pending human verification: {claim.claim}"
+                )
+                if warning not in unresolved:
+                    unresolved.append(warning)
+                validation_notes.append(warning)
+            citation_status = (
+                "mismatch"
+                if unlinked_urls or claim.citation_status == "mismatch"
+                else "linked" if referenced else "missing"
+            )
+            support_status = claim.support_status
+            if not referenced and claim.claim_scope == "company_specific" and support_status == "not_assessed":
+                support_status = "unsupported"
+            if referenced:
+                validation_notes.append(
+                    (
+                        "No claim-level evidence assessment was provided."
+                        if support_status == "not_assessed"
+                        else "Claim support is an AI assessment of the supplied "
+                        "evidence, not independent verification."
+                    )
+                )
+            elif claim.claim_scope == "company_specific" and support_status == "unsupported":
+                validation_notes.append(
+                    "No supplied evidence was attached to this company-specific claim; "
+                    "unsupported here does not mean the claim is false."
                 )
             claims.append(
                 claim.model_copy(
                     update={
-                        "source_urls": [
-                            item.source_url
-                            for item in referenced
-                            if item.source_url
-                        ],
+                        "source_urls": list(dict.fromkeys(referenced_urls.values())),
                         "supporting_evidence": referenced,
+                        "citation_status": citation_status,
+                        "support_status": support_status,
+                        "validation_notes": list(dict.fromkeys(validation_notes)),
                     }
                 )
             )
-        return result.model_copy(update={"claims_used": claims})
+        return result.model_copy(
+            update={"claims_used": claims, "unresolved_items": unresolved}
+        )
 
     @staticmethod
     def _system_prompt() -> str:
@@ -426,9 +560,12 @@ BLOG WRITING APPROACH
 
 EVIDENCE AND FACTUALITY
 
-9. Use the supplied evidence for company-specific and other material
-   factual claims. Never invent facts, figures, study results, examples,
-   certifications, capabilities, customer outcomes, citations, or URLs.
+9. Ground claims specifically about the customer, its products, services,
+   capabilities, processes, and results in the supplied evidence. Generic
+   industry context and educational explanations do not need to be verified
+   against customer evidence; keep them cautious and reader-focused. Never
+   invent facts, figures, study results, examples, certifications,
+   capabilities, customer outcomes, citations, or URLs.
 
 10. Evidence with status "verified" may be stated as verified by the
     upstream process, but do not claim more than its quote supports.
@@ -647,14 +784,34 @@ Return a JSON object with exactly these fields:
 - word_count: integer (approximate; it will be recalculated)
 - sections: array of objects with heading, content_markdown,
   evidence_ids_used
-- claims_used: array of objects with claim, evidence_ids, source_urls
+- claims_used: array of objects with claim, evidence_ids, source_urls,
+  claim_scope="company_specific|industry_context|general_education",
+  citation_status="not_checked",
+  support_status="supported|partially_supported|unsupported|contradicted|inconclusive|not_assessed",
+  validation_notes=[]
 - unresolved_items: array of strings
 - brief_coverage: array of strings
 
 For claims_used, record important factual claims that actually appear in
 the article and their supporting evidence IDs and URLs. Use an empty
 evidence_ids list if no supplied evidence supports a claim. Do not invent
-supporting references.
+supporting references. Set citation_status="not_checked"; assess
+support_status against the supplied claim, quote, source context, and
+evidence status. Use:
+- supported: the supplied evidence directly supports the whole claim.
+- partially_supported: it supports a narrower version; state the limit.
+- contradicted: supplied evidence directly conflicts with the claim.
+- unsupported: the available evidence does not support the claim.
+- inconclusive: evidence is incomplete or ambiguous and cannot settle it.
+- not_assessed: there is not enough supplied information to assess it.
+A citation URL/ID mismatch is a citation_status issue, not evidence that a
+claim is unsupported or contradicted. This assessment is an AI judgment,
+not independent verification. Validation code resolves citation links
+separately. Mark claims about the named
+customer, its products, services, capabilities, processes, or results as
+company_specific. Mark broad industry observations as industry_context and
+plain explanations as general_education. Do not turn generic context into
+a company claim or a company-evidence research gap.
 
 For sections, reflect the actual H2/H3 sections in the finished article.
 The article_markdown field must contain the complete Markdown article,
