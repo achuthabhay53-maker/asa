@@ -1,9 +1,9 @@
-
 """Agent 5: Writer Agent.
 
 Consumes a validated writer input and produces an evidence-grounded blog
 for Agent 6.
 """
+
 from __future__ import annotations
 
 import json
@@ -84,9 +84,32 @@ class WriterAgent:
             re.IGNORECASE,
         )
         stop_words = {
-            "about", "after", "and", "are", "as", "at", "by", "for", "from",
-            "has", "have", "in", "into", "is", "it", "more", "of", "on", "or",
-            "the", "their", "this", "to", "was", "were", "with",
+            "about",
+            "after",
+            "and",
+            "are",
+            "as",
+            "at",
+            "by",
+            "for",
+            "from",
+            "has",
+            "have",
+            "in",
+            "into",
+            "is",
+            "it",
+            "more",
+            "of",
+            "on",
+            "or",
+            "the",
+            "their",
+            "this",
+            "to",
+            "was",
+            "were",
+            "with",
         }
 
         def number_keys(text: str) -> set[tuple[str, str]]:
@@ -96,9 +119,7 @@ class WriterAgent:
             }
 
         verified = {
-            item.evidence_id: item
-            for item in evidence
-            if item.status == "verified" and item.evidence_quote
+            item.evidence_id: item for item in evidence if item.status == "verified" and item.evidence_quote
         }
         lines = result.article_markdown.splitlines()
         unresolved = list(result.unresolved_items)
@@ -136,9 +157,7 @@ class WriterAgent:
                             continue
                         quote_tokens = {
                             token.casefold()
-                            for token in re.findall(
-                                r"[A-Za-z][A-Za-z'-]{2,}", item.evidence_quote or ""
-                            )
+                            for token in re.findall(r"[A-Za-z][A-Za-z'-]{2,}", item.evidence_quote or "")
                             if token.casefold() not in stop_words
                         }
                         if tokens & claim_tokens & quote_tokens:
@@ -170,14 +189,10 @@ class WriterAgent:
             review_notes = []
             if unsupported:
                 review_notes.append(
-                    "add a verified source and context for numerical claim(s) "
-                    f"{', '.join(unsupported)}"
+                    "add a verified source and context for numerical claim(s) " f"{', '.join(unsupported)}"
                 )
             if limitations:
-                review_notes.append(
-                    "preserve source limitation: "
-                    + "; ".join(dict.fromkeys(limitations))
-                )
+                review_notes.append("preserve source limitation: " + "; ".join(dict.fromkeys(limitations)))
             if review_notes and "[VERIFY:" not in line:
                 line += f" [VERIFY: {'; '.join(review_notes)}]"
             flagged_lines.append(line)
@@ -201,8 +216,7 @@ class WriterAgent:
                 continue
             support_messages = {
                 "partially_supported": (
-                    "Supplied evidence supports only part of this claim; narrow or "
-                    "qualify it"
+                    "Supplied evidence supports only part of this claim; narrow or " "qualify it"
                 ),
                 "unsupported": (
                     "Supplied evidence does not support this claim; that does not "
@@ -213,8 +227,7 @@ class WriterAgent:
                     "the conflict before publication"
                 ),
                 "inconclusive": (
-                    "Supplied evidence is incomplete or ambiguous and cannot settle "
-                    "this claim"
+                    "Supplied evidence is incomplete or ambiguous and cannot settle " "this claim"
                 ),
                 "not_assessed": "Claim-level evidence support was not assessed",
             }
@@ -230,8 +243,7 @@ class WriterAgent:
             for item in evidence:
                 if item.wording_boundary:
                     warning = (
-                        f"Preserve evidence limitation for claim {claim.claim!r}: "
-                        f"{item.wording_boundary}"
+                        f"Preserve evidence limitation for claim {claim.claim!r}: " f"{item.wording_boundary}"
                     )
                     if warning not in unresolved:
                         unresolved.append(warning)
@@ -245,19 +257,17 @@ class WriterAgent:
         if faq_index is not None:
             faq_end = next(
                 (
-                    index for index in range(faq_index + 1, len(lines))
+                    index
+                    for index in range(faq_index + 1, len(lines))
                     if re.match(r"^##\s+", lines[index].strip())
                 ),
                 len(lines),
             )
-            faq_lines = lines[faq_index + 1:faq_end]
-            questions = [
-                index for index, line in enumerate(faq_lines)
-                if re.match(r"^###\s+", line.strip())
-            ]
+            faq_lines = lines[faq_index + 1 : faq_end]
+            questions = [index for index, line in enumerate(faq_lines) if re.match(r"^###\s+", line.strip())]
             for position, start in enumerate(questions):
                 end = questions[position + 1] if position + 1 < len(questions) else len(faq_lines)
-                answer = "\n".join(faq_lines[start + 1:end]).strip()
+                answer = "\n".join(faq_lines[start + 1 : end]).strip()
                 words = len(re.findall(r"\b[\w’'-]+\b", answer))
                 if not 40 <= words <= 50:
                     question = faq_lines[start].strip()[4:].strip()
@@ -285,9 +295,7 @@ class WriterAgent:
             if len(meta_description) > 155:
                 meta_description = meta_description[:155].rsplit(" ", 1)[0]
 
-        return result.model_copy(
-            update={"seo_title": seo_title, "meta_description": meta_description}
-        )
+        return result.model_copy(update={"seo_title": seo_title, "meta_description": meta_description})
 
     def _generate_output(self, user_prompt: str) -> WriterOutput:
         token_limits = [self.max_tokens, min(self.max_tokens * 2, 32000)]
@@ -309,30 +317,65 @@ class WriterAgent:
                 )
 
         raw_text = "\n".join(
-            block.text
-            for block in response.content
-            if getattr(block, "type", None) == "text"
+            block.text for block in response.content if getattr(block, "type", None) == "text"
         ).strip()
 
         if not raw_text:
             raise RuntimeError("Writer returned an empty response.")
 
         payload = self._parse_json(raw_text)
+        payload, support_status_warnings = self._normalize_claim_support_status(payload)
 
         try:
             result = WriterOutput.model_validate(payload)
         except ValidationError as exc:
-            raise RuntimeError(
-                f"Writer returned invalid output: {exc}"
-            ) from exc
+            raise RuntimeError(f"Writer returned invalid output: {exc}") from exc
 
         actual_word_count = len(re.findall(r"\b[\w’'-]+\b", result.article_markdown))
         return result.model_copy(
             update={
                 "word_count": actual_word_count,
-                "unresolved_items": list(dict.fromkeys(result.unresolved_items)),
+                "unresolved_items": list(dict.fromkeys([*result.unresolved_items, *support_status_warnings])),
             }
         )
+
+    @staticmethod
+    def _normalize_claim_support_status(
+        payload: dict[str, Any],
+    ) -> tuple[dict[str, Any], list[str]]:
+        """Default invalid model-generated claim assessments to the safe unknown state."""
+        allowed_statuses = {
+            "not_assessed",
+            "supported",
+            "partially_supported",
+            "unsupported",
+            "contradicted",
+            "inconclusive",
+        }
+        normalized = dict(payload)
+        raw_claims = payload.get("claims_used")
+        if not isinstance(raw_claims, list):
+            return normalized, []
+
+        claims = []
+        warnings = []
+        for index, raw_claim in enumerate(raw_claims):
+            if not isinstance(raw_claim, dict):
+                claims.append(raw_claim)
+                continue
+            claim = dict(raw_claim)
+            status = claim.get("support_status")
+            if "support_status" in claim and (not isinstance(status, str) or status not in allowed_statuses):
+                claim_text = str(claim.get("claim") or f"claim #{index + 1}")
+                warnings.append(
+                    f"Writer returned invalid support_status {status!r} for "
+                    f"{claim_text!r}; set to not_assessed because evidence support "
+                    "was not established by that invalid label."
+                )
+                claim["support_status"] = "not_assessed"
+            claims.append(claim)
+        normalized["claims_used"] = claims
+        return normalized, warnings
 
     @staticmethod
     def _validate_evidence_references(
@@ -343,16 +386,14 @@ class WriterAgent:
             unknown_ids = set(claim.evidence_ids) - allowed_ids
             if unknown_ids:
                 raise RuntimeError(
-                    "Writer referenced unknown evidence IDs: "
-                    + ", ".join(sorted(unknown_ids))
+                    "Writer referenced unknown evidence IDs: " + ", ".join(sorted(unknown_ids))
                 )
 
         for section in result.sections:
             unknown_ids = set(section.evidence_ids_used) - allowed_ids
             if unknown_ids:
                 raise RuntimeError(
-                    "Writer section referenced unknown evidence IDs: "
-                    + ", ".join(sorted(unknown_ids))
+                    "Writer section referenced unknown evidence IDs: " + ", ".join(sorted(unknown_ids))
                 )
 
     @staticmethod
@@ -370,8 +411,7 @@ class WriterAgent:
             if unknown_ids:
                 warning = (
                     "Writer referenced evidence IDs that were not supplied; "
-                    f"they were removed from claim {claim.claim!r}: "
-                    + ", ".join(unknown_ids)
+                    f"they were removed from claim {claim.claim!r}: " + ", ".join(unknown_ids)
                 )
                 if warning not in unresolved:
                     unresolved.append(warning)
@@ -384,11 +424,7 @@ class WriterAgent:
                             for evidence_id in dict.fromkeys(claim.evidence_ids)
                             if evidence_id in allowed_ids
                         ],
-                        "citation_status": (
-                            "mismatch"
-                            if unknown_ids
-                            else "not_checked"
-                        ),
+                        "citation_status": ("mismatch" if unknown_ids else "not_checked"),
                         "validation_notes": list(dict.fromkeys(validation_notes)),
                     }
                 )
@@ -401,8 +437,7 @@ class WriterAgent:
                 warning = (
                     "Writer section "
                     f"{section.heading!r} referenced evidence IDs that were not "
-                    "supplied; they were removed: "
-                    + ", ".join(unknown_ids)
+                    "supplied; they were removed: " + ", ".join(unknown_ids)
                 )
                 if warning not in unresolved:
                     unresolved.append(warning)
@@ -435,10 +470,7 @@ class WriterAgent:
         claims = []
         unresolved = list(result.unresolved_items)
         for claim in result.claims_used:
-            referenced = [
-                evidence_by_id[evidence_id]
-                for evidence_id in dict.fromkeys(claim.evidence_ids)
-            ]
+            referenced = [evidence_by_id[evidence_id] for evidence_id in dict.fromkeys(claim.evidence_ids)]
             referenced_urls = {
                 canonicalize_evidence_url(item.source_url): item.source_url
                 for item in referenced
@@ -447,15 +479,13 @@ class WriterAgent:
             unlinked_urls = {
                 url
                 for url in claim.source_urls
-                if not canonicalize_evidence_url(url)
-                or canonicalize_evidence_url(url) not in referenced_urls
+                if not canonicalize_evidence_url(url) or canonicalize_evidence_url(url) not in referenced_urls
             }
             validation_notes = list(claim.validation_notes)
             if unlinked_urls:
                 warning = (
                     "Writer returned source URLs not linked to supplied evidence "
-                    f"for claim {claim.claim!r}; those URLs were removed: "
-                    + ", ".join(sorted(unlinked_urls))
+                    f"for claim {claim.claim!r}; those URLs were removed: " + ", ".join(sorted(unlinked_urls))
                 )
                 if warning not in unresolved:
                     unresolved.append(warning)
@@ -471,10 +501,16 @@ class WriterAgent:
             citation_status = (
                 "mismatch"
                 if unlinked_urls or claim.citation_status == "mismatch"
-                else "linked" if referenced else "missing"
+                else "linked"
+                if referenced
+                else "missing"
             )
             support_status = claim.support_status
-            if not referenced and claim.claim_scope == "company_specific" and support_status == "not_assessed":
+            if (
+                not referenced
+                and claim.claim_scope == "company_specific"
+                and support_status == "not_assessed"
+            ):
                 support_status = "unsupported"
             if referenced:
                 validation_notes.append(
@@ -501,9 +537,7 @@ class WriterAgent:
                     }
                 )
             )
-        return result.model_copy(
-            update={"claims_used": claims, "unresolved_items": unresolved}
-        )
+        return result.model_copy(update={"claims_used": claims, "unresolved_items": unresolved})
 
     @staticmethod
     def _system_prompt() -> str:
@@ -845,8 +879,7 @@ or claims.
         if faq_index is None:
             raise RuntimeError("Writer article is missing its Frequently Asked Questions section.")
         if not any(
-            section.heading.strip().casefold() == "frequently asked questions"
-            for section in result.sections
+            section.heading.strip().casefold() == "frequently asked questions" for section in result.sections
         ):
             raise RuntimeError("Writer sections must include the FAQ section.")
         faq_end = next(
@@ -857,10 +890,9 @@ or claims.
             ),
             len(lines),
         )
-        faq_lines = lines[faq_index + 1:faq_end]
+        faq_lines = lines[faq_index + 1 : faq_end]
         question_indexes = [
-            index for index, line in enumerate(faq_lines)
-            if re.match(r"^###\s+", line.strip())
+            index for index, line in enumerate(faq_lines) if re.match(r"^###\s+", line.strip())
         ]
         if not 3 <= len(question_indexes) <= 5:
             raise RuntimeError("Writer FAQ section must contain 3 to 5 questions.")
@@ -870,7 +902,7 @@ or claims.
             if not heading.endswith("?"):
                 raise RuntimeError("Each FAQ heading must be phrased as a question.")
             end = question_indexes[position + 1] if position + 1 < len(question_indexes) else len(faq_lines)
-            answer = "\n".join(faq_lines[start + 1:end]).strip()
+            answer = "\n".join(faq_lines[start + 1 : end]).strip()
             if not answer:
                 raise RuntimeError(f"FAQ question has no answer: {heading}")
 
@@ -889,7 +921,6 @@ or claims.
                 break
         if not has_table:
             raise RuntimeError("Writer article must include at least one valid Markdown table.")
-
 
     @staticmethod
     def _parse_json(raw_text: str) -> dict[str, Any]:

@@ -101,6 +101,9 @@ article title instead of failing the blog run.
 Agent 5 also includes at least one useful Markdown table, based only on
 information in the brief and supplied evidence. Unsupported details are
 marked as unspecified rather than guessed.
+The `Read blog` tab offers a formatted PDF download with styled headings,
+readable tables, FAQ question headings, clickable web links, and page numbers.
+The Markdown source download remains available separately.
 Agent 3 researches the customer website and external sources independently;
 Agent 2's content structure and style analysis is used by Agent 4, not Agent 3.
 Agent 3's evidence checks focus on claims about the customer, its products,

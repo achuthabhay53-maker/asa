@@ -7,6 +7,7 @@ searched, both, or neither.
 
 The model's own knowledge is not evidence.
 """
+
 from __future__ import annotations
 
 import json
@@ -33,15 +34,11 @@ from aca.models.ground_truth import (
     Evidence,
     EvidenceBackedTopic,
     EvidenceItem,
-    EvidenceSourceType,
     Fact,
     FactStatus,
     GroundTruthGuide,
-    HeadingItem,
-    LimitedClaimHandoff,
     LimitedStatement,
     PromptContext,
-    PromptContextHandoff,
     PromptUnderstandingInput,
     PromptVerification,
     Relevance,
@@ -114,8 +111,25 @@ _COMPARE = (
     "competitors",
 )
 _STOP = {
-    "a", "an", "the", "that", "with", "from", "this", "have", "has", "been",
-    "were", "will", "into", "about", "their", "which", "than", "such", "also",
+    "a",
+    "an",
+    "the",
+    "that",
+    "with",
+    "from",
+    "this",
+    "have",
+    "has",
+    "been",
+    "were",
+    "will",
+    "into",
+    "about",
+    "their",
+    "which",
+    "than",
+    "such",
+    "also",
 }
 
 
@@ -157,11 +171,7 @@ class _EvidenceRegistry:
             source_type = (
                 page.get("source_type")
                 or preferred_source_type
-                or (
-                    "company_website"
-                    if _host(url) == self.client_host
-                    else "reputable_external"
-                )
+                or ("company_website" if _host(url) == self.client_host else "reputable_external")
             )
             self.items.append(
                 EvidenceItem(
@@ -177,6 +187,36 @@ class _EvidenceRegistry:
             self._ids_by_quote_and_url[key] = evidence_id
             return evidence_id
         return None
+
+    def register_checked_evidence(
+        self,
+        evidence: Evidence,
+        preferred_source_type: str | None = None,
+    ) -> str | None:
+        """Register a quote already validated against its exact source page."""
+        quote = _clean(evidence.quote)
+        url = evidence.url.strip()
+        canonical_url = canonicalize_evidence_url(url)
+        if len(quote) < 25 or not canonical_url:
+            return None
+        key = (quote.casefold(), canonical_url)
+        existing = self._ids_by_quote_and_url.get(key)
+        if existing:
+            return existing
+        evidence_id = f"ev_{len(self.items) + 1:03d}"
+        self.items.append(
+            EvidenceItem(
+                evidence_id=evidence_id,
+                url=url,
+                quote=quote,
+                source_type=preferred_source_type
+                or ("company_website" if _host(url) == self.client_host else "reputable_external"),
+                domain=_host(url),
+                published=evidence.published,
+            )
+        )
+        self._ids_by_quote_and_url[key] = evidence_id
+        return evidence_id
 
 
 def _dump(value: Any) -> Any:
@@ -222,7 +262,7 @@ def _extract_json(text: str) -> dict[str, Any]:
     # Slice from first { to last }
     start, end = text.find("{"), text.rfind("}")
     if start >= 0 and end > start:
-        candidate = text[start:end + 1]
+        candidate = text[start : end + 1]
         try:
             data = json.loads(candidate, strict=False)
             if isinstance(data, dict):
@@ -232,6 +272,7 @@ def _extract_json(text: str) -> dict[str, Any]:
         # Try json_repair on the sliced candidate
         try:
             import json_repair  # type: ignore[import]
+
             data = json_repair.loads(candidate)
             if isinstance(data, dict):
                 return data
@@ -241,6 +282,7 @@ def _extract_json(text: str) -> dict[str, Any]:
     # Last resort: json_repair on the full text
     try:
         import json_repair  # type: ignore[import]
+
         data = json_repair.loads(text)
         if isinstance(data, dict):
             return data
@@ -251,7 +293,6 @@ def _extract_json(text: str) -> dict[str, Any]:
     raise ValueError(f"Claude did not return a valid JSON object. Preview: {preview!r}")
 
 
-
 def _quote_in_page(quote: str, page: str) -> bool:
     quote_n = _clean(quote)
     page_n = _clean(page)
@@ -260,7 +301,7 @@ def _quote_in_page(quote: str, page: str) -> bool:
 
 def _is_superlative(text: str) -> bool:
     lowered = text.lower()
-    return any(term in lowered for term in _SUPERLATIVES)
+    return any(re.search(rf"(?<!\w){re.escape(term)}(?!\w)", lowered) for term in _SUPERLATIVES)
 
 
 def _parse_date(value: Any) -> date | None:
@@ -298,7 +339,9 @@ def build_prompt_context(agent1: Any, website: str, company_name: str | None = N
         ),
         content_opportunities=_string_list(first.get("content_opportunities")),
         answer_topics=_string_list((first.get("answer_understanding") or {}).get("key_topics")),
-        comparison_criteria=_string_list((first.get("answer_understanding") or {}).get("comparison_criteria")),
+        comparison_criteria=_string_list(
+            (first.get("answer_understanding") or {}).get("comparison_criteria")
+        ),
     )
 
 
@@ -333,7 +376,7 @@ class GroundTruthAgent:
         client_name = context.customer.company_name
         client_host = _host(context.customer.website)
         if not client_host:
-            raise ValueError("The website must include a host, for example https://alamarbio.com.")
+            raise ValueError("The website must include a host, for example https://example.com.")
 
         # Step 1: Understand the original prompt & verify relevance
         understanding = self._understand_prompt_and_verify(context, client_name, client_host)
@@ -355,7 +398,8 @@ class GroundTruthAgent:
                 boundaries=[
                     "The request did not pass prompt/customer relevance verification; "
                     "no content research or writing was performed."
-                ] + self._warnings,
+                ]
+                + list(dict.fromkeys(self._warnings)),
             )
 
         # Step 2: Research the specific topic (Company website vs. Reputable external sources)
@@ -371,6 +415,10 @@ class GroundTruthAgent:
         # Step 4: Return structured output ready for Agent 4
         return guide
 
+    def _add_warning(self, warning: str) -> None:
+        if warning not in self._warnings:
+            self._warnings.append(warning)
+
     @staticmethod
     def _validate_understanding(data: dict[str, Any]) -> dict[str, Any]:
         """Require explicit verification flags and valid types from Agent 3's model."""
@@ -379,9 +427,7 @@ class GroundTruthAgent:
         flags = ("is_verified", "intent_valid", "customer_relevant")
         for key in flags:
             if type(data.get(key)) is not bool:
-                raise ValueError(
-                    f"Agent 3 verification output requires boolean field {key!r}."
-                )
+                raise ValueError(f"Agent 3 verification output requires boolean field {key!r}.")
         expected_verified = data["intent_valid"] and data["customer_relevant"]
         if data["is_verified"] != expected_verified:
             raise ValueError(
@@ -391,27 +437,19 @@ class GroundTruthAgent:
 
         for key in ("main_topic", "search_intent", "target_audience", "reason"):
             if not isinstance(data.get(key), str):
-                raise ValueError(
-                    f"Agent 3 verification output requires string field {key!r}."
-                )
+                raise ValueError(f"Agent 3 verification output requires string field {key!r}.")
         if not data["main_topic"].strip():
             raise ValueError("Agent 3 verification output has an empty main_topic.")
         if not data["search_intent"].strip() or not data["target_audience"].strip():
-            raise ValueError(
-                "Agent 3 verification output requires search_intent and target_audience."
-            )
+            raise ValueError("Agent 3 verification output requires search_intent and target_audience.")
         if data.get("prompt_scope") not in {
             "broad_industry",
             "company_specific",
             "hybrid",
         }:
             raise ValueError("Agent 3 verification output has an invalid prompt_scope.")
-        if not isinstance(data.get("quote"), str) or not isinstance(
-            data.get("source_url"), str
-        ):
-            raise ValueError(
-                "Agent 3 verification output requires string quote and source_url fields."
-            )
+        if not isinstance(data.get("quote"), str) or not isinstance(data.get("source_url"), str):
+            raise ValueError("Agent 3 verification output requires string quote and source_url fields.")
         data["human_review_required"] = False
         if data["customer_relevant"]:
             source_url = canonicalize_evidence_url(data["source_url"])
@@ -427,8 +465,7 @@ class GroundTruthAgent:
                 data = data.copy()
                 data["human_review_required"] = True
                 data["reason"] = (
-                    data["reason"].strip()
-                    + " Human review is required: customer relevance did not have "
+                    data["reason"].strip() + " Human review is required: customer relevance did not have "
                     "an exact matching quote from the retrieved source page."
                 ).strip()
         return data
@@ -441,11 +478,16 @@ class GroundTruthAgent:
     ) -> dict[str, Any]:
         """Step 1: Understand prompt, infer main topic, intent, audience, scope, and verify relevance."""
         query_fp = f"{context.original_prompt} {context.prompt_understanding.intent}".strip()
-        first_pages, _ = self._collect_pages(query_fp, client_host, client_name, first_party=True)
+        first_pages, first_failed = self._collect_optional_pages(
+            query_fp, client_host, client_name, first_party=True
+        )
         retrieved_pages = list(first_pages)
+        external_failed = False
         if len(retrieved_pages) < PAGES_PER_PASS:
             web_query = f"{client_name} {context.original_prompt}"
-            web_pages, _ = self._collect_pages(web_query, client_host, client_name, first_party=False)
+            web_pages, external_failed = self._collect_optional_pages(
+                web_query, client_host, client_name, first_party=False
+            )
             retrieved_pages.extend(web_pages)
 
         if not retrieved_pages:
@@ -458,14 +500,31 @@ class GroundTruthAgent:
                     "Agent 3 root-page fallback failed (%s).",
                     type(exc).__name__,
                 )
-                self._warnings.append(
-                    "Company root-page fallback failed during prompt verification."
-                )
+                self._add_warning("Company root-page fallback failed during prompt verification.")
 
-        packed = [
-            {"url": page["url"], "text": page["text"][:PAGE_CHARS]}
-            for page in retrieved_pages
-        ]
+        if not retrieved_pages and (first_failed or external_failed):
+            reason = (
+                "Customer relevance could not be assessed because web search "
+                "returned no usable pages and root-page retrieval failed. This is not evidence that the "
+                "customer is irrelevant; rerun research or review manually."
+            )
+            self._add_warning(reason)
+            return {
+                "main_topic": context.prompt_understanding.topic or context.original_prompt,
+                "search_intent": context.prompt_understanding.intent,
+                "target_audience": context.prompt_understanding.audience or "Industry professionals",
+                "prompt_scope": "hybrid",
+                "is_verified": False,
+                "intent_valid": True,
+                "customer_relevant": False,
+                "human_review_required": True,
+                "reason": reason,
+                "quote": "",
+                "source_url": "",
+                "retrieved_pages": [],
+            }
+
+        packed = [{"url": page["url"], "text": page["text"][:PAGE_CHARS]} for page in retrieved_pages]
 
         system = """You are Agent 3 in a content intelligence workflow.
 Step 1: Understand the user prompt and verify customer relevance.
@@ -525,45 +584,47 @@ Rules:
             u = p.get("url")
             if u and u not in seen_urls:
                 seen_urls.add(u)
-                all_pages.append({
-                    "url": u,
-                    "text": p.get("text", ""),
-                    "published": p.get("published"),
-                    "source_type": "company_website" if _host(u) == client_host else "reputable_external",
-                })
+                all_pages.append(
+                    {
+                        "url": u,
+                        "text": p.get("text", ""),
+                        "published": p.get("published"),
+                        "source_type": "company_website" if _host(u) == client_host else "reputable_external",
+                    }
+                )
 
         # 1. Company Website: Search products, assays, services, capabilities
         main_topic = understanding.get("main_topic") or context.original_prompt
         fp_query = f"{main_topic} products assays services technology".strip()
-        fp_pages, _ = self._collect_optional_pages(
-            fp_query, client_host, client_name, first_party=True
-        )
+        fp_pages, _ = self._collect_optional_pages(fp_query, client_host, client_name, first_party=True)
         for p in fp_pages:
             u = p.get("url")
             if u and u not in seen_urls:
                 seen_urls.add(u)
-                all_pages.append({
-                    "url": u,
-                    "text": p.get("text", ""),
-                    "published": p.get("published"),
-                    "source_type": "company_website",
-                })
+                all_pages.append(
+                    {
+                        "url": u,
+                        "text": p.get("text", ""),
+                        "published": p.get("published"),
+                        "source_type": "company_website",
+                    }
+                )
 
         # 2. Reputable External: Broader industry context, benchmarks, applications
         ext_query = f"{main_topic} workflow technology comparison review".strip()
-        ext_pages, _ = self._collect_optional_pages(
-            ext_query, client_host, client_name, first_party=False
-        )
+        ext_pages, _ = self._collect_optional_pages(ext_query, client_host, client_name, first_party=False)
         for p in ext_pages:
             u = p.get("url")
             if u and u not in seen_urls:
                 seen_urls.add(u)
-                all_pages.append({
-                    "url": u,
-                    "text": p.get("text", ""),
-                    "published": p.get("published"),
-                    "source_type": "reputable_external",
-                })
+                all_pages.append(
+                    {
+                        "url": u,
+                        "text": p.get("text", ""),
+                        "published": p.get("published"),
+                        "source_type": "reputable_external",
+                    }
+                )
 
         # Check capability questions for exact factual grounding
         try:
@@ -573,29 +634,32 @@ Rules:
                 "Agent 3 capability-question generation failed (%s).",
                 type(exc).__name__,
             )
-            self._warnings.append(
-                "Capability-question generation failed; those optional checks were skipped."
-            )
+            self._add_warning("Capability-question generation failed; those optional checks were skipped.")
             questions = []
         pairs: list[tuple[dict[str, str], CheckedClaim]] = []
         for opportunity in self._opportunity_claims(context):
             if opportunity.get("relevance") == "low" and opportunity.get("relevance_to_topic") == "low":
-                pairs.append((opportunity, _unresolved(
-                    f"fact_{len(pairs) + 1:03d}",
-                    opportunity.get("topic") or "Content opportunity",
-                    opportunity["claim"],
-                    opportunity.get("claim_type") or "other",
-                    "low",
-                    "low",
-                    "content_opportunity",
-                    "do_not_write",
-                    "inconclusive",
-                    "Outside the original prompt and the topic being searched.",
-                    [],
-                    [],
-                    gap=False,
-                    asked_claim=opportunity["claim"],
-                )))
+                pairs.append(
+                    (
+                        opportunity,
+                        _unresolved(
+                            f"fact_{len(pairs) + 1:03d}",
+                            opportunity.get("topic") or "Content opportunity",
+                            opportunity["claim"],
+                            opportunity.get("claim_type") or "other",
+                            "low",
+                            "low",
+                            "content_opportunity",
+                            "do_not_write",
+                            "inconclusive",
+                            "Outside the original prompt and the topic being searched.",
+                            [],
+                            [],
+                            gap=False,
+                            asked_claim=opportunity["claim"],
+                        ),
+                    )
+                )
                 continue
             questions.append(opportunity)
 
@@ -623,20 +687,18 @@ Rules:
         first_party: bool,
     ) -> tuple[list[dict[str, Any]], bool]:
         try:
-            pages, failed = self._collect_pages(
-                claim, client_host, client_name, first_party
-            )
+            pages, failed = self._collect_pages(claim, client_host, client_name, first_party)
         except (httpx.HTTPError, OSError, RuntimeError, TypeError, ValueError) as exc:
             logger.warning(
                 "Agent 3 optional research retrieval failed (%s).",
                 type(exc).__name__,
             )
-            self._warnings.append(
+            self._add_warning(
                 f"Optional {'first-party' if first_party else 'external'} research retrieval failed."
             )
             return [], True
         if failed:
-            self._warnings.append(
+            self._add_warning(
                 f"Optional {'first-party' if first_party else 'external'} search returned no usable results."
             )
         return pages, failed
@@ -660,17 +722,17 @@ Rules:
         v_ev: list[Evidence] = []
         if v_quote and v_url:
             for p in research_pages:
-                if (
-                    canonicalize_evidence_url(p["url"])
-                    == canonicalize_evidence_url(v_url)
-                    and _quote_in_page(v_quote, p["text"])
+                if canonicalize_evidence_url(p["url"]) == canonicalize_evidence_url(v_url) and _quote_in_page(
+                    v_quote, p["text"]
                 ):
-                    v_ev.append(Evidence(
-                        url=v_url,
-                        quote=v_quote,
-                        source_tier=_tier(v_url, client_host),
-                        published=p.get("published"),
-                    ))
+                    v_ev.append(
+                        Evidence(
+                            url=v_url,
+                            quote=v_quote,
+                            source_tier=_tier(v_url, client_host),
+                            published=p.get("published"),
+                        )
+                    )
                     break
 
         understanding = self._validate_understanding(understanding)
@@ -695,11 +757,20 @@ Rules:
 
         # Prepare facts from checked claims
         known_facts = [
-            {"statement": f.claim, "quote": f.evidence[0].quote if f.evidence else "", "source": f.evidence[0].url if f.evidence else ""}
+            {
+                "statement": f.claim,
+                "quote": f.evidence[0].quote if f.evidence else "",
+                "source": f.evidence[0].url if f.evidence else "",
+            }
             for f in checked_guide.can_write
         ] + [
-            {"statement": l.statement, "limit": l.wording_limit, "quote": l.evidence[0].quote if l.evidence else "", "source": l.evidence[0].url if l.evidence else ""}
-            for l in checked_guide.can_write_with_limits
+            {
+                "statement": limited_fact.statement,
+                "limit": limited_fact.wording_limit,
+                "quote": limited_fact.evidence[0].quote if limited_fact.evidence else "",
+                "source": limited_fact.evidence[0].url if limited_fact.evidence else "",
+            }
+            for limited_fact in checked_guide.can_write_with_limits
         ]
 
         system = """You are Agent 3 in a content intelligence pipeline (Ground Truth & Research Discovery).
@@ -736,7 +807,7 @@ Return one JSON object with exactly these keys:
   "research_gaps": [
     {
       "topic_or_question": "Topic or question that is relevant to the prompt but lacks evidence",
-      "missing_claim": "The specific assertion that could not be verified (e.g. 'Alamar offers 5-day turnaround for custom assay development')",
+      "missing_claim": "The specific assertion that could not be verified (e.g. 'Example Bio offers a 5-day service turnaround')",
       "reason": "Why the current evidence is inconclusive: what is present, what is absent",
       "suggested_search_direction": "Exact search query or page type that would resolve this gap",
       "affects_subtopic_ids": []
@@ -781,7 +852,9 @@ Rules:
             {
                 "url": p["url"],
                 "source_type": p.get("source_type", "company_website"),
-                "text_snippet": p["text_snippet"][:_SNIPPET] if isinstance(p.get("text_snippet"), str) else "",
+                "text_snippet": p["text_snippet"][:_SNIPPET]
+                if isinstance(p.get("text_snippet"), str)
+                else "",
             }
             for p in packed_evidence
         ]
@@ -793,7 +866,8 @@ Rules:
             "understanding": {
                 "main_topic": understanding.get("main_topic") or context.original_prompt,
                 "search_intent": understanding.get("search_intent") or context.prompt_understanding.intent,
-                "target_audience": understanding.get("target_audience") or context.prompt_understanding.audience,
+                "target_audience": understanding.get("target_audience")
+                or context.prompt_understanding.audience,
                 "prompt_scope": understanding.get("prompt_scope") or "hybrid",
             },
             "known_facts": known_facts,
@@ -808,9 +882,7 @@ Rules:
                 "Agent 3 subtopic discovery failed (%s); falling back to checked facts.",
                 type(exc).__name__,
             )
-            self._warnings.append(
-                "Subtopic discovery failed; only independently checked claims are included."
-            )
+            self._add_warning("Subtopic discovery failed; only independently checked claims are included.")
             data = {}
 
         # 1. Build EvidenceItem registry
@@ -829,28 +901,25 @@ Rules:
         for f in checked_guide.can_write:
             ev_ids_for_fact: list[str] = []
             for ev in f.evidence:
-                eid = add_evidence(ev.quote, "company_website" if ev.source_tier == "first_party" else "reputable_external")
+                eid = evidence_registry.register_checked_evidence(
+                    ev,
+                    "company_website" if ev.source_tier == "first_party" else "reputable_external",
+                )
                 if eid:
                     ev_ids_for_fact.append(eid)
             checked_fact_ev_map[f.fact_id] = ev_ids_for_fact
-        for l in checked_guide.can_write_with_limits:
+        for limited_fact in checked_guide.can_write_with_limits:
             ev_ids_for_fact = []
-            for ev in l.evidence:
-                eid = add_evidence(ev.quote, "company_website" if ev.source_tier == "first_party" else "reputable_external")
+            for ev in limited_fact.evidence:
+                eid = evidence_registry.register_checked_evidence(
+                    ev,
+                    "company_website" if ev.source_tier == "first_party" else "reputable_external",
+                )
                 if eid:
                     ev_ids_for_fact.append(eid)
-            checked_fact_ev_map[l.fact_id] = ev_ids_for_fact
+            checked_fact_ev_map[limited_fact.fact_id] = ev_ids_for_fact
 
         # 2. Parse candidate subtopics
-        # Build a quick lookup: quote_norm -> fact_id for verified_fact_ids linking
-        fact_quote_index: dict[str, set[str]] = {}
-        for f in checked_guide.can_write:
-            for ev in f.evidence:
-                fact_quote_index.setdefault(_clean(ev.quote).casefold(), set()).add(f.fact_id)
-        for l in checked_guide.can_write_with_limits:
-            for ev in l.evidence:
-                fact_quote_index.setdefault(_clean(ev.quote).casefold(), set()).add(l.fact_id)
-
         candidate_subtopics: list[CandidateSubtopic] = []
         for idx, item in enumerate(data.get("candidate_subtopics") or [], start=1):
             if not isinstance(item, dict):
@@ -860,38 +929,25 @@ Rules:
                 continue
 
             ev_ids: list[str] = []
-            vfact_ids: list[str] = []
             for q in item.get("evidence_quotes") or []:
                 ev_id = add_evidence(str(q))
                 if ev_id:
                     ev_ids.append(ev_id)
-                # Cross-link to a verified fact if the same quote grounds one
-                q_key = _clean(str(q)).casefold()
-                matching_fact_ids = fact_quote_index.get(q_key, set())
-                if len(matching_fact_ids) == 1:
-                    fid = next(iter(matching_fact_ids))
-                    if fid not in vfact_ids:
-                        vfact_ids.append(fid)
-
-            # Fix 2: Strip any IDs that are not in the fact_xxx namespace.
-            # LLMs sometimes emit limit_xxx or ev_xxx here by mistake.
-            vfact_ids = [fid for fid in vfact_ids if fid.startswith("fact_")]
 
             # Fix 3: Stricter support_status — fully_supported requires BOTH
             # an evidence record AND a verified-fact cross-link.
-            raw_status = str(item.get("evidence_status") or "").strip().lower()
-            if ev_ids and vfact_ids:
-                support_status: str = "fully_supported"
-            elif ev_ids:
-                # Evidence quote exists but no matching verified fact → partial
-                support_status = "partially_supported"
-            elif raw_status == "needs_more_research":
-                support_status = "needs_more_research"
+            if ev_ids:
+                support_status: str = "partially_supported"
             else:
                 support_status = "needs_more_research"
 
             angle = str(item.get("topic_angle") or "company_capability").strip().lower()
-            if angle not in {"company_capability", "industry_context", "comparison_methodology", "educational_guide"}:
+            if angle not in {
+                "company_capability",
+                "industry_context",
+                "comparison_methodology",
+                "educational_guide",
+            }:
                 angle = "company_capability"
 
             relevance = str(item.get("relevance_to_main_topic") or "high").strip().lower()
@@ -902,18 +958,20 @@ Rules:
             if support_status in {"needs_more_research", "partially_supported"} and not research_needed:
                 research_needed = [f"Find primary evidence for: {title}"]
 
-            candidate_subtopics.append(CandidateSubtopic(
-                subtopic_id=f"subtopic_{idx:03d}",
-                title=title,
-                description=_clean(str(item.get("description") or "")),
-                topic_angle=angle,
-                relevance=relevance,
-                support_status=support_status,
-                verified_fact_ids=vfact_ids,
-                evidence_ids=ev_ids,
-                research_needed=research_needed,
-                suggested_questions=_string_list(item.get("suggested_questions")),
-            ))
+            candidate_subtopics.append(
+                CandidateSubtopic(
+                    subtopic_id=f"subtopic_{idx:03d}",
+                    title=title,
+                    description=_clean(str(item.get("description") or "")),
+                    topic_angle=angle,
+                    relevance=relevance,
+                    support_status=support_status,
+                    verified_fact_ids=[],
+                    evidence_ids=ev_ids,
+                    research_needed=research_needed,
+                    suggested_questions=_string_list(item.get("suggested_questions")),
+                )
+            )
 
         # 3. Parse verified facts
         # Fix B: after building facts, link them to the evidence IDs we seeded from
@@ -933,10 +991,7 @@ Rules:
                 ev_type = "company_website"
             boundary = _clean(str(item.get("wording_boundary") or ""))
 
-            has_evidence = bool(
-                ev_id
-                and _safe_narrow(statement, q, statement)
-            )
+            has_evidence = bool(ev_id and _safe_narrow(statement, q, statement))
             if not has_evidence:
                 ev_id = None
             confidence: str
@@ -946,53 +1001,56 @@ Rules:
                     confidence = "high"
             else:
                 confidence = "low"
-                self._warnings.append(
+                self._add_warning(
                     "An Agent 3 fact was not accepted as verified because its quote "
                     "did not both match a retrieved page and support the statement."
                 )
                 if not boundary:
                     boundary = "No verbatim evidence quote found; treat as unverified until sourced."
 
-            fact_id = f"fact_{idx:03d}"
-            verified_facts.append(VerifiedFact(
-                fact_id=fact_id,
-                statement=statement,
-                category=_clean(str(item.get("category") or "company_capability")),
-                evidence_type=ev_type,
-                evidence_ids=[ev_id] if ev_id else [],
-                confidence=confidence,
-                status="verified" if has_evidence else "inconclusive",
-                wording_boundary=boundary if boundary else None,
-            ))
+            fact_id = f"fact_model_{idx:03d}"
+            verified_facts.append(
+                VerifiedFact(
+                    fact_id=fact_id,
+                    statement=statement,
+                    category=_clean(str(item.get("category") or "company_capability")),
+                    evidence_type=ev_type,
+                    evidence_ids=[ev_id] if ev_id else [],
+                    confidence=confidence,
+                    status="verified" if has_evidence else "inconclusive",
+                    wording_boundary=boundary if boundary else None,
+                )
+            )
 
         # Add checked facts if LLM verified_facts was sparse
         if not verified_facts:
-            for idx, f in enumerate(checked_guide.can_write, start=1):
+            for f in checked_guide.can_write:
                 ev_ids_f = checked_fact_ev_map.get(f.fact_id, [])
-                fact_id = f"fact_{idx:03d}"
-                verified_facts.append(VerifiedFact(
-                    fact_id=fact_id,
-                    statement=f.claim,
-                    category="company_capability",
-                    evidence_type="company_website",
-                    evidence_ids=ev_ids_f,
-                    confidence="high" if ev_ids_f else "low",
-                    status="verified" if ev_ids_f else "inconclusive",
-                ))
-            offset = len(verified_facts)
-            for idx, l in enumerate(checked_guide.can_write_with_limits, start=offset + 1):
-                ev_ids_l = checked_fact_ev_map.get(l.fact_id, [])
-                fact_id = f"fact_{idx:03d}"
-                verified_facts.append(VerifiedFact(
-                    fact_id=fact_id,
-                    statement=l.statement,
-                    category="company_capability",
-                    evidence_type="company_website",
-                    evidence_ids=ev_ids_l,
-                    confidence="medium" if ev_ids_l else "low",
-                    status="verified" if ev_ids_l else "inconclusive",
-                    wording_boundary=l.wording_limit,
-                ))
+                verified_facts.append(
+                    VerifiedFact(
+                        fact_id=f.fact_id,
+                        statement=f.claim,
+                        category="company_capability",
+                        evidence_type="company_website",
+                        evidence_ids=ev_ids_f,
+                        confidence="high" if ev_ids_f else "low",
+                        status="verified" if ev_ids_f else "inconclusive",
+                    )
+                )
+            for limited_fact in checked_guide.can_write_with_limits:
+                ev_ids_l = checked_fact_ev_map.get(limited_fact.fact_id, [])
+                verified_facts.append(
+                    VerifiedFact(
+                        fact_id=limited_fact.fact_id,
+                        statement=limited_fact.statement,
+                        category="company_capability",
+                        evidence_type="company_website",
+                        evidence_ids=ev_ids_l,
+                        confidence="medium" if ev_ids_l else "low",
+                        status="verified" if ev_ids_l else "inconclusive",
+                        wording_boundary=limited_fact.wording_limit,
+                    )
+                )
 
         # Fix B (post-fact): Re-link LLM-emitted facts to checked_fact_ev_map evidence.
         # The LLM may emit a fact whose statement matches a checked claim; re-use those
@@ -1000,9 +1058,12 @@ Rules:
         checked_claim_norms = {
             _norm(f.claim): checked_fact_ev_map.get(f.fact_id, []) for f in checked_guide.can_write
         }
-        checked_claim_norms.update({
-            _norm(l.statement): checked_fact_ev_map.get(l.fact_id, []) for l in checked_guide.can_write_with_limits
-        })
+        checked_claim_norms.update(
+            {
+                _norm(limited_fact.statement): checked_fact_ev_map.get(limited_fact.fact_id, [])
+                for limited_fact in checked_guide.can_write_with_limits
+            }
+        )
         for vf in verified_facts:
             if not vf.evidence_ids:
                 match_ev = checked_claim_norms.get(_norm(vf.statement), [])
@@ -1017,7 +1078,7 @@ Rules:
                 ev_to_fact_ids.setdefault(eid, []).append(vf.fact_id)
 
         for sub in candidate_subtopics:
-            linked_facts = set(sub.verified_fact_ids)
+            linked_facts: set[str] = set()
             for eid in sub.evidence_ids:
                 for fid in ev_to_fact_ids.get(eid, []):
                     linked_facts.add(fid)
@@ -1044,45 +1105,38 @@ Rules:
             missing_claim = _clean(str(item.get("missing_claim") or ""))
             # Derive affects_subtopic_ids by matching gap topic against subtopic titles
             raw_affects = item.get("affects_subtopic_ids") or []
-            affects: list[str] = [
-                sid for sid in _string_list(raw_affects) if sid.startswith("subtopic_")
-            ]
+            affects: list[str] = [sid for sid in _string_list(raw_affects) if sid.startswith("subtopic_")]
             # Also auto-link if gap topic words appear in any subtopic title
             if not affects:
                 t_words = set(t_or_q.lower().split())
                 for title_lc, sid in subtopic_title_map.items():
                     if len(t_words & set(title_lc.split())) >= 2:
                         affects.append(sid)
-            research_gaps.append(ResearchGap(
-                gap_id=f"gap_{idx:03d}",
-                topic_or_question=t_or_q,
-                missing_claim=missing_claim or t_or_q,
-                reason=_clean(str(item.get("reason") or "Evidence inconclusive")),
-                suggested_search_direction=_clean(str(item.get("suggested_search_direction") or "")) or None,
-                affects_subtopic_ids=affects,
-            ))
+            research_gaps.append(
+                ResearchGap(
+                    gap_id=f"gap_{idx:03d}",
+                    topic_or_question=t_or_q,
+                    missing_claim=missing_claim or t_or_q,
+                    reason=_clean(str(item.get("reason") or "Evidence inconclusive")),
+                    suggested_search_direction=_clean(str(item.get("suggested_search_direction") or ""))
+                    or None,
+                    affects_subtopic_ids=affects,
+                )
+            )
 
-        # Fix 5: Also add unverified checked gaps with specific missing_claim
-        for item in checked_guide.cannot_write:
-            if "not establish" in item.reason.lower() or "further research" in item.reason.lower():
-                topic = item.claim_or_topic
-                affects_auto = [
-                    sub.subtopic_id for sub in candidate_subtopics
-                    if any(w in sub.title.lower() for w in topic.lower().split() if len(w) > 4)
-                ]
-                research_gaps.append(ResearchGap(
-                    gap_id=f"gap_{len(research_gaps) + 1:03d}",
-                    topic_or_question=topic,
-                    missing_claim=f"Verified evidence that {topic}",
-                    reason=item.reason,
-                    suggested_search_direction=f"Search company documentation or partner publications for {topic}",
-                    affects_subtopic_ids=affects_auto,
-                ))
+        seen_gap_claims = {_norm(gap.missing_claim or gap.topic_or_question) for gap in research_gaps}
+        for gap in checked_guide.information_still_needed:
+            key = _norm(gap.missing_claim or gap.topic_or_question)
+            if key and key not in seen_gap_claims:
+                research_gaps.append(gap.model_copy(update={"gap_id": f"gap_{len(research_gaps) + 1:03d}"}))
+                seen_gap_claims.add(key)
 
         # 5. Parse limitations
         limitations: list[str] = _string_list(data.get("limitations"))
         for standing in _STANDING_BANS:
-            limitations.append(f"Do not use superlative claims such as '{standing}' without verified primary certification.")
+            limitations.append(
+                f"Do not use superlative claims such as '{standing}' without verified primary certification."
+            )
         for lim in _LIMITATIONS:
             if lim not in limitations:
                 limitations.append(lim)
@@ -1096,42 +1150,40 @@ Rules:
         legacy_topics: list[EvidenceBackedTopic] = []
         for sub in candidate_subtopics:
             sub_ev = [ev for ev in evidence_items if ev.evidence_id in sub.evidence_ids]
-            legacy_topics.append(EvidenceBackedTopic(
-                topic=sub.title,
-                description=sub.description,
-                evidence_fact_ids=sub.verified_fact_ids,  # fact_xxx only
-                supporting_quotes=[e.quote for e in sub_ev],
-                source_urls=[e.url for e in sub_ev],
-            ))
+            legacy_topics.append(
+                EvidenceBackedTopic(
+                    topic=sub.title,
+                    description=sub.description,
+                    evidence_fact_ids=sub.verified_fact_ids,  # fact_xxx only
+                    supporting_quotes=[e.quote for e in sub_ev],
+                    source_urls=[e.url for e in sub_ev],
+                )
+            )
 
-        potential_headings = [f"H2: {sub.title}" for sub in candidate_subtopics]
-        structured_headings = [
-            HeadingItem(level="H2", text=sub.title, intent_hint=sub.description)
-            for sub in candidate_subtopics
-        ]
-        related_topics = [
-            q for sub in candidate_subtopics for q in sub.suggested_questions[:2]
-        ]
-
-        main_topic = _clean(str(data.get("main_topic") or understanding.get("main_topic") or context.original_prompt))
-        search_intent = _clean(str(data.get("search_intent") or understanding.get("search_intent") or context.prompt_understanding.intent))
-        target_audience = _clean(str(data.get("target_audience") or understanding.get("target_audience") or context.prompt_understanding.audience or "Industry professionals"))
+        main_topic = _clean(
+            str(data.get("main_topic") or understanding.get("main_topic") or context.original_prompt)
+        )
+        search_intent = _clean(
+            str(
+                data.get("search_intent")
+                or understanding.get("search_intent")
+                or context.prompt_understanding.intent
+            )
+        )
+        target_audience = _clean(
+            str(
+                data.get("target_audience")
+                or understanding.get("target_audience")
+                or context.prompt_understanding.audience
+                or "Industry professionals"
+            )
+        )
         prompt_scope = str(data.get("prompt_scope") or understanding.get("prompt_scope") or "hybrid")
 
         # ----------------------------------------------------------------
         # Build clean Agent 4 handoff — single canonical object, no dupes
         # ----------------------------------------------------------------
         # Editorial constraints: standing bans + per-claim limits
-        editorial_constraints: list[str] = [
-            "Do not make unsupported superiority claims.",
-            "Do not present research-use capabilities as diagnostic services.",
-            "Do not treat missing evidence as proof that a capability does not exist.",
-            "Use only claims supported by their cited evidence.",
-        ]
-        for lim in limitations:
-            if lim not in editorial_constraints:
-                editorial_constraints.append(lim)
-
         # target_audience as list for Agent 4
         raw_audience = understanding.get("target_audience") or context.prompt_understanding.audience or ""
         if isinstance(raw_audience, list):
@@ -1145,11 +1197,9 @@ Rules:
         # A claim already narrowly supported under can_write_with_limits must NOT appear
         # as a blanket prohibition. Only store the broader extension that is prohibited.
         limited_claim_norms: set[str] = {
-            _norm(l.statement) for l in checked_guide.can_write_with_limits
+            _norm(limited_fact.statement) for limited_fact in checked_guide.can_write_with_limits
         }
-        raw_prohibited = [
-            item.claim_or_topic for item in checked_guide.cannot_write
-        ] + banned
+        raw_prohibited = [item.claim_or_topic for item in checked_guide.cannot_write] + banned
         deduped_prohibited: list[str] = []
         for claim in raw_prohibited:
             if _norm(claim) not in limited_claim_norms:
@@ -1158,9 +1208,8 @@ Rules:
         # Fix E: Drop research gaps that are already resolved by verified facts.
         # A gap is resolved if its missing_claim text substantially overlaps with a
         # verified fact's statement that has at least one evidence_id.
-        resolved_norms: set[str] = {
-            _norm(vf.statement) for vf in verified_facts if vf.evidence_ids
-        }
+        resolved_norms: set[str] = {_norm(vf.statement) for vf in verified_facts if vf.evidence_ids}
+
         def _gap_is_resolved(gap: ResearchGap) -> bool:
             mc_norm = _norm(gap.missing_claim)
             # Consider resolved if >=3 words match a verified fact norm
@@ -1169,6 +1218,7 @@ Rules:
                 if len(mc_words & set(fact_norm.split())) >= 3:
                     return True
             return False
+
         research_gaps = [g for g in research_gaps if not _gap_is_resolved(g)]
         # Re-number gap IDs after filtering
         for i, g in enumerate(research_gaps, start=1):
@@ -1178,7 +1228,9 @@ Rules:
         # Clean Agent 3 Research Result & Agent 4 Handoff (no duplicates)
         # ----------------------------------------------------------------
         brief_topic = main_topic or context.original_prompt
-        brief_audience = target_audience or (", ".join(audience_list) if audience_list else "Biopharma companies, CROs, and research organizations")
+        brief_audience = target_audience or (
+            ", ".join(audience_list) if audience_list else "Industry professionals"
+        )
         brief_intent = search_intent or f"Understand capabilities, platforms, and services for {brief_topic}"
 
         # 1. Relevant findings (clean researched claims with source URLs and verification status)
@@ -1191,11 +1243,7 @@ Rules:
                 continue
             seen_claims.add(st)
             urls = [ev.url for ev in evidence_items if ev.evidence_id in vf.evidence_ids and ev.url]
-            status = (
-                "verified"
-                if vf.evidence_ids and vf.status == "verified"
-                else "needs_human_review"
-            )
+            status = "verified" if vf.evidence_ids and vf.status == "verified" else "needs_human_review"
             relevant_findings.append(
                 CompanyTalkingPoint(
                     claim=st,
@@ -1210,11 +1258,7 @@ Rules:
                 continue
             seen_claims.add(st)
             evidence_ids = checked_fact_ev_map.get(cw.fact_id, [])
-            urls = [
-                ev.url
-                for ev in evidence_items
-                if ev.evidence_id in evidence_ids and ev.url
-            ]
+            urls = [ev.url for ev in evidence_items if ev.evidence_id in evidence_ids and ev.url]
             relevant_findings.append(
                 CompanyTalkingPoint(
                     claim=st,
@@ -1233,32 +1277,21 @@ Rules:
                 CompanyTalkingPoint(
                     claim=st,
                     source_urls=[
-                        ev.url
-                        for ev in evidence_items
-                        if ev.evidence_id in evidence_ids and ev.url
+                        ev.url for ev in evidence_items if ev.evidence_id in evidence_ids and ev.url
                     ],
-                    verification_status=(
-                        "verified" if evidence_ids else "needs_human_review"
-                    ),
+                    verification_status=("verified" if evidence_ids else "needs_human_review"),
                 )
             )
 
         # 2. Boundaries (clean, practical rules)
-        boundaries: list[str] = [
-            "Use evidence to support company-specific claims.",
-            f"Distinguish {client_name}'s capabilities from partner capabilities.",
-            "Do not invent technical specifications, certifications, or performance metrics.",
-            "Flag claims that need further research or human verification.",
-        ]
-        for warning in self._warnings:
-            if warning not in boundaries:
-                boundaries.append(warning)
+        boundaries = _handoff_boundaries(
+            client_name,
+            deduped_prohibited,
+            self._warnings,
+        )
 
         # 3. Filtered candidate subtopics
-        filtered_subtopics = [
-            sub for sub in candidate_subtopics
-            if sub.support_status != "unsupported"
-        ]
+        filtered_subtopics = [sub for sub in candidate_subtopics if sub.support_status != "unsupported"]
 
         # 4. Canonical research handoff for Agent 4
         agent4_handoff = Agent4HandoffPackage(
@@ -1270,7 +1303,7 @@ Rules:
             evidence=evidence_items,
             information_still_needed=research_gaps,
             candidate_subtopics=filtered_subtopics,
-            boundaries=boundaries,
+            boundaries=list(dict.fromkeys(boundaries)),
             company=CompanyInfo(
                 name=client_name,
                 website=f"https://{client_host}",
@@ -1335,7 +1368,11 @@ Rules:
             claim_type = str(item.get("claim_type") or "").strip().lower()
             if claim_type not in _CLAIM_TYPES:
                 claim_type = "geographic_service_availability" if axis == "geography" else "other"
-            relevance = str(item.get("relevance_to_original_prompt") or item.get("relevance") or "medium").strip().lower()
+            relevance = (
+                str(item.get("relevance_to_original_prompt") or item.get("relevance") or "medium")
+                .strip()
+                .lower()
+            )
             if relevance not in _RELEVANCE:
                 relevance = "medium"
             topic_relevance = str(item.get("relevance_to_topic") or "medium").strip().lower()
@@ -1345,14 +1382,16 @@ Rules:
             if not claim or key in seen or _is_superlative(claim):
                 continue
             seen.add(key)
-            questions.append({
-                "topic": topic,
-                "claim": claim,
-                "claim_type": claim_type,
-                "relevance": relevance,
-                "relevance_to_topic": topic_relevance,
-                "checked_from": "prompt",
-            })
+            questions.append(
+                {
+                    "topic": topic,
+                    "claim": claim,
+                    "claim_type": claim_type,
+                    "relevance": relevance,
+                    "relevance_to_topic": topic_relevance,
+                    "checked_from": "prompt",
+                }
+            )
         if not questions:
             raise RuntimeError("Agent 3 did not produce any capability questions.")
         return questions
@@ -1373,7 +1412,10 @@ Rules:
         usable = [item for item in checked if item["support"] != "none"]
         retrieved = [page["url"] for page in first_pages]
         search_failed = first_failed and not first_pages
-        if not usable:
+        has_full_first_party = any(
+            item["support"] == "full" and _host(item["url"]) == client_host for item in checked
+        )
+        if not has_full_first_party:
             web_pages, web_failed = self._collect_optional_pages(
                 claim, client_host, client_name, first_party=False
             )
@@ -1425,7 +1467,7 @@ JSON only."""
                 "Agent 3 content-opportunity assessment failed (%s).",
                 type(exc).__name__,
             )
-            self._warnings.append(
+            self._add_warning(
                 "Content-opportunity assessment failed; original opportunities were treated as unverified."
             )
             data = {}
@@ -1449,15 +1491,17 @@ JSON only."""
                 relevance = "medium"
             if topic_relevance not in _RELEVANCE:
                 topic_relevance = "medium"
-            claims.append({
-                "topic": topic,
-                "claim": claim,
-                "claim_type": claim_type,
-                "relevance": relevance,
-                "relevance_to_topic": topic_relevance,
-                "checked_from": "content_opportunity",
-                "opportunity": opportunity,
-            })
+            claims.append(
+                {
+                    "topic": topic,
+                    "claim": claim,
+                    "claim_type": claim_type,
+                    "relevance": relevance,
+                    "relevance_to_topic": topic_relevance,
+                    "checked_from": "content_opportunity",
+                    "opportunity": opportunity,
+                }
+            )
         return claims
 
     def _collect_pages(
@@ -1492,10 +1536,7 @@ JSON only."""
         return pages, False
 
     def _read_pages(self, claim: str, client_name: str, pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        packed = [
-            {"url": page["url"], "text": page["text"][:PAGE_CHARS]}
-            for page in pages
-        ]
+        packed = [{"url": page["url"], "text": page["text"][:PAGE_CHARS]} for page in pages]
         system = """You check one capability claim against supplied page text.
 Return one JSON object:
 {"pages":[{"url":"","support":"full|partial|contradicts|none","quote":"","narrow_statement":"","wording_limit":""}]}
@@ -1522,7 +1563,7 @@ Rules:
                 "Agent 3 evidence assessment failed (%s) for one claim.",
                 type(exc).__name__,
             )
-            self._warnings.append(
+            self._add_warning(
                 "One optional evidence assessment failed; the affected claim was left unresolved."
             )
             return []
@@ -1539,14 +1580,16 @@ Rules:
             quote = str(item.get("quote") or "")
             if support not in {"full", "partial", "contradicts"} or not _quote_in_page(quote, page["text"]):
                 continue
-            checked.append({
-                "support": support,
-                "quote": _clean(quote),
-                "url": url,
-                "published": page["published"],
-                "narrow_statement": _clean(str(item.get("narrow_statement") or "")),
-                "wording_limit": _clean(str(item.get("wording_limit") or "")),
-            })
+            checked.append(
+                {
+                    "support": support,
+                    "quote": _clean(quote),
+                    "url": url,
+                    "published": page["published"],
+                    "narrow_statement": _clean(str(item.get("narrow_statement") or "")),
+                    "wording_limit": _clean(str(item.get("wording_limit") or "")),
+                }
+            )
         return checked
 
     def _complete(self, system: str, payload: dict[str, Any], max_tokens: int) -> dict[str, Any]:
@@ -1610,20 +1653,66 @@ def _apply(
     contradictions = [hit for hit in hits if hit["support"] == "contradicts"]
     extra_bans: list[str] = []
 
+    supporting_hits = full_first + partial_first + full_other + partial_other
+    if contradictions and supporting_hits:
+        reason = (
+            "Conflicting retrieved evidence includes both support for and a direct "
+            "contradiction of this claim. Further research and human review are required."
+        )
+        return _unresolved(
+            fact_id,
+            topic,
+            claim,
+            claim_type,
+            relevance,
+            topic_relevance,
+            checked_from,
+            "research_more",
+            "inconclusive",
+            reason,
+            supporting_hits + contradictions,
+            [claim],
+            gap=True,
+            asked_claim=claim,
+        )
+
     if _is_superlative(claim) and not full_first:
         return _unresolved(
-            fact_id, topic, claim, claim_type, relevance, topic_relevance, checked_from,
-            "do_not_write", "inconclusive",
+            fact_id,
+            topic,
+            claim,
+            claim_type,
+            relevance,
+            topic_relevance,
+            checked_from,
+            "do_not_write",
+            "inconclusive",
             "Superlatives are not allowed without a first-party quote.",
-            contradictions, extra_bans + [claim], gap=False, asked_claim=claim,
+            contradictions,
+            extra_bans + [claim],
+            gap=False,
+            asked_claim=claim,
         )
 
     if full_first:
         hit = full_first[0]
         if _safe_narrow(claim, hit["quote"], claim):
             return _supported(
-                fact_id, topic, claim, claim_type, relevance, topic_relevance, checked_from,
-                "verified", "high", "write", hit, None, claim, None, claim,
+                fact_id,
+                topic,
+                claim,
+                claim_type,
+                relevance,
+                topic_relevance,
+                checked_from,
+                "verified",
+                "high",
+                "write",
+                hit,
+                None,
+                claim,
+                None,
+                claim,
             )
         full_first = []
         partial_first = [hit, *partial_first]
@@ -1631,11 +1720,27 @@ def _apply(
         hit = full_other[0]
         if _safe_narrow(claim, hit["quote"], claim):
             return _supported(
-                fact_id, topic, claim, claim_type, relevance, topic_relevance, checked_from,
-                "verified", "medium", "write_limited", hit, None, claim,
-                "Only a third-party page supports this.", claim,
+                fact_id,
+                topic,
+                claim,
+                claim_type,
+                relevance,
+                topic_relevance,
+                checked_from,
+                "verified",
+                "medium",
+                "write_limited",
+                hit,
+                None,
+                claim,
+                "Only a third-party page supports this.",
+                claim,
             )
-    if partial_first or partial_other or (full_other and not _safe_narrow(claim, full_other[0]["quote"], claim)):
+    if (
+        partial_first
+        or partial_other
+        or (full_other and not _safe_narrow(claim, full_other[0]["quote"], claim))
+    ):
         hit = (partial_first or partial_other or full_other)[0]
         narrow = _safe_narrow(hit["narrow_statement"], hit["quote"], claim)
         if narrow is None:
@@ -1643,28 +1748,72 @@ def _apply(
         mismatch = _mismatch_reason(claim, hit["quote"])
         if narrow and narrow.lower() != claim.lower():
             return _supported(
-                fact_id, topic, narrow, claim_type, relevance, topic_relevance, checked_from,
-                "verified", "high" if is_first(hit) else "medium", "write_limited", hit, None, narrow,
-                mismatch or "State only what the quote supports.", claim,
+                fact_id,
+                topic,
+                narrow,
+                claim_type,
+                relevance,
+                topic_relevance,
+                checked_from,
+                "verified",
+                "high" if is_first(hit) else "medium",
+                "write_limited",
+                hit,
+                None,
+                narrow,
+                mismatch or "State only what the quote supports.",
+                claim,
             )
         if mismatch:
             return _unresolved(
-                fact_id, topic, claim, claim_type, relevance, topic_relevance, checked_from,
-                "do_not_write", "inconclusive", mismatch, [hit], extra_bans, gap=False, asked_claim=claim,
+                fact_id,
+                topic,
+                claim,
+                claim_type,
+                relevance,
+                topic_relevance,
+                checked_from,
+                "do_not_write",
+                "inconclusive",
+                mismatch,
+                [hit],
+                extra_bans,
+                gap=False,
+                asked_claim=claim,
             )
         return _unresolved(
-            fact_id, topic, claim, claim_type, relevance, topic_relevance, checked_from,
-            "research_more", "inconclusive",
+            fact_id,
+            topic,
+            claim,
+            claim_type,
+            relevance,
+            topic_relevance,
+            checked_from,
+            "research_more",
+            "inconclusive",
             "The evidence reviewed does not establish this claim. Further research is required.",
-            [], extra_bans, gap=True, asked_claim=claim,
+            [],
+            extra_bans,
+            gap=True,
+            asked_claim=claim,
         )
     if contradictions:
         extra_bans.append(claim)
         return _unresolved(
-            fact_id, topic, claim, claim_type, relevance, topic_relevance, checked_from,
-            "do_not_write", "contradicted",
+            fact_id,
+            topic,
+            claim,
+            claim_type,
+            relevance,
+            topic_relevance,
+            checked_from,
+            "do_not_write",
+            "contradicted",
             "A retrieved page says otherwise.",
-            contradictions, extra_bans, gap=False, asked_claim=claim,
+            contradictions,
+            extra_bans,
+            gap=False,
+            asked_claim=claim,
         )
     reason = "The evidence reviewed does not establish this claim. Further research is required."
     if search_failed:
@@ -1672,8 +1821,20 @@ def _apply(
     elif retrieved_urls:
         reason = f"A page was retrieved, but it did not contain a quote that establishes this claim. {retrieved_urls[0]}"
     return _unresolved(
-        fact_id, topic, claim, claim_type, relevance, topic_relevance, checked_from,
-        "research_more", "inconclusive", reason, [], extra_bans, gap=True, asked_claim=claim,
+        fact_id,
+        topic,
+        claim,
+        claim_type,
+        relevance,
+        topic_relevance,
+        checked_from,
+        "research_more",
+        "inconclusive",
+        reason,
+        [],
+        extra_bans,
+        gap=True,
+        asked_claim=claim,
     )
 
 
@@ -1720,7 +1881,8 @@ def _supported(
     if asked_claim.lower() != claim.lower():
         blocked = DoNotWrite(
             claim_or_topic=asked_claim,
-            reason=wording_limit or "The quote supports a narrower statement and does not establish this broader claim.",
+            reason=wording_limit
+            or "The quote supports a narrower statement and does not establish this broader claim.",
         )
     return CheckedClaim(fact, verdict, blocked, [], None, statement, wording_limit, asked_claim)
 
@@ -1758,7 +1920,14 @@ def _unresolved(
     research = UnresolvedClaim(claim=asked, reason=reason) if gap else None
     blocked = DoNotWrite(claim_or_topic=asked, reason=reason) if decision == "do_not_write" else None
     return CheckedClaim(
-        fact, verdict, blocked, extra_bans, research, None, None, asked,
+        fact,
+        verdict,
+        blocked,
+        extra_bans,
+        research,
+        None,
+        None,
+        asked,
     )
 
 
@@ -1784,7 +1953,14 @@ def _apply_target(question: dict[str, str], checked: CheckedClaim) -> CheckedCla
     fact = checked.fact.model_copy(update={"reason": reason})
     verdict = checked.verdict.model_copy(update={"decision": "do_not_write", "reason": reason})
     return CheckedClaim(
-        fact, verdict, DoNotWrite(claim_or_topic=fact.claim, reason=reason), checked.extra_bans, None, None, None, checked.asked_claim,
+        fact,
+        verdict,
+        DoNotWrite(claim_or_topic=fact.claim, reason=reason),
+        checked.extra_bans,
+        None,
+        None,
+        None,
+        checked.asked_claim,
     )
 
 
@@ -1835,7 +2011,9 @@ def _safe_narrow(statement: str, quote: str, claim: str) -> str | None:
         return None
     if _mismatch_reason(claim, quote) and _same_claim(statement, claim):
         return None
-    words = [word for word in re.findall(r"[a-z0-9]+", statement.lower()) if len(word) > 3 and word not in _STOP]
+    words = [
+        word for word in re.findall(r"[a-z0-9]+", statement.lower()) if len(word) > 3 and word not in _STOP
+    ]
     if not words:
         return None
     quote_l = quote.lower()
@@ -1854,9 +2032,11 @@ def _mismatch_reason(claim: str, quote: str) -> str | None:
         "under 8 hours" in quote_l or "under 15 hours" in quote_l or "service provider for" in quote_l
     ):
         return "The quote describes instrument runtime or a customer installation, not the company's own locations or faster service."
-    named = [item for item in ("clia", "gclp", "cap") if item in claim_l]
-    if named and not any(item in quote_l for item in named):
-        if "iso" in quote_l:
+    certifications = ("clia", "gclp", "cap", "iso")
+    named = [item for item in certifications if re.search(rf"(?<!\w){item}(?!\w)", claim_l)]
+    quoted = {item for item in certifications if re.search(rf"(?<!\w){item}(?!\w)", quote_l)}
+    if named and not set(named) & quoted:
+        if "iso" in quoted:
             return "The quote supports a different certification from the one claimed."
         return "The quote does not establish the named certification."
     return None
@@ -1866,11 +2046,29 @@ def _scope_note(context: PromptContext) -> ScopeNote:
     prompt = context.original_prompt
     topic = context.prompt_understanding.topic.strip() or None
     note = None
-    if topic and "north america" in topic.lower() and "north america" not in prompt.lower():
-        note = "North America is answer-derived from the stored AI answers. It is not part of the original prompt."
-    elif topic and topic.lower() not in prompt.lower():
+    if topic and topic.lower() not in prompt.lower():
         note = "The topic adds wording that is not in the original prompt. The original prompt is unchanged."
     return ScopeNote(original_prompt=prompt, inferred_topic=topic, scope_note=note)
+
+
+def _handoff_boundaries(
+    client_name: str,
+    prohibited_claims: list[str],
+    warnings: list[str],
+) -> list[str]:
+    boundaries = [
+        "Use evidence to support company-specific claims.",
+        f"Distinguish {client_name}'s capabilities from partner capabilities.",
+        "Do not invent technical specifications, certifications, or performance metrics.",
+        "Flag claims that need further research or human verification.",
+    ]
+    boundaries.extend(
+        f"Do not make this unsupported or prohibited claim: {claim.strip()}"
+        for claim in prohibited_claims
+        if claim.strip()
+    )
+    boundaries.extend(warnings)
+    return list(dict.fromkeys(boundaries))
 
 
 def _collapse(
@@ -1883,9 +2081,16 @@ def _collapse(
     blocks = [checked.block] if checked.block else []
     gaps = [checked.gap] if checked.gap else []
     from_prompt = False
+    group_has_conflict = any(
+        pair[1].fact.status == "contradicted"
+        or "conflicting retrieved evidence" in (pair[1].fact.reason or "").casefold()
+        for pair in group
+    )
     opportunities: list[dict[str, str]] = []
     for question, other in group:
-        from_prompt = from_prompt or question.get("checked_from") == "prompt" or other.fact.checked_from == "prompt"
+        from_prompt = (
+            from_prompt or question.get("checked_from") == "prompt" or other.fact.checked_from == "prompt"
+        )
         if question.get("checked_from") == "content_opportunity":
             opportunities.append(question)
         if other.fact.fact_id == checked.fact.fact_id:
@@ -1898,14 +2103,44 @@ def _collapse(
             key = (item.url, item.quote)
             if key in seen:
                 continue
-            if checked.fact.status == "verified" and not _safe_narrow(checked.fact.claim, item.quote, checked.asked_claim):
+            if (
+                checked.fact.status == "verified"
+                and not group_has_conflict
+                and not _safe_narrow(checked.fact.claim, item.quote, checked.asked_claim)
+            ):
                 continue
             seen.add(key)
             evidence.append(item)
-    fact = checked.fact.model_copy(update={
-        "evidence": evidence,
-        "checked_from": "prompt" if from_prompt else "content_opportunity",
-    })
+
+    conflicting_pairs = [
+        pair
+        for pair in group
+        if pair[1].fact.status == "contradicted"
+        or "conflicting retrieved evidence" in (pair[1].fact.reason or "").casefold()
+    ]
+    if conflicting_pairs:
+        reason = (
+            "Conflicting retrieved evidence includes both support for and a direct "
+            "contradiction of this claim. Further research and human review are required."
+        )
+        fact = checked.fact.model_copy(
+            update={
+                "status": "inconclusive",
+                "reason": reason,
+                "evidence": evidence,
+                "checked_from": "prompt" if from_prompt else "content_opportunity",
+            }
+        )
+        verdict = checked.verdict.model_copy(update={"decision": "research_more", "reason": reason})
+        gap = UnresolvedClaim(claim=checked.asked_claim, reason=reason)
+        return checked._replace(fact=fact, verdict=verdict, block=None, gap=gap), opportunities
+
+    fact = checked.fact.model_copy(
+        update={
+            "evidence": evidence,
+            "checked_from": "prompt" if from_prompt else "content_opportunity",
+        }
+    )
     block = next((item for item in blocks if item), None)
     gap = None if fact.status == "verified" else next((item for item in gaps if item), None)
     return checked._replace(fact=fact, block=block, gap=gap), opportunities
@@ -1940,13 +2175,9 @@ def _assemble(
     pairs: list[tuple[dict[str, str], CheckedClaim]],
     banned: list[str],
 ) -> GroundTruthGuide:
-    prompt = context.original_prompt.lower()
     adjusted: list[tuple[dict[str, str], CheckedClaim]] = []
     for question, checked in pairs:
         fact = checked.fact
-        if "north america" in fact.claim.lower() and "north america" not in prompt:
-            fact = fact.model_copy(update={"relevance_to_original_prompt": "low"})
-            checked = checked._replace(fact=fact)
         adjusted.append((question, checked))
     merged = _merge_pairs(adjusted)
     can_write: list[Fact] = []
@@ -1954,42 +2185,55 @@ def _assemble(
     blocked: list[DoNotWrite] = []
     for checked, _opportunity_questions in merged:
         fact = checked.fact
-        on_target = fact.relevance_to_original_prompt in {"high", "medium"} or fact.relevance_to_topic in {"high", "medium"}
+        on_target = fact.relevance_to_original_prompt in {"high", "medium"} or fact.relevance_to_topic in {
+            "high",
+            "medium",
+        }
         narrowed = checked.asked_claim.lower() != fact.claim.lower()
         if fact.status == "verified" and on_target and checked.verdict.decision == "write" and not narrowed:
             can_write.append(fact)
             continue
         if fact.status == "verified" and on_target and checked.verdict.decision in {"write", "write_limited"}:
-            limited.append(LimitedStatement(
-                fact_id=fact.fact_id,
-                statement=fact.claim,
-                wording_limit=checked.wording_limit or (checked.block.reason if checked.block else "State only what the quote supports."),
-                evidence=fact.evidence,
-                confidence=fact.confidence,
-                relevance_to_original_prompt=fact.relevance_to_original_prompt,
-                relevance_to_topic=fact.relevance_to_topic,
-            ))
+            limited.append(
+                LimitedStatement(
+                    fact_id=fact.fact_id,
+                    statement=fact.claim,
+                    wording_limit=checked.wording_limit
+                    or (checked.block.reason if checked.block else "State only what the quote supports."),
+                    evidence=fact.evidence,
+                    confidence=fact.confidence,
+                    relevance_to_original_prompt=fact.relevance_to_original_prompt,
+                    relevance_to_topic=fact.relevance_to_topic,
+                )
+            )
             if narrowed:
-                blocked.append(DoNotWrite(
-                    claim_or_topic=checked.asked_claim,
-                    reason=checked.wording_limit or "The quote supports a narrower statement.",
-                ))
+                blocked.append(
+                    DoNotWrite(
+                        claim_or_topic=checked.asked_claim,
+                        reason=checked.wording_limit or "The quote supports a narrower statement.",
+                    )
+                )
             continue
-        reason = checked.verdict.reason or fact.reason or "The evidence reviewed does not establish this claim."
+        reason = (
+            checked.verdict.reason or fact.reason or "The evidence reviewed does not establish this claim."
+        )
         blocked.append(DoNotWrite(claim_or_topic=checked.asked_claim, reason=reason))
-    write_numbered = [
-        fact.model_copy(update={"fact_id": f"fact_{index:03d}"})
-        for index, fact in enumerate(can_write, start=1)
-    ]
-    limit_numbered = [
-        item.model_copy(update={"fact_id": f"limit_{index:03d}"})
-        for index, item in enumerate(limited, start=1)
+    gaps = _unique_unresolved([checked.gap for checked, _ in merged if checked.gap is not None])
+    research_gaps = [
+        ResearchGap(
+            gap_id=f"gap_{index:03d}",
+            topic_or_question=gap.claim,
+            missing_claim=gap.claim,
+            reason=gap.reason,
+        )
+        for index, gap in enumerate(gaps, start=1)
     ]
     return GroundTruthGuide(
         scope=_scope_note(context),
-        can_write=write_numbered,
-        can_write_with_limits=limit_numbered,
+        can_write=can_write,
+        can_write_with_limits=limited,
         cannot_write=_unique_blocks(blocked),
+        information_still_needed=research_gaps,
         banned_claims=banned,
         limitations=list(_LIMITATIONS),
     )

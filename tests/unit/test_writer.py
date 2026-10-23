@@ -779,6 +779,36 @@ def test_writer_retries_truncated_response_with_larger_token_limit():
     assert token_limits == [11000, 22000]
 
 
+def test_writer_normalizes_invalid_claim_support_status_without_calling_it_supported():
+    output = _writer_output().model_dump(mode="json")
+    output["claims_used"][0]["support_status"] = "verified"
+
+    class FakeMessages:
+        @staticmethod
+        def stream(**_kwargs):
+            return _FakeMessageStream(
+                SimpleNamespace(
+                    stop_reason="end_turn",
+                    content=[
+                        SimpleNamespace(type="text", text=json.dumps(output)),
+                    ],
+                )
+            )
+
+    agent = WriterAgent.__new__(WriterAgent)
+    agent.client = SimpleNamespace(messages=FakeMessages())
+    agent.model = "test"
+    agent.max_tokens = 1000
+
+    result = agent._generate_output("test prompt")
+
+    assert result.claims_used[0].support_status == "not_assessed"
+    assert any(
+        "invalid support_status 'verified'" in item and "set to not_assessed" in item
+        for item in result.unresolved_items
+    )
+
+
 def test_writer_reports_when_retry_is_still_truncated():
     token_limits = []
 

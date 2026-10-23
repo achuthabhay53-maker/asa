@@ -2,20 +2,32 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from aca.agents.ground_truth import (
     GroundTruthAgent,
+    CheckedClaim,
     _EvidenceRegistry,
+    _apply,
+    _assemble,
+    _is_superlative,
+    _handoff_boundaries,
+    _merge_pairs,
+    _mismatch_reason,
+    _scope_note,
     build_prompt_context,
 )
 from aca.models.ground_truth import (
     CandidateSubtopic,
     ClientInput,
+    Evidence,
     EvidenceItem,
+    Fact,
     GroundTruthGuide,
     PromptVerification,
     ResearchGap,
+    TopicVerdict,
     VerifiedFact,
 )
 from aca.models.prompt_intelligence import PromptAnalysis
@@ -192,6 +204,239 @@ def test_evidence_registry_deduplicates_only_same_quote_and_canonical_source():
         "HTTPS://WWW.Example.com:443/product/#details",
         "https://example.org/review",
     ]
+
+
+def test_evidence_registry_keeps_validated_checked_quote_and_original_source_url():
+    from aca.models.ground_truth import Evidence as GroundTruthEvidence
+
+    quote = "The product supports a validated immune assay workflow."
+    source_url = "https://example.com/product-page"
+    registry = _EvidenceRegistry("example.com")
+
+    evidence_id = registry.register_checked_evidence(
+        GroundTruthEvidence(url=source_url, quote=quote, source_tier="first_party")
+    )
+
+    assert evidence_id == "ev_001"
+    assert registry.items[0].url == source_url
+    assert registry.items[0].quote == quote
+    assert registry.items[0].source_type == "company_website"
+
+
+def test_superlative_and_certification_matching_use_word_boundaries():
+    assert not _is_superlative("The team can bestow several technical capabilities.")
+    assert _is_superlative("The product is the best in its category.")
+    assert (
+        _mismatch_reason("The product has this capability.", "The platform capabilities include analytics.")
+        is None
+    )
+    assert (
+        _mismatch_reason("The laboratory is CAP certified.", "The laboratory is ISO certified.") is not None
+    )
+    assert _mismatch_reason("The system isolates biological samples.", "The system isolates samples.") is None
+
+
+def test_positive_and_contradictory_pages_are_preserved_as_a_conflict():
+    question = {
+        "topic": "Product service",
+        "claim": "Example Bio provides the service",
+        "claim_type": "service",
+        "relevance": "high",
+        "relevance_to_topic": "high",
+        "checked_from": "prompt",
+    }
+    supported = _apply(
+        "fact_001",
+        question["topic"],
+        question["claim"],
+        [
+            {
+                "support": "full",
+                "quote": "Example Bio provides the service to customers.",
+                "url": "https://example.com/services",
+                "published": None,
+                "client_host": "example.com",
+                "narrow_statement": question["claim"],
+                "wording_limit": "",
+            }
+        ],
+        False,
+        "service",
+        "high",
+        "high",
+        "prompt",
+    )
+    contradicted = _apply(
+        "fact_002",
+        question["topic"],
+        question["claim"],
+        [
+            {
+                "support": "contradicts",
+                "quote": "Example Bio does not provide the service to customers.",
+                "url": "https://example.org/review",
+                "published": None,
+                "client_host": "example.com",
+                "narrow_statement": "",
+                "wording_limit": "",
+            }
+        ],
+        False,
+        "service",
+        "high",
+        "high",
+        "prompt",
+    )
+
+    merged, _ = _merge_pairs([(question, supported), (question, contradicted)])[0]
+
+    assert merged.fact.status == "inconclusive"
+    assert merged.verdict.decision == "research_more"
+    assert len(merged.fact.evidence) == 2
+    assert merged.gap is not None
+
+
+def test_checked_research_gaps_survive_assembly_without_reason_word_matching():
+    context = build_prompt_context(
+        _mock_agent1_data(),
+        "https://alamarbio.com",
+        "Alamar Biosciences",
+    )
+    checked = _apply(
+        "fact_001",
+        "Capability",
+        "Example Bio supports a particular platform feature",
+        [],
+        False,
+        "platform_capability",
+        "high",
+        "high",
+        "prompt",
+    )
+
+    guide = _assemble(
+        context,
+        [({"checked_from": "prompt"}, checked)],
+        [],
+    )
+
+    assert guide.information_still_needed
+    assert guide.information_still_needed[0].missing_claim == checked.asked_claim
+
+
+def test_checked_and_limited_facts_keep_unique_ids_across_groups():
+    context = build_prompt_context(
+        _mock_agent1_data(),
+        "https://alamarbio.com",
+        "Alamar Biosciences",
+    )
+    first_fact = Fact(
+        fact_id="input_a",
+        claim="Example Bio offers assay A",
+        status="verified",
+        evidence=[Evidence(url="https://example.com/a", quote="Example Bio offers assay A.")],
+    )
+    limited_fact = Fact(
+        fact_id="input_b",
+        claim="Example Bio supports assay B",
+        status="verified",
+        evidence=[Evidence(url="https://example.com/b", quote="Example Bio supports assay B.")],
+    )
+    first = CheckedClaim(
+        first_fact,
+        TopicVerdict(topic="A", decision="write", fact_ids=["input_a"]),
+        None,
+        [],
+        None,
+        None,
+        None,
+        first_fact.claim,
+    )
+    limited = CheckedClaim(
+        limited_fact,
+        TopicVerdict(topic="B", decision="write_limited", fact_ids=["input_b"]),
+        None,
+        [],
+        None,
+        limited_fact.claim,
+        "State only the named assay.",
+        limited_fact.claim,
+    )
+
+    guide = _assemble(
+        context,
+        [
+            ({"checked_from": "prompt"}, first),
+            ({"checked_from": "prompt"}, limited),
+        ],
+        [],
+    )
+    fact_ids = [fact.fact_id for fact in guide.can_write]
+    fact_ids.extend(item.fact_id for item in guide.can_write_with_limits)
+
+    assert len(fact_ids) == len(set(fact_ids)) == 2
+    assert all(fact_id.startswith("fact_") for fact_id in fact_ids)
+
+
+def test_scope_note_describes_extra_topic_words_generically():
+    context = build_prompt_context(
+        _mock_agent1_data(),
+        "https://example.com",
+        "Example Bio",
+    )
+
+    note = _scope_note(context)
+
+    assert note.scope_note
+    assert "North America" not in note.scope_note
+
+
+def test_agent3_deduplicates_repeated_warnings():
+    agent = GroundTruthAgent(api_key="mock-key", model="mock-model")
+
+    agent._add_warning("The same retrieval warning.")
+    agent._add_warning("The same retrieval warning.")
+
+    assert agent._warnings == ["The same retrieval warning."]
+
+
+def test_agent3_handoff_includes_prohibited_claims_and_deduplicated_warnings():
+    boundaries = _handoff_boundaries(
+        "Example Bio",
+        ["Claim contradicted by evidence", "best"],
+        ["Research retrieval failed", "Research retrieval failed"],
+    )
+
+    assert any("Claim contradicted by evidence" in item for item in boundaries)
+    assert any("best" in item for item in boundaries)
+    assert boundaries.count("Research retrieval failed") == 1
+
+
+def test_step1_search_failure_is_reported_as_unassessed_not_irrelevant():
+    agent = GroundTruthAgent(
+        api_key="mock-key",
+        model="mock-model",
+        research=SimpleNamespace(extract=lambda _url: None),
+    )
+    context = build_prompt_context(
+        _mock_agent1_data(),
+        "https://example.com",
+        "Example Bio",
+    )
+
+    with patch.object(agent, "_collect_optional_pages", return_value=([], True)):
+        result = agent._understand_prompt_and_verify(
+            context,
+            "Example Bio",
+            "example.com",
+        )
+
+    assert result["is_verified"] is False
+    assert result["intent_valid"] is True
+    assert result["customer_relevant"] is False
+    assert result["human_review_required"] is True
+    assert "not evidence that the customer is irrelevant" in result["reason"]
+    assert result["retrieved_pages"] == []
 
 
 def test_optional_research_failure_is_logged_as_warning_and_returned():

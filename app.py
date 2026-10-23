@@ -15,6 +15,7 @@ from aca.article_sections import split_article_sections
 from aca.agents.source_intelligence import TOP_N_SOURCES
 from aca.output_storage import clear_agent_outputs, save_agent_output
 from aca.orchestrator.pipeline import PipelineState, build_pipeline
+from aca.pdf_export import build_article_pdf
 from aca.review_diff import render_markdown_diff
 
 
@@ -534,6 +535,15 @@ if any(x is not None for x in (a1, a2, a3, a4, a5, a6)):
                     sections = split_article_sections(article)
                     st.markdown(f"### {title}")
                     st.divider()
+                    st.download_button(
+                        "Download formatted blog (PDF)",
+                        data=build_article_pdf(article),
+                        file_name=f"agent5_article_{prompt_id}.pdf",
+                        mime="application/pdf",
+                        key="download_agent5_pdf",
+                        type="primary",
+                        width="stretch",
+                    )
                     with st.container(border=True):
                         if sections.introduction:
                             st.subheader("Introduction")
