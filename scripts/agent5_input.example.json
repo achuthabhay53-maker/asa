@@ -1,0 +1,79 @@
+{
+  "company_name": "Example Organization",
+  "title": "How Immersive Simulation Supports Procedural Practice",
+  "article_objective": "Explain the procedural-practice example using only the supplied synthetic evidence; do not imply measured results.",
+  "target_audience": "Readers evaluating training approaches",
+  "search_intent": "Understand how immersive simulation supports practice",
+  "primary_keyword": "immersive simulation for procedural practice",
+  "secondary_keywords": [
+    "guided procedural practice"
+  ],
+  "related_topics": [
+    "training design"
+  ],
+  "question_based_queries": [
+    "How does immersive simulation support procedural practice?"
+  ],
+  "faqs": [
+    {
+      "question": "What kind of practice does the example describe?",
+      "answer": ""
+    },
+    {
+      "question": "How are procedure steps practiced in the example?",
+      "answer": ""
+    },
+    {
+      "question": "How is the practice sequence structured?",
+      "answer": ""
+    }
+  ],
+  "sections": [
+    {
+      "heading": "How immersive simulation supports practice",
+      "level": 2,
+      "objective": "Explain the approach and its purpose.",
+      "topics": [
+        "Guided procedural practice"
+      ],
+      "questions_to_answer": [
+        "How does immersive simulation support procedural practice?"
+      ],
+      "evidence_ids": [
+        "sample_001",
+        "sample_002",
+        "sample_003"
+      ],
+      "guidelines": [
+        "The evidence is synthetic example data, not a real-world claim."
+      ]
+    }
+  ],
+  "evidence": [
+    {
+      "evidence_id": "sample_001",
+      "claim": "This sample describes guided procedural practice in an immersive simulation.",
+      "status": "verified",
+      "evidence_quote": "Synthetic sample evidence: guided procedural practice is presented in an immersive simulation.",
+      "source_url": null
+    },
+    {
+      "evidence_id": "sample_002",
+      "claim": "The example describes practicing procedural steps inside a simulated environment.",
+      "status": "verified",
+      "evidence_quote": "Synthetic sample evidence: learners rehearse procedural steps inside the simulated environment.",
+      "source_url": null
+    },
+    {
+      "evidence_id": "sample_003",
+      "claim": "The sample presents practice as a guided sequence.",
+      "status": "verified",
+      "evidence_quote": "Synthetic sample evidence: the procedure practice follows a guided sequence.",
+      "source_url": null
+    }
+  ],
+  "unsupported_claims_to_avoid": [
+    "Do not claim measurable outcomes, performance improvements, or statistics."
+  ],
+  "target_word_count": 500
+}
