@@ -170,7 +170,7 @@ def test_verification_rejects_missing_or_non_boolean_flags():
         raise AssertionError("Non-boolean verification flags must be rejected.")
 
 
-def test_evidence_registry_deduplicates_only_same_quote_and_canonical_source():
+def test_evidence_registry_only_accepts_official_site_quotes():
     quote = "The platform supports a measured multiplex protein analysis workflow."
     pages = [
         {
@@ -198,12 +198,18 @@ def test_evidence_registry_deduplicates_only_same_quote_and_canonical_source():
     )
 
     assert first == duplicate_same_source == "ev_001"
-    assert same_quote_other_source == "ev_002"
+    assert same_quote_other_source is None
     assert fabricated is None
     assert [item.url for item in registry.items] == [
         "HTTPS://WWW.Example.com:443/product/#details",
-        "https://example.org/review",
     ]
+
+    external_evidence = Evidence(
+        url="https://example.org/review",
+        quote=quote,
+        source_tier="trusted_third_party",
+    )
+    assert registry.register_checked_evidence(external_evidence) is None
 
 
 def test_evidence_registry_keeps_validated_checked_quote_and_original_source_url():
@@ -274,7 +280,7 @@ def test_positive_and_contradictory_pages_are_preserved_as_a_conflict():
             {
                 "support": "contradicts",
                 "quote": "Example Bio does not provide the service to customers.",
-                "url": "https://example.org/review",
+                "url": "https://www.example.com/service-limitations",
                 "published": None,
                 "client_host": "example.com",
                 "narrow_statement": "",
@@ -288,6 +294,8 @@ def test_positive_and_contradictory_pages_are_preserved_as_a_conflict():
         "prompt",
     )
 
+    assert supported.fact.status == "verified"
+    assert supported.fact.evidence[0].source_tier == "first_party"
     merged, _ = _merge_pairs([(question, supported), (question, contradicted)])[0]
 
     assert merged.fact.status == "inconclusive"
@@ -424,13 +432,19 @@ def test_step1_search_failure_is_reported_as_unassessed_not_irrelevant():
         "Example Bio",
     )
 
-    with patch.object(agent, "_collect_optional_pages", return_value=([], True)):
+    with patch.object(agent, "_collect_optional_pages", return_value=([], True)) as collect:
         result = agent._understand_prompt_and_verify(
             context,
             "Example Bio",
             "example.com",
         )
 
+    collect.assert_called_once_with(
+        f"{context.original_prompt} {context.prompt_understanding.intent}".strip(),
+        "example.com",
+        "Example Bio",
+        first_party=True,
+    )
     assert result["is_verified"] is False
     assert result["intent_valid"] is True
     assert result["customer_relevant"] is False
@@ -494,29 +508,102 @@ def test_verified_relevance_without_exact_quote_requires_human_review():
     assert "Human review is required" in validated["reason"]
 
 
-def test_collect_pages_resolves_google_grounding_redirect_before_domain_filter():
+def test_third_party_quote_cannot_verify_customer_claim():
+    result = _apply(
+        "fact_external",
+        "Service",
+        "Example Bio provides the service to customers",
+        [
+            {
+                "support": "full",
+                "quote": "Example Bio provides the service to customers.",
+                "url": "https://example.org/review",
+                "published": None,
+                "client_host": "example.com",
+                "narrow_statement": "Example Bio provides the service to customers",
+                "wording_limit": "",
+            }
+        ],
+        False,
+        "service",
+        "high",
+        "high",
+        "prompt",
+        ["https://example.org/review"],
+    )
+
+    assert result.fact.status == "inconclusive"
+    assert result.fact.evidence == []
+    assert result.gap is not None
+
+
+def test_check_question_does_not_run_third_party_fallback():
+    agent = GroundTruthAgent(api_key="mock-key", model="mock-model")
+    question = {
+        "topic": "Capability",
+        "claim": "Example Bio offers the capability",
+        "claim_type": "platform_capability",
+        "relevance": "high",
+        "relevance_to_topic": "high",
+        "checked_from": "prompt",
+    }
+    with patch.object(agent, "_collect_optional_pages", return_value=([], True)) as collect:
+        result = agent._check_question(
+            "fact_001",
+            question,
+            "Example Bio",
+            "example.com",
+        )
+
+    collect.assert_called_once_with(
+        question["claim"],
+        "example.com",
+        "Example Bio",
+        first_party=True,
+    )
+    assert result.fact.status == "inconclusive"
+
+
+def test_optional_external_page_request_is_not_sent_to_research():
+    class Research:
+        def search(self, *_args, **_kwargs):
+            raise AssertionError("Third-party search must not be called.")
+
+    agent = GroundTruthAgent(
+        api_key="mock-key",
+        model="mock-model",
+        research=Research(),
+    )
+
+    pages, failed = agent._collect_optional_pages(
+        "company service",
+        "example.com",
+        "Example Bio",
+        first_party=False,
+    )
+
+    assert pages == []
+    assert failed is False
+
+
+def test_collect_pages_does_not_retrieve_third_party_search_results():
     redirect_url = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/opaque"
-    other_redirect_url = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/other-opaque"
+    official_url = "https://www.ethosh.com/virtual-reality-training"
 
     class Research:
         def search(self, query: str, **kwargs) -> SearchResponse:
             return SearchResponse(
                 results=[
                     SearchResult(url=redirect_url, title="Ethosh capability page"),
-                    SearchResult(url=other_redirect_url, title="Other page"),
+                    SearchResult(url=official_url, title="Official capability page"),
                 ]
             )
 
         def extract(self, url: str, *, max_chars: int) -> ExtractedPage:
-            if url == redirect_url:
-                return ExtractedPage(
-                    url="https://www.ethosh.com/virtual-reality-training",
-                    text="Ethosh provides immersive virtual reality training for medical device teams.",
-                )
-            assert url == other_redirect_url
+            assert url == official_url
             return ExtractedPage(
-                url="https://another-company.example/training",
-                text="This is not an Ethosh page.",
+                url=official_url,
+                text="Ethosh provides immersive virtual reality training for medical device teams.",
             )
 
     agent = GroundTruthAgent(
@@ -534,7 +621,7 @@ def test_collect_pages_resolves_google_grounding_redirect_before_domain_filter()
 
     assert failed is False
     assert len(pages) == 1
-    assert pages[0]["url"] == "https://www.ethosh.com/virtual-reality-training"
+    assert pages[0]["url"] == official_url
 
 
 def test_ground_truth_returns_structured_agent4_package():

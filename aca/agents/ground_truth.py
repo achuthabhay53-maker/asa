@@ -162,23 +162,22 @@ class _EvidenceRegistry:
         for page in pages:
             url = str(page.get("url") or "")
             canonical_url = canonicalize_evidence_url(url)
-            if not canonical_url or not _quote_in_page(cleaned_quote, str(page.get("text") or "")):
+            if (
+                not canonical_url
+                or not _is_customer_url(url, self.client_host)
+                or not _quote_in_page(cleaned_quote, str(page.get("text") or ""))
+            ):
                 continue
             key = (cleaned_quote.casefold(), canonical_url)
             if key in self._ids_by_quote_and_url:
                 return self._ids_by_quote_and_url[key]
             evidence_id = f"ev_{len(self.items) + 1:03d}"
-            source_type = (
-                page.get("source_type")
-                or preferred_source_type
-                or ("company_website" if _host(url) == self.client_host else "reputable_external")
-            )
             self.items.append(
                 EvidenceItem(
                     evidence_id=evidence_id,
                     url=url,
                     quote=cleaned_quote,
-                    source_type=source_type,
+                    source_type="company_website",
                     domain=_host(url),
                     page_title=page.get("title"),
                     published=page.get("published"),
@@ -197,7 +196,7 @@ class _EvidenceRegistry:
         quote = _clean(evidence.quote)
         url = evidence.url.strip()
         canonical_url = canonicalize_evidence_url(url)
-        if len(quote) < 25 or not canonical_url:
+        if len(quote) < 25 or not canonical_url or not _is_customer_url(url, self.client_host):
             return None
         key = (quote.casefold(), canonical_url)
         existing = self._ids_by_quote_and_url.get(key)
@@ -209,8 +208,7 @@ class _EvidenceRegistry:
                 evidence_id=evidence_id,
                 url=url,
                 quote=quote,
-                source_type=preferred_source_type
-                or ("company_website" if _host(url) == self.client_host else "reputable_external"),
+                source_type="company_website",
                 domain=_host(url),
                 published=evidence.published,
             )
@@ -232,6 +230,11 @@ def _clean(value: str) -> str:
 def _host(url: str) -> str:
     host = (urlparse(url if "://" in url else f"https://{url}").hostname or "").lower()
     return host.removeprefix("www.")
+
+
+def _is_customer_url(url: str, client_host: str) -> bool:
+    host = _host(url)
+    return bool(host) and (host == client_host or host.endswith(f".{client_host}"))
 
 
 def _string_list(raw: Any) -> list[str]:
@@ -315,7 +318,7 @@ def _parse_date(value: Any) -> date | None:
 
 
 def _tier(url: str, client_host: str) -> SourceTier:
-    return "first_party" if _host(url) == client_host else "other"
+    return "first_party" if _is_customer_url(url, client_host) else "other"
 
 
 def build_prompt_context(agent1: Any, website: str, company_name: str | None = None) -> PromptContext:
@@ -478,22 +481,17 @@ class GroundTruthAgent:
     ) -> dict[str, Any]:
         """Step 1: Understand prompt, infer main topic, intent, audience, scope, and verify relevance."""
         query_fp = f"{context.original_prompt} {context.prompt_understanding.intent}".strip()
-        first_pages, first_failed = self._collect_optional_pages(
+        first_pages, search_failed = self._collect_optional_pages(
             query_fp, client_host, client_name, first_party=True
         )
-        retrieved_pages = list(first_pages)
-        external_failed = False
-        if len(retrieved_pages) < PAGES_PER_PASS:
-            web_query = f"{client_name} {context.original_prompt}"
-            web_pages, external_failed = self._collect_optional_pages(
-                web_query, client_host, client_name, first_party=False
-            )
-            retrieved_pages.extend(web_pages)
+        retrieved_pages = [
+            page for page in first_pages if _is_customer_url(str(page.get("url") or ""), client_host)
+        ]
 
         if not retrieved_pages:
             try:
                 root_page = self.research.extract(f"https://{client_host}")
-                if root_page and root_page.text.strip():
+                if root_page and root_page.text.strip() and _is_customer_url(root_page.url, client_host):
                     retrieved_pages.append({"url": root_page.url, "text": root_page.text, "published": None})
             except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
                 logger.warning(
@@ -502,7 +500,7 @@ class GroundTruthAgent:
                 )
                 self._add_warning("Company root-page fallback failed during prompt verification.")
 
-        if not retrieved_pages and (first_failed or external_failed):
+        if not retrieved_pages and search_failed:
             reason = (
                 "Customer relevance could not be assessed because web search "
                 "returned no usable pages and root-page retrieval failed. This is not evidence that the "
@@ -551,7 +549,8 @@ Rules:
 - Check functional capabilities, not just exact wording. Consider clear equivalents and alternate terms (for example, virtual reality / VR, immersive training, XR, and simulation for VR training), but do not infer a capability from a broad industry association alone.
 - Do not mark the customer irrelevant only because the exact prompt wording is absent from its pages or search results. Use relevant capability pages and equivalent terminology; if evidence is insufficient, say that in reason rather than claiming the question itself is invalid.
 - A valid prompt about an unrelated customer must have intent_valid: true, customer_relevant: false, and is_verified: false.
-- Base your judgment strictly on the retrieved pages and customer facts. Do NOT hallucinate.
+- Verify customer-specific relevance only from the customer's official website pages supplied below.
+- Base your judgment strictly on those pages. Do NOT use third-party sources, outside knowledge, or assumptions.
 - quote must be an exact contiguous quote from the supplied page text (at least 30 characters) if one is found.
 - JSON only."""
 
@@ -575,31 +574,14 @@ Rules:
         client_name: str,
         client_host: str,
     ) -> tuple[list[dict[str, Any]], list[tuple[dict[str, str], CheckedClaim]], list[str]]:
-        """Step 2: Research the specific topic across company website and reputable external sources."""
+        """Step 2: Research customer-specific claims on the official website only."""
         all_pages: list[dict[str, Any]] = []
         seen_urls: set[str] = set()
 
         # Add any pages already collected in Step 1
         for p in understanding.get("retrieved_pages") or []:
             u = p.get("url")
-            if u and u not in seen_urls:
-                seen_urls.add(u)
-                all_pages.append(
-                    {
-                        "url": u,
-                        "text": p.get("text", ""),
-                        "published": p.get("published"),
-                        "source_type": "company_website" if _host(u) == client_host else "reputable_external",
-                    }
-                )
-
-        # 1. Company Website: Search products, assays, services, capabilities
-        main_topic = understanding.get("main_topic") or context.original_prompt
-        fp_query = f"{main_topic} products assays services technology".strip()
-        fp_pages, _ = self._collect_optional_pages(fp_query, client_host, client_name, first_party=True)
-        for p in fp_pages:
-            u = p.get("url")
-            if u and u not in seen_urls:
+            if u and _is_customer_url(u, client_host) and u not in seen_urls:
                 seen_urls.add(u)
                 all_pages.append(
                     {
@@ -610,19 +592,20 @@ Rules:
                     }
                 )
 
-        # 2. Reputable External: Broader industry context, benchmarks, applications
-        ext_query = f"{main_topic} workflow technology comparison review".strip()
-        ext_pages, _ = self._collect_optional_pages(ext_query, client_host, client_name, first_party=False)
-        for p in ext_pages:
+        # 1. Company Website: Search products, assays, services, capabilities
+        main_topic = understanding.get("main_topic") or context.original_prompt
+        fp_query = f"{main_topic} products assays services technology".strip()
+        fp_pages, _ = self._collect_optional_pages(fp_query, client_host, client_name, first_party=True)
+        for p in fp_pages:
             u = p.get("url")
-            if u and u not in seen_urls:
+            if u and _is_customer_url(u, client_host) and u not in seen_urls:
                 seen_urls.add(u)
                 all_pages.append(
                     {
                         "url": u,
                         "text": p.get("text", ""),
                         "published": p.get("published"),
-                        "source_type": "reputable_external",
+                        "source_type": "company_website",
                     }
                 )
 
@@ -686,6 +669,8 @@ Rules:
         client_name: str,
         first_party: bool,
     ) -> tuple[list[dict[str, Any]], bool]:
+        if not first_party:
+            return [], False
         try:
             pages, failed = self._collect_pages(claim, client_host, client_name, first_party)
         except (httpx.HTTPError, OSError, RuntimeError, TypeError, ValueError) as exc:
@@ -693,15 +678,11 @@ Rules:
                 "Agent 3 optional research retrieval failed (%s).",
                 type(exc).__name__,
             )
-            self._add_warning(
-                f"Optional {'first-party' if first_party else 'external'} research retrieval failed."
-            )
+            self._add_warning("Optional first-party research retrieval failed.")
             return [], True
         if failed:
-            self._add_warning(
-                f"Optional {'first-party' if first_party else 'external'} search returned no usable results."
-            )
-        return pages, failed
+            self._add_warning("Optional first-party search returned no usable results.")
+        return [page for page in pages if _is_customer_url(str(page.get("url") or ""), client_host)], failed
 
     def _discover_subtopics_and_evidence(
         self,
@@ -714,6 +695,9 @@ Rules:
         client_host: str,
     ) -> GroundTruthGuide:
         """Step 3: Discover candidate subtopics, verified facts, evidence, research gaps, limitations."""
+        research_pages = [
+            page for page in research_pages if _is_customer_url(str(page.get("url") or ""), client_host)
+        ]
         checked_guide = _assemble(context, checked_pairs, banned)
 
         # Build prompt verification object
@@ -798,7 +782,7 @@ Return one JSON object with exactly these keys:
     {
       "statement": "Concrete factual statement",
       "category": "company_capability | product_technology | regulatory_certification | service_scope",
-      "evidence_type": "company_website | reputable_external",
+      "evidence_type": "company_website",
       "confidence": "high | medium",
       "wording_boundary": "What the evidence does NOT support (or empty string if no boundary)",
       "evidence_quote": "Exact verbatim quote copied from the supplied research_evidence text"
@@ -825,6 +809,8 @@ Rules:
    - Do NOT expand the scope. Agent 4 decides whether to include optional topics.
 
 2. Evidence Grounding for Facts:
+   - Verify every customer-specific fact only from the supplied pages on the customer's official website.
+   - Never use third-party sources or assumptions to fill an evidence gap.
    - The primary verification target is a claim specifically about the named company, its products, services, capabilities, processes, or results. Do not classify general industry context or educational explanations as company facts.
    - Do not create a research gap solely because a generic industry statement lacks evidence about the named company. Keep useful industry context separate from company-specific facts and gaps.
    - A verified_fact MUST include a non-empty evidence_quote that is verbatim from the supplied research_evidence.
@@ -903,7 +889,7 @@ Rules:
             for ev in f.evidence:
                 eid = evidence_registry.register_checked_evidence(
                     ev,
-                    "company_website" if ev.source_tier == "first_party" else "reputable_external",
+                    "company_website",
                 )
                 if eid:
                     ev_ids_for_fact.append(eid)
@@ -913,7 +899,7 @@ Rules:
             for ev in limited_fact.evidence:
                 eid = evidence_registry.register_checked_evidence(
                     ev,
-                    "company_website" if ev.source_tier == "first_party" else "reputable_external",
+                    "company_website",
                 )
                 if eid:
                     ev_ids_for_fact.append(eid)
@@ -986,9 +972,7 @@ Rules:
             q = str(item.get("evidence_quote") or "")
             ev_id = add_evidence(q) if q else None
 
-            ev_type = str(item.get("evidence_type") or "company_website").strip().lower()
-            if ev_type not in {"company_website", "reputable_external"}:
-                ev_type = "company_website"
+            ev_type = "company_website"
             boundary = _clean(str(item.get("wording_boundary") or ""))
 
             has_evidence = bool(ev_id and _safe_narrow(statement, q, statement))
@@ -1410,20 +1394,9 @@ Rules:
         )
         checked = self._read_pages(claim, client_name, first_pages) if first_pages else []
         usable = [item for item in checked if item["support"] != "none"]
-        retrieved = [page["url"] for page in first_pages]
+        retrieved = [page["url"] for page in first_pages if _is_customer_url(page["url"], client_host)]
         search_failed = first_failed and not first_pages
-        has_full_first_party = any(
-            item["support"] == "full" and _host(item["url"]) == client_host for item in checked
-        )
-        if not has_full_first_party:
-            web_pages, web_failed = self._collect_optional_pages(
-                claim, client_host, client_name, first_party=False
-            )
-            retrieved.extend(page["url"] for page in web_pages)
-            if web_pages:
-                checked.extend(self._read_pages(claim, client_name, web_pages))
-                usable = [item for item in checked if item["support"] != "none"]
-            search_failed = search_failed and web_failed and not web_pages and not first_pages
+        usable = [hit for hit in usable if _is_customer_url(hit["url"], client_host)]
         for hit in usable:
             hit["client_host"] = client_host
         return _apply(
@@ -1511,26 +1484,33 @@ JSON only."""
         client_name: str,
         first_party: bool,
     ) -> tuple[list[dict[str, Any]], bool]:
-        query = claim if first_party else f"{client_name} {claim}"
+        if not first_party:
+            return [], False
+        query = claim
         response = self.research.search(
             query,
             max_results=PAGES_PER_PASS,
-            include_domains=[client_host] if first_party else None,
-            exclude_domains=None if first_party else [client_host],
+            include_domains=[client_host],
         )
         if response.failed:
             return [], True
         pages: list[dict[str, Any]] = []
         for result in response.results:
+            if not _is_customer_url(result.url, client_host):
+                continue
             page = self.research.extract(result.url, max_chars=PAGE_CHARS)
             if page is None or not page.text.strip():
                 continue
-            page_host = _host(page.url)
-            if first_party and page_host != client_host:
+            if not _is_customer_url(page.url, client_host):
                 continue
-            if not first_party and page_host == client_host:
-                continue
-            pages.append({"url": page.url, "text": page.text, "published": _parse_date(result.published)})
+            pages.append(
+                {
+                    "url": page.url,
+                    "text": page.text,
+                    "published": _parse_date(result.published),
+                    "source_type": "company_website",
+                }
+            )
             if len(pages) >= PAGES_PER_PASS:
                 break
         return pages, False
@@ -1542,6 +1522,7 @@ Return one JSON object:
 {"pages":[{"url":"","support":"full|partial|contradicts|none","quote":"","narrow_statement":"","wording_limit":""}]}
 Rules:
 - Use only the supplied page text. Do not use outside knowledge.
+- These supplied pages are from the customer's official website; verify customer-specific claims only from them.
 - quote must be an exact contiguous span copied from that page, at least 30 characters.
 - full means the quote supports the whole claim and does not require extra wording.
 - partial means the quote supports a narrower fact. narrow_statement is that narrower fact, copied in meaning from the quote.
@@ -1644,16 +1625,15 @@ def _apply(
 
     def is_first(hit: dict[str, Any]) -> bool:
         host = hit.get("client_host")
-        return bool(host) and _host(hit["url"]) == host
+        return bool(host) and _is_customer_url(hit["url"], host)
 
-    full_first = [hit for hit in hits if hit["support"] == "full" and is_first(hit)]
-    partial_first = [hit for hit in hits if hit["support"] == "partial" and is_first(hit)]
-    full_other = [hit for hit in hits if hit["support"] == "full" and not is_first(hit)]
-    partial_other = [hit for hit in hits if hit["support"] == "partial" and not is_first(hit)]
-    contradictions = [hit for hit in hits if hit["support"] == "contradicts"]
+    official_hits = [hit for hit in hits if is_first(hit)]
+    full_first = [hit for hit in official_hits if hit["support"] == "full"]
+    partial_first = [hit for hit in official_hits if hit["support"] == "partial"]
+    contradictions = [hit for hit in official_hits if hit["support"] == "contradicts"]
     extra_bans: list[str] = []
 
-    supporting_hits = full_first + partial_first + full_other + partial_other
+    supporting_hits = full_first + partial_first
     if contradictions and supporting_hits:
         reason = (
             "Conflicting retrieved evidence includes both support for and a direct "
@@ -1687,7 +1667,7 @@ def _apply(
             checked_from,
             "do_not_write",
             "inconclusive",
-            "Superlatives are not allowed without a first-party quote.",
+            "Superlatives are not allowed without an official website quote.",
             contradictions,
             extra_bans + [claim],
             gap=False,
@@ -1716,32 +1696,8 @@ def _apply(
             )
         full_first = []
         partial_first = [hit, *partial_first]
-    if full_other:
-        hit = full_other[0]
-        if _safe_narrow(claim, hit["quote"], claim):
-            return _supported(
-                fact_id,
-                topic,
-                claim,
-                claim_type,
-                relevance,
-                topic_relevance,
-                checked_from,
-                "verified",
-                "medium",
-                "write_limited",
-                hit,
-                None,
-                claim,
-                "Only a third-party page supports this.",
-                claim,
-            )
-    if (
-        partial_first
-        or partial_other
-        or (full_other and not _safe_narrow(claim, full_other[0]["quote"], claim))
-    ):
-        hit = (partial_first or partial_other or full_other)[0]
+    if partial_first:
+        hit = partial_first[0]
         narrow = _safe_narrow(hit["narrow_statement"], hit["quote"], claim)
         if narrow is None:
             narrow = _safe_narrow(hit["quote"], hit["quote"], claim)
@@ -1756,7 +1712,7 @@ def _apply(
                 topic_relevance,
                 checked_from,
                 "verified",
-                "high" if is_first(hit) else "medium",
+                "high",
                 "write_limited",
                 hit,
                 None,
