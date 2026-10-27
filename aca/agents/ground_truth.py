@@ -1252,7 +1252,7 @@ Rules:
             )
 
         for cw in checked_guide.can_write:
-            st = cw.statement.strip()
+            st = cw.claim.strip()
             if not st or st in seen_claims:
                 continue
             seen_claims.add(st)

@@ -80,6 +80,49 @@ class WriterAgent:
             )
         return result
 
+    def revise(
+        self,
+        writer_input: WriterInput,
+        draft: WriterOutput,
+        instructions: str,
+    ) -> WriterOutput:
+        """Create a proposed revision from human instructions without changing the saved draft."""
+        instructions = instructions.strip()
+        if not instructions:
+            raise ValueError("Revision instructions must not be empty.")
+
+        payload = {
+            "writer_input": writer_input.model_dump(mode="json"),
+            "current_draft": draft.model_dump(mode="json"),
+            "human_revision_instructions": instructions,
+        }
+        prompt = (
+            "You are Agent 5, revising a blog at a human editor's request.\n"
+            "Follow the human_revision_instructions for the requested wording, tone, "
+            "style, or content changes. Keep unrelated content unchanged where possible. "
+            "Use only facts and approved evidence in writer_input. Do not invent, strengthen, "
+            "or remove necessary qualifications from factual claims. Preserve the required "
+            "article structure, evidence references, FAQ section, and Markdown table. "
+            "Return one complete JSON object matching the WriterOutput schema. "
+            "This is a proposal; do not state that it was accepted or approved.\n\n"
+            "<revision_request>\n"
+            + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            + "\n</revision_request>"
+        )
+        result = self._generate_output(prompt)
+        result = self._sanitize_evidence_references(result, writer_input.evidence)
+        result = self._normalize_metadata(result)
+        self._validate_seo_requirements(result, writer_input)
+        result, style_notes = self._enforce_style(result, prompt, writer_input)
+        result = self._attach_supporting_evidence(result, writer_input.evidence)
+        result = self._flag_unsupported_numeric_claims(result, writer_input.evidence)
+        result = self._audit_claims_and_faqs(result)
+        if style_notes:
+            result = result.model_copy(
+                update={"unresolved_items": list(dict.fromkeys([*result.unresolved_items, *style_notes]))}
+            )
+        return result
+
     def _enforce_style(
         self,
         result: WriterOutput,

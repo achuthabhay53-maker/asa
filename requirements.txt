@@ -14,7 +14,8 @@ SQLAlchemy==2.0.*
 psycopg[binary]==3.2.*
 
 # Agents and orchestration
-langgraph==0.2.*
+langgraph==0.5.*
+langgraph-checkpoint-postgres==2.0.25
 langchain-core==0.3.*
 
 # LLM and search

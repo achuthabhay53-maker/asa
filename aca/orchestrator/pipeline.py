@@ -15,6 +15,7 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from langgraph.graph import END, START, StateGraph
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from pydantic import BaseModel, Field
 
 from aca.agents.content_brief import ContentBriefAgent
@@ -34,6 +35,7 @@ from aca.models.writer import (
     WriterOutput,
     WriterSectionInput,
 )
+from aca.orchestrator.checkpointer import postgres_checkpointer, thread_config
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +56,12 @@ class PipelineState(BaseModel):
     content_brief: ContentBrief | None = None
     written_article: WriterOutput | None = None
     review_output: ReviewOutput | None = None
+    draft_version: int = 0
+    draft_versions: list[dict[str, Any]] = Field(default_factory=list)
+    draft_approval: dict[str, Any] | None = None
+    proposed_revision: dict[str, Any] | None = None
+    reviewed_draft_fingerprint: str | None = None
+    finding_statuses: dict[str, str] = Field(default_factory=dict)
     errors: list[str] = Field(default_factory=list)
 
 
@@ -298,8 +306,8 @@ def _after_agent5(state: PipelineState) -> str:
     return END
 
 
-def build_pipeline():
-    """Compile the content workflow; Agent 6 runs only when explicitly requested."""
+def build_pipeline(checkpointer: BaseCheckpointSaver | None = None):
+    """Compile the workflow, optionally persisting state with a LangGraph checkpointer."""
     graph = StateGraph(PipelineState)
     graph.add_node("agent1", agent1_node)
     graph.add_node("agent2", agent2_node)
@@ -318,7 +326,7 @@ def build_pipeline():
     graph.add_conditional_edges("agent4", _after_agent4, ["agent5", END])
     graph.add_conditional_edges("agent5", _after_agent5, ["agent6", END])
     graph.add_edge("agent6", END)
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer)
 
 
 def run_workflow(
@@ -340,6 +348,7 @@ def run_workflow(
         max_questions=max_questions,
         target_word_count=target_word_count,
     )
-    pipeline = build_pipeline()
-    final_dict = pipeline.invoke(initial_state)
+    with postgres_checkpointer() as checkpointer:
+        pipeline = build_pipeline(checkpointer)
+        final_dict = pipeline.invoke(initial_state, config=thread_config(initial_state.run_id))
     return PipelineState.model_validate(final_dict)

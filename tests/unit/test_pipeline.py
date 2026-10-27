@@ -1,3 +1,7 @@
+from contextlib import contextmanager
+
+from langgraph.checkpoint.memory import MemorySaver
+
 from aca.models.content_brief import BriefSection, ContentBrief
 from aca.models.ground_truth import ClientInput, GroundTruthGuide
 from aca.models.prompt_intelligence import (
@@ -10,6 +14,7 @@ from aca.orchestrator import pipeline as workflow
 from aca.orchestrator.pipeline import PipelineState, _build_writer_input, build_pipeline
 from aca.agents.writer import WriterAgent
 from aca.models.reviewer import ReviewOutput
+from aca.orchestrator.checkpointer import thread_config
 from ..agent_fixtures import (
     agent1_output,
     agent2_output,
@@ -17,6 +22,14 @@ from ..agent_fixtures import (
     agent4_output,
     agent5_output,
 )
+
+
+def _use_memory_checkpointer(monkeypatch):
+    @contextmanager
+    def memory_checkpointer():
+        yield MemorySaver()
+
+    monkeypatch.setattr(workflow, "postgres_checkpointer", memory_checkpointer)
 
 
 def test_shared_agent_outputs_satisfy_schema_and_evidence_contracts():
@@ -232,6 +245,7 @@ def test_pipeline_hands_typed_outputs_through_all_five_agents(monkeypatch):
 
 
 def test_failed_agent3_verification_stops_before_agents4_and5(monkeypatch):
+    _use_memory_checkpointer(monkeypatch)
     guide = agent3_output(verified=False)
     calls = []
     monkeypatch.setattr(workflow, "run_agent1", lambda *args: agent1_output())
@@ -265,6 +279,7 @@ def test_failed_agent3_verification_stops_before_agents4_and5(monkeypatch):
 
 
 def test_empty_agent4_brief_stops_before_agent5(monkeypatch):
+    _use_memory_checkpointer(monkeypatch)
     calls = []
     monkeypatch.setattr(workflow, "run_agent1", lambda *args: agent1_output())
     monkeypatch.setattr(workflow, "run_agent2", lambda *args, **kwargs: agent2_output())
@@ -298,6 +313,7 @@ def test_empty_agent4_brief_stops_before_agent5(monkeypatch):
 
 
 def test_agent1_errors_are_propagated_without_running_later_agents(monkeypatch):
+    _use_memory_checkpointer(monkeypatch)
     error = ValueError("Prompt was not found.")
     calls = []
 
@@ -389,8 +405,12 @@ def test_requested_review_runs_only_after_existing_five_agent_outputs(monkeypatc
 
     monkeypatch.setattr(workflow, "ReviewerAgent", FakeReviewerAgent)
 
-    result = build_pipeline().invoke(
+    checkpointer = MemorySaver()
+    graph = build_pipeline(checkpointer)
+    config = thread_config("checkpoint-run")
+    result = graph.invoke(
         PipelineState(
+            run_id="checkpoint-run",
             campaign_id=1,
             prompt_id="prompt-1",
             website="https://example.com",
@@ -401,10 +421,15 @@ def test_requested_review_runs_only_after_existing_five_agent_outputs(monkeypatc
             content_brief=agent4_output(),
             written_article=draft,
             review_requested=True,
-        )
+        ),
+        config=config,
     )
 
     assert result["review_output"] == review
     assert len(calls) == 1
     assert calls[0][1] == draft
     assert calls[0][0].company_name == "Example Bio"
+    saved_state = graph.get_state(config)
+    assert saved_state.values["review_output"] == review
+    graph.update_state(config, {"draft_approval": {"fingerprint": "approved"}})
+    assert graph.get_state(config).values["draft_approval"] == {"fingerprint": "approved"}

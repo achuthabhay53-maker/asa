@@ -28,9 +28,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from aca.agents.ground_truth import MAX_QUESTIONS
-from aca.agents.source_intelligence import TOP_N_SOURCES
-from aca.orchestrator.pipeline import PipelineState, build_pipeline
+from aca.agents.ground_truth import MAX_QUESTIONS  # noqa: E402
+from aca.agents.source_intelligence import TOP_N_SOURCES  # noqa: E402
+from aca.orchestrator.checkpointer import postgres_checkpointer, thread_config  # noqa: E402
+from aca.orchestrator.pipeline import PipelineState, build_pipeline  # noqa: E402
 
 
 def main() -> None:
@@ -93,10 +94,10 @@ def main() -> None:
         max_questions=args.max_questions,
     )
 
-    pipeline = build_pipeline()
-
     print("\n[1/3] Executing Workflow Pipeline...")
-    final_dict = pipeline.invoke(initial_state)
+    with postgres_checkpointer() as checkpointer:
+        pipeline = build_pipeline(checkpointer)
+        final_dict = pipeline.invoke(initial_state, config=thread_config(initial_state.run_id))
     state = PipelineState.model_validate(final_dict)
 
     # 1. Save Agent 1 output

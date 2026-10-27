@@ -475,6 +475,35 @@ def test_writer_attaches_source_quote_and_status_to_each_claim():
     assert claim.supporting_evidence[0].status == "verified"
 
 
+def test_writer_revision_uses_human_instructions_and_returns_a_proposal():
+    draft = _writer_output()
+    proposed = draft.model_copy(update={"article_markdown": draft.article_markdown + "\n\nA clearer next step."})
+    prompts = []
+    agent = WriterAgent.__new__(WriterAgent)
+
+    def generate(prompt):
+        prompts.append(prompt)
+        return proposed
+
+    agent._generate_output = generate
+
+    result = agent.revise(_writer_input(), draft, "Make the conclusion more direct.")
+
+    assert result.article_markdown.endswith("A clearer next step.")
+    assert draft.article_markdown == _writer_output().article_markdown
+    assert draft.article_markdown != result.article_markdown
+    assert "Make the conclusion more direct." in prompts[0]
+    assert "approved evidence" in prompts[0]
+    assert "This is a proposal" in prompts[0]
+
+
+def test_writer_revision_rejects_empty_instructions():
+    agent = WriterAgent.__new__(WriterAgent)
+
+    with pytest.raises(ValueError, match="instructions must not be empty"):
+        agent.revise(_writer_input(), _writer_output(), "  ")
+
+
 def test_writer_drops_claim_url_not_linked_to_its_evidence_id_and_reports_it():
     result = _writer_output().model_copy(
         update={
