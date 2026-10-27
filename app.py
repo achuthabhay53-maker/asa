@@ -5,7 +5,9 @@ Run with: streamlit run app.py
 
 from __future__ import annotations
 
+import html
 import json
+import re
 import traceback
 from pathlib import Path
 from typing import Any
@@ -16,7 +18,6 @@ from aca.agents.source_intelligence import TOP_N_SOURCES
 from aca.output_storage import clear_agent_outputs, save_agent_output
 from aca.orchestrator.pipeline import PipelineState, build_pipeline
 from aca.pdf_export import build_article_pdf
-from aca.review_diff import render_markdown_diff
 
 
 # ------------------------------- UI ---------------------------------
@@ -27,6 +28,37 @@ st.markdown(
 .block-container {padding-top:1.25rem; padding-bottom:3rem; max-width:1450px;}
 h1 {font-size:1.85rem; font-weight:750;}
 [data-testid="stMetric"] {background:rgba(128,128,128,.07); padding:12px; border-radius:12px;}
+
+/* ---- Blog view ---- */
+h1.blog-title {
+    font-size:2.05rem; line-height:1.25; font-weight:750;
+    margin:0 0 .6rem 0; padding:0; letter-spacing:-.01em;
+}
+/* hide the hover "link" icon Streamlit adds next to headings */
+.st-key-blog_header [data-testid="stHeaderActionElements"],
+.st-key-blog_header_reviewed [data-testid="stHeaderActionElements"],
+.st-key-blog_card [data-testid="stHeaderActionElements"],
+.st-key-blog_card_reviewed [data-testid="stHeaderActionElements"] {display:none;}
+
+/* comfortable reading typography inside the article card */
+.st-key-blog_card,
+.st-key-blog_card_reviewed {padding:.5rem .75rem;}
+.st-key-blog_card p,
+.st-key-blog_card li,
+.st-key-blog_card_reviewed p,
+.st-key-blog_card_reviewed li {font-size:1.05rem; line-height:1.8;}
+.st-key-blog_card h2,
+.st-key-blog_card_reviewed h2 {
+    font-size:1.55rem; font-weight:700; line-height:1.3;
+    margin-top:1.8rem; padding-bottom:.4rem;
+    border-bottom:1px solid rgba(128,128,128,.25);
+}
+.st-key-blog_card h3,
+.st-key-blog_card_reviewed h3 {font-size:1.2rem; font-weight:650; margin-top:1.2rem;}
+.st-key-blog_card table,
+.st-key-blog_card_reviewed table {width:100%; font-size:.95rem;}
+.st-key-blog_card th,
+.st-key-blog_card_reviewed th {background:rgba(128,128,128,.12);}
 </style>
 """,
     unsafe_allow_html=True,
@@ -34,30 +66,15 @@ h1 {font-size:1.85rem; font-weight:750;}
 
 
 # ----------------------------- HELPERS ------------------------------
+VERIFY_RE = re.compile(r"\[VERIFY:[^\]]*\]")
+
+
 def as_dict(value: Any) -> dict:
     if value is None:
         return {}
     if hasattr(value, "model_dump"):
         return value.model_dump(mode="json")
     return value if isinstance(value, dict) else {}
-
-
-def string_list(value: Any) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        return [value.strip()] if value.strip() else []
-    if isinstance(value, (list, tuple)):
-        return [
-            x.strip() if isinstance(x, str) else str(x)
-            for x in value
-            if x is not None and str(x).strip() and not isinstance(x, (dict, list, tuple))
-        ]
-    return []
-
-
-def unique(items: list[str]) -> list[str]:
-    return list(dict.fromkeys(x for x in items if x and x.strip()))
 
 
 def show_json(label: str, obj: Any):
@@ -76,12 +93,18 @@ def download_json(label: str, obj: Any, filename: str, key: str):
     )
 
 
-def bullets(items: list[str], empty="Nothing available."):
-    if items:
-        for item in items:
-            st.markdown(f"- {item}")
-    else:
-        st.caption(empty)
+@st.cache_data(show_spinner=False)
+def cached_article_pdf(article: str) -> bytes:
+    """Build the PDF once per article instead of on every Streamlit rerun."""
+    return build_article_pdf(article)
+
+
+def style_verify_markers(text: str) -> str:
+    """Show '[VERIFY: ...]' placeholders as small orange badges in the preview.
+
+    Only the on-screen preview changes; the PDF/Markdown downloads keep the raw text.
+    """
+    return VERIFY_RE.sub(":orange-badge[⚠ needs source]", text)
 
 
 def pipeline():
@@ -109,6 +132,27 @@ def pipeline():
             else:
                 st.info(f"○ {name}")
             st.caption(desc)
+
+
+def seo_metadata_panel(seo_title: str, meta_description: str):
+    """Copy-ready SEO fields with character counts."""
+    fields = (
+        ("SEO title", seo_title, 60),
+        ("Meta description", meta_description, 160),
+    )
+    if not any(value for _, value, _ in fields):
+        return
+    with st.expander("SEO metadata", icon=":material/search:"):
+        for label, value, limit in fields:
+            if not value:
+                continue
+            st.markdown(f"**{label}**")
+            st.code(value, language=None, wrap_lines=True)  # st.code has a built-in copy button
+            count = len(value)
+            if count > limit:
+                st.caption(f":red[{count} characters, over the recommended {limit}]")
+            else:
+                st.caption(f"{count} of {limit} recommended characters")
 
 
 # ------------------------------- STATE ------------------------------
@@ -270,289 +314,95 @@ if all(x is None for x in (a1, a2, a3, a4, a5, a6)):
     st.info("Enter a Campaign ID, Prompt ID, and customer website, then click **Run Agents 1–5**.")
 
 if any(x is not None for x in (a1, a2, a3, a4, a5, a6)):
-    tabs = st.tabs(
-        [
-            "Agent 1 · Prompt",
-            "Agent 2 · Sources",
-            "Agent 3 · Ground truth",
-            "Agent 4 · Brief",
-            "Agent 5 · Draft blog",
-            "Agent 6 · Review",
-        ]
-    )
+    writer_tab, reviewer_tab = st.tabs(["Agent 5 - Blog Writer", "Agent 6 - Review"])
 
-    with tabs[0]:
-        if a1 is None:
-            st.info("Agent 1 has not completed.")
-        else:
-            d = as_dict(a1)
-            p = d.get("prompt_understanding") or {}
-            ans = d.get("answer_understanding") or {}
-            vis = d.get("customer_visibility") or {}
-            x, y, z = st.columns(3)
-            x.metric("Intent", str(p.get("intent") or "—"))
-            y.metric("Topic", str(p.get("topic") or "—"))
-            z.metric("Customer visibility", str(vis.get("status") or "unknown").replace("_", " ").title())
-            left, right = st.columns(2)
-            with left:
-                st.subheader("Prompt")
-                st.write(p.get("user_goal") or "—")
-                st.caption(p.get("audience") or "Audience not stated")
-                bullets(string_list(p.get("key_questions")))
-            with right:
-                st.subheader("AI answers")
-                st.write(ans.get("summary") or "—")
-                for label, key in [
-                    ("Topics", "key_topics"),
-                    ("Concepts", "key_concepts"),
-                    ("Comparison criteria", "comparison_criteria"),
-                ]:
-                    st.markdown(f"**{label}**")
-                    bullets(string_list(ans.get(key)))
-            companies = d.get("companies_mentioned") or []
-            if companies:
-                st.dataframe(
-                    [{"Company": c.get("name", ""), "Context": c.get("context", "")} for c in companies],
-                    hide_index=True,
-                    width="stretch",
-                )
-            st.markdown("**Content opportunities**")
-            bullets(string_list(d.get("content_opportunities")))
-            show_json("Agent 1 JSON", a1)
-            download_json("Download Agent 1 JSON", a1, f"agent1_{prompt_id}.json", "dl_a1")
-
-    with tabs[1]:
-        if a2 is None:
-            st.info("Agent 2 has not completed.")
-        else:
-            d = as_dict(a2)
-            summary = d.get("citation_summary") or {}
-            x, y, z = st.columns(3)
-            x.metric("Citation occurrences", summary.get("total_citation_occurrences", 0))
-            y.metric("Unique sources", summary.get("unique_sources", 0))
-            z.metric("Pages analyzed", len(d.get("content_analyses") or []))
-            rows = []
-            analyzed = {s.get("source_id") for s in d.get("content_analyses") or []}
-            for source in d.get("ranked_sources") or []:
-                rows.append(
-                    {
-                        "Rank": source.get("rank"),
-                        "Source": source.get("title") or source.get("url"),
-                        "Citations": source.get("citation_count", 0),
-                        "URL": source.get("url"),
-                        "Status": "Analyzed" if source.get("source_id") in analyzed else "Not analyzed",
-                    }
-                )
-            if rows:
-                st.dataframe(rows, hide_index=True, width="stretch")
-            with st.expander("Source page analysis"):
-                for item in d.get("content_analyses") or []:
-                    ca = item.get("content_analysis") or {}
-                    st.markdown(
-                        f"**{item.get('source_id', '')} · "
-                        f"{item.get('title') or item.get('url') or 'Source'}**"
-                    )
-                    st.caption(item.get("url") or "")
-                    st.write(ca.get("summary") or "—")
-                    bullets(string_list(ca.get("main_topics")))
-                    for finding in ca.get("findings") or []:
-                        finding_data = as_dict(finding)
-                        st.markdown(f"**Finding:** {finding_data.get('finding', '')}")
-                        if finding_data.get("quote_found_on_page"):
-                            st.markdown(f"> {finding_data.get('evidence_quote', '')}")
-                            st.caption(
-                                "The quote matches fetched page text; check the source "
-                                "to assess whether it supports the finding."
-                            )
-                        else:
-                            st.warning("No exact supporting quote was confirmed in fetched page text.")
-                            if finding_data.get("evidence_quote"):
-                                st.caption(
-                                    f"Unmatched quote returned by analysis: "
-                                    f"{finding_data['evidence_quote']}"
-                                )
-            show_json("Agent 2 JSON", a2)
-            download_json("Download Agent 2 JSON", a2, f"agent2_{prompt_id}.json", "dl_a2")
-
-    with tabs[2]:
-        if a3 is None:
-            st.info("Agent 3 has not completed.")
-        else:
-            d = as_dict(a3)
-            ver = d.get("verification") or {}
-            if ver.get("is_verified") and ver.get("human_review_required"):
-                st.warning(
-                    "Prompt/customer relevance passed, but supporting evidence "
-                    "needs human review. " + str(ver.get("reason") or "")
-                )
-            elif ver.get("is_verified"):
-                st.success("Prompt and customer verified. " + str(ver.get("reason") or ""))
-            else:
-                st.error("Verification failed: " + str(ver.get("reason") or "No reason supplied."))
-            x, y, z = st.columns(3)
-            x.metric("Main topic", str(d.get("main_topic") or d.get("topic") or "—"))
-            y.metric("Search intent", str(d.get("search_intent") or "—"))
-            z.metric("Target audience", str(d.get("target_audience") or "—"))
-            subs = d.get("candidate_subtopics") or []
-            st.subheader(f"Candidate subtopics ({len(subs)})")
-            for sub in subs:
-                with st.container(border=True):
-                    st.markdown(f"**{sub.get('title') or sub.get('subtopic_id') or 'Subtopic'}**")
-                    st.caption(
-                        f"Evidence status: {sub.get('evidence_status', sub.get('support_status', 'unknown'))}"
-                    )
-                    st.write(sub.get("description") or "")
-                    bullets(string_list(sub.get("suggested_questions")))
-                    subtopic_evidence_ids = string_list(sub.get("evidence_ids"))
-                    if subtopic_evidence_ids:
-                        st.caption("Evidence IDs: " + ", ".join(subtopic_evidence_ids))
-            facts = d.get("verified_facts") or []
-            st.subheader(f"Verified facts ({len(facts)})")
-            evidence_by_id = {
-                str(item.get("evidence_id")): item
-                for item in d.get("evidence") or []
-                if item.get("evidence_id")
-            }
-            if facts:
-                st.dataframe(
-                    [
-                        {
-                            "ID": f.get("fact_id"),
-                            "Statement": f.get("statement"),
-                            "Status": f.get("status"),
-                            "Evidence IDs": ", ".join(string_list(f.get("evidence_ids"))),
-                            "Confidence": f.get("confidence"),
-                            "Boundary": f.get("wording_boundary"),
-                        }
-                        for f in facts
-                    ],
-                    hide_index=True,
-                    width="stretch",
-                )
-                for fact in facts:
-                    fact_evidence = [
-                        evidence_by_id[evidence_id]
-                        for evidence_id in string_list(fact.get("evidence_ids"))
-                        if evidence_id in evidence_by_id
-                    ]
-                    with st.expander(f"Evidence for {fact.get('fact_id', 'fact')}"):
-                        st.write(fact.get("statement") or "")
-                        if fact_evidence:
-                            for item in fact_evidence:
-                                st.markdown(f"**{item.get('evidence_id')}** · {item.get('source_type', '')}")
-                                st.markdown(f"> {item.get('quote', '')}")
-                                if item.get("url"):
-                                    st.markdown(f"[Open source]({item['url']})")
-                        else:
-                            st.warning("No evidence reference is attached to this finding.")
-            with st.expander(f"Evidence quotes ({len(d.get('evidence') or [])})"):
-                for ev in d.get("evidence") or []:
-                    st.markdown(f"**{ev.get('evidence_id', '')} · {ev.get('source_type', '')}**")
-                    st.markdown(f"> {ev.get('quote', '')}")
-                    if ev.get("url"):
-                        st.caption(ev["url"])
-            show_json("Agent 3 JSON", a3)
-            download_json("Download Agent 3 JSON", a3, f"agent3_{prompt_id}.json", "dl_a3")
-
-    with tabs[3]:
-        if a4 is None:
-            st.info("Agent 4 has not completed.")
-        else:
-            d = as_dict(a4)
-            st.header("Content brief")
-            st.markdown("**Proposed title**")
-            st.write(d.get("title") or d.get("recommended_title") or "Title not available")
-            st.markdown("**Objective**")
-            st.write(d.get("article_objective") or d.get("objective") or "—")
-            st.markdown("**Target audience**")
-            st.write(d.get("target_audience") or "—")
-            sections = d.get("sections") or d.get("outline") or d.get("brief_sections") or []
-            st.subheader(f"Article outline ({len(sections)} sections)")
-            for i, raw in enumerate(sections, 1):
-                s = as_dict(raw)
-                with st.container(border=True):
-                    st.markdown(
-                        f"**{i}. {s.get('heading') or s.get('title') or s.get('name') or 'Section'}**"
-                    )
-                    st.write(
-                        s.get("section_objective")
-                        or s.get("objective")
-                        or s.get("description")
-                        or s.get("purpose")
-                        or ""
-                    )
-                    bullets(
-                        unique(
-                            string_list(s.get("topics_and_questions"))
-                            + string_list(s.get("topics"))
-                            + string_list(s.get("key_points"))
-                        )
-                    )
-                    evidence_ids = string_list(s.get("evidence_ids"))
-                    source_urls = string_list(s.get("source_urls"))
-                    if evidence_ids:
-                        st.caption("Evidence IDs: " + ", ".join(evidence_ids))
-                    if source_urls:
-                        st.markdown("**Sources**")
-                    for url in source_urls:
-                        st.markdown(f"- [Source]({url})")
-                    guidelines = s.get("guidelines_and_gaps") or s.get("guidelines") or []
-                    if guidelines:
-                        st.markdown("**Guidelines and evidence limits**")
-                        bullets(string_list(guidelines))
-            show_json("Agent 4 JSON", a4)
-            download_json("Download Agent 4 JSON", a4, f"agent4_brief_{prompt_id}.json", "dl_a4")
-
-    with tabs[4]:
+    with writer_tab:
         if a5 is None:
             if st.session_state.agent5_error:
                 st.warning("The brief may be ready, but Agent 5 failed. See the error above.")
             else:
                 st.info("Agent 5 has not completed.")
         else:
-            d = as_dict(a5)
-            article = str(d.get("article_markdown") or "").strip()
-            title = str(d.get("title") or "Final Blog")
-            if d.get("seo_title"):
-                st.caption(f"SEO title ({len(d['seo_title'])}/60): {d['seo_title']}")
-            if d.get("meta_description"):
-                st.caption(
-                    f"Meta description ({len(d['meta_description'])}/155): " f"{d['meta_description']}"
-                )
-            if not article:
-                st.warning("Agent 5 returned an empty article_markdown field.")
-            else:
-                if not article.startswith("# "):
-                    article = f"# {title}\\n\\n{article}"
-                claims, unresolved = d.get("claims_used") or [], d.get("unresolved_items") or []
-                x, y, z, w = st.columns(4)
-                x.metric("Word count", d.get("word_count", 0))
-                y.metric("Written sections", len(d.get("sections") or []))
-                z.metric("Tracked claims", len(claims))
-                w.metric("Unresolved items", len(unresolved))
-                btabs = st.tabs(["Read blog", "Markdown source", "Evidence & review"])
-                with btabs[0]:
+            writer_output = as_dict(a5)
+            article = str(writer_output.get("article_markdown") or "").strip()
+            title = str(writer_output.get("title") or "Generated blog")
+            seo_title = str(writer_output.get("seo_title") or "").strip()
+            meta_description = str(writer_output.get("meta_description") or "").strip()
+
+            # Center the blog in a reading-width column instead of stretching across the page.
+            _, page, _ = st.columns([1, 6, 1])
+            with page:
+                if not article:
+                    st.warning("Agent 5 returned an empty article_markdown field.")
+                else:
                     sections = split_article_sections(article)
-                    st.markdown(f"### {title}")
-                    st.divider()
-                    st.download_button(
-                        "Download formatted blog (PDF)",
-                        data=build_article_pdf(article),
-                        file_name=f"agent5_article_{prompt_id}.pdf",
-                        mime="application/pdf",
-                        key="download_agent5_pdf",
-                        type="primary",
-                        width="stretch",
-                    )
-                    with st.container(border=True):
+                    words = len(article.split())
+                    target = int(target_word_count)
+                    h2_count = len(re.findall(r"^##\s", article, flags=re.MULTILINE))
+                    faq_count = len(sections.faqs or [])
+                    verify_count = len(VERIFY_RE.findall(article))
+
+                    # ---- Header card: title, stats, actions ----
+                    with st.container(border=True, key="blog_header"):
+                        st.markdown(
+                            f'<h1 class="blog-title">{html.escape(title)}</h1>',
+                            unsafe_allow_html=True,
+                        )
+
+                        word_color = "green" if abs(words - target) <= target * 0.10 else "orange"
+                        chips = [f":{word_color}-badge[{words:,} of {target:,} words]"]
+                        if h2_count:
+                            chips.append(f":gray-badge[{h2_count} sections]")
+                        if faq_count:
+                            chips.append(f":gray-badge[{faq_count} FAQs]")
+                        if verify_count:
+                            chips.append(f":orange-badge[⚠ {verify_count} claims need a source]")
+                        else:
+                            chips.append(":green-badge[✓ no open source flags]")
+                        st.markdown(" ".join(chips))
+
+                        b1, b2, b3, _spacer = st.columns([1.25, 1.35, 1.45, 2.5])
+                        with b1:
+                            st.download_button(
+                                "Download PDF",
+                                data=cached_article_pdf(article),
+                                file_name=f"agent5_article_{prompt_id}.pdf",
+                                mime="application/pdf",
+                                key="download_agent5_pdf",
+                                type="primary",
+                                icon=":material/download:",
+                                width="stretch",
+                            )
+                        with b2:
+                            st.download_button(
+                                "Download Markdown",
+                                article + "\n",
+                                file_name=f"agent5_article_{prompt_id}.md",
+                                mime="text/markdown",
+                                key="download_agent5_blog",
+                                icon=":material/download:",
+                                width="stretch",
+                            )
+                        with b3:
+                            with st.popover(
+                                "Copy Markdown",
+                                icon=":material/content_copy:",
+                                width="stretch",
+                            ):
+                                st.caption("Use the copy icon at the top right of the box.")
+                                st.code(article, language="markdown", wrap_lines=True)
+
+                    seo_metadata_panel(seo_title, meta_description)
+
+                    # ---- Article body ----
+                    with st.container(border=True, key="blog_card"):
                         if sections.introduction:
-                            st.subheader("Introduction")
-                            st.markdown(sections.introduction)
+                            st.markdown(style_verify_markers(sections.introduction))
                         if sections.main_content:
-                            st.markdown(sections.main_content)
+                            st.markdown(style_verify_markers(sections.main_content))
                         if sections.conclusion:
                             st.subheader("Conclusion")
-                            st.markdown(sections.conclusion)
+                            st.markdown(style_verify_markers(sections.conclusion))
                         if sections.faqs or sections.faq_fallback:
                             st.subheader("Frequently Asked Questions")
                             if sections.faq_intro:
@@ -560,82 +410,18 @@ if any(x is not None for x in (a1, a2, a3, a4, a5, a6)):
                             if sections.faqs:
                                 for question, answer in sections.faqs:
                                     with st.expander(question):
-                                        st.markdown(answer)
+                                        st.markdown(style_verify_markers(answer))
                             else:
-                                st.markdown(sections.faq_fallback)
-                with btabs[1]:
-                    st.code(article, language="markdown")
-                    st.download_button(
-                        "Download blog (.md)",
-                        article + "\\n",
-                        file_name=f"agent5_article_{prompt_id}.md",
-                        mime="text/markdown",
-                        type="primary",
-                        width="stretch",
-                    )
-                with btabs[2]:
-                    st.subheader("Claims used")
-                    if claims:
-                        for claim in claims:
-                            c = as_dict(claim)
-                            with st.container(border=True):
-                                st.write(c.get("claim", ""))
-                                st.caption("Claim scope: " + str(c.get("claim_scope", "company_specific")))
-                                ids = string_list(c.get("evidence_ids"))
-                                if ids:
-                                    st.caption("Evidence IDs: " + ", ".join(ids))
-                                supporting_evidence = c.get("supporting_evidence") or []
-                                st.caption(
-                                    "Citation mapping: " + str(c.get("citation_status", "not_checked"))
-                                )
-                                st.caption(
-                                    "Evidence assessment (AI, not independently verified): "
-                                    + str(c.get("support_status", "not_assessed"))
-                                )
-                                for note in string_list(c.get("validation_notes")):
-                                    st.warning(note)
-                                if (
-                                    not supporting_evidence
-                                    and c.get("claim_scope", "company_specific") == "company_specific"
-                                ):
-                                    st.warning(
-                                        "No supplied evidence is attached to this claim; "
-                                        "review it before publication."
-                                    )
-                                for reference in supporting_evidence:
-                                    evidence = as_dict(reference)
-                                    st.markdown(
-                                        f"**{evidence.get('evidence_id')} · "
-                                        f"{evidence.get('status', 'unknown')}**"
-                                    )
-                                    if evidence.get("wording_boundary"):
-                                        st.warning("Wording boundary: " + str(evidence["wording_boundary"]))
-                                    st.markdown(
-                                        f"> {evidence.get('evidence_quote') or 'No quote available.'}"
-                                    )
-                                    if evidence.get("source_url"):
-                                        st.markdown(f"[Open source]({evidence['source_url']})")
-                    else:
-                        st.caption("No structured claims returned.")
-                    st.subheader("Unresolved items")
-                    bullets(string_list(unresolved), "No unresolved items reported.")
-                    st.subheader("Brief coverage")
-                    bullets(string_list(d.get("brief_coverage")), "No coverage report returned.")
-                show_json("Agent 5 JSON", a5)
-                download_json("Download Agent 5 JSON", a5, f"agent5_output_{prompt_id}.json", "dl_a5")
+                                st.markdown(style_verify_markers(sections.faq_fallback))
 
-    with tabs[5]:
+    with reviewer_tab:
         if a5 is None or a4 is None or a3 is None or a2 is None or a1 is None:
-            st.info("Complete Agents 1–5 before requesting the optional review.")
+            st.info("Complete Agents 1-5 before requesting the optional review.")
         else:
-            st.write(
-                "Review formatting, headings, content, keywords, SEO, and evidence-grounded "
-                "claims. The Reviewer uses an additional model call; it runs only when requested."
-            )
             if st.session_state.reviewer_error:
                 st.error(f"Reviewer: {st.session_state.reviewer_error}")
             if a6 is None and st.button(
-                "Review and revise blog",
+                "Run Agent 6 review",
                 type="primary",
                 key="run_agent6_review",
             ):
@@ -657,17 +443,9 @@ if any(x is not None for x in (a1, a2, a3, a4, a5, a6)):
                     review_requested=True,
                 )
                 try:
-                    with st.status(
-                        "Running optional Reviewer Agent",
-                        state="running",
-                        expanded=True,
-                    ) as review_status:
+                    with st.status("Running optional Reviewer Agent", state="running") as review_status:
                         reviewed_state = PipelineState.model_validate(build_pipeline().invoke(review_state))
-                        review_status.update(
-                            label="Reviewer completed",
-                            state="complete",
-                            expanded=False,
-                        )
+                        review_status.update(label="Reviewer completed", state="complete", expanded=False)
                     if reviewed_state.review_output is None:
                         raise RuntimeError("Workflow ended without a Reviewer result.")
                     st.session_state.agent6 = reviewed_state.review_output
@@ -683,73 +461,26 @@ if any(x is not None for x in (a1, a2, a3, a4, a5, a6)):
                     st.session_state.reviewer_error = f"{type(exc).__name__}: {exc}"
                     st.error(f"Reviewer could not complete: {st.session_state.reviewer_error}")
 
-            a6 = st.session_state.agent6
-            if a6 is not None:
-                review_data = as_dict(a6)
-                revised = review_data.get("revised_blog") or {}
-                revised_article = str(revised.get("article_markdown") or "").strip()
-                st.success(str(review_data.get("summary") or "Review completed."))
-                review_tabs = st.tabs(["Revised blog with changes", "Final Markdown", "Review findings"])
-                with review_tabs[0]:
-                    st.caption("Green text marks words added or changed by Agent 6.")
-                    if a5.article_markdown and revised_article:
-                        st.markdown(
-                            render_markdown_diff(a5.article_markdown, revised_article),
-                            unsafe_allow_html=True,
-                        )
-                with review_tabs[1]:
-                    st.code(revised_article, language="markdown")
-                    st.download_button(
-                        "Download revised blog (.md)",
-                        revised_article + "\n",
-                        file_name=f"reviewed_article_{prompt_id}.md",
-                        mime="text/markdown",
-                        key="download_reviewed_blog",
-                        width="stretch",
-                    )
-                with review_tabs[2]:
-                    st.subheader("Review findings")
-                    for finding in review_data.get("findings") or []:
-                        finding_data = as_dict(finding)
-                        st.markdown(
-                            f"**{finding_data.get('severity', 'review')} · "
-                            f"{finding_data.get('area', 'content')}** — "
-                            f"{finding_data.get('issue', '')}"
-                        )
-                        st.write(finding_data.get("recommendation", ""))
-                    st.subheader("Claims requiring human verification")
-                    flagged = [
-                        as_dict(claim)
-                        for claim in revised.get("claims_used") or []
-                        if as_dict(claim).get("claim_scope", "company_specific") == "company_specific"
-                        and as_dict(claim).get("support_status")
-                        in {
-                            "partially_supported",
-                            "unsupported",
-                            "contradicted",
-                            "inconclusive",
-                            "not_assessed",
-                        }
-                    ]
-                    if flagged:
-                        for claim in flagged:
-                            st.warning(f"{claim.get('support_status')}: {claim.get('claim')}")
-                    else:
-                        st.success("No company-specific claims were flagged by the reviewer.")
+            if st.session_state.agent6 is not None:
+                review_output = as_dict(st.session_state.agent6)
+                st.caption("Agent 6 reports issues only; it does not edit the Agent 5 draft.")
+                if review_output.get("summary"):
+                    st.info(str(review_output["summary"]))
+                findings = review_output.get("findings") or []
+                if findings:
+                    with st.expander("Review findings", icon=":material/rate_review:"):
+                        for raw_finding in findings:
+                            finding = as_dict(raw_finding)
+                            st.markdown(
+                                f"**{finding.get('severity', 'Review')} · "
+                                f"{finding.get('area', 'Content')}** — {finding.get('issue', '')}"
+                            )
+                            if finding.get("recommendation"):
+                                st.write(finding["recommendation"])
+                else:
+                    st.success("No material issues were reported. Human review is still required.")
+                unresolved = review_output.get("unresolved_items") or []
+                if unresolved:
                     st.subheader("Unresolved items")
-                    bullets(string_list(revised.get("unresolved_items")), "No unresolved items.")
-                show_json("Agent 6 JSON", a6)
-                download_json(
-                    "Download Agent 6 JSON",
-                    a6,
-                    f"agent6_review_{prompt_id}.json",
-                    "dl_agent6",
-                )
-
-if a3 is not None and a4 is not None and a5 is not None:
-    st.info(
-        "Draft generated by Agents 1–5. Human review of claims, citations, and "
-        "unresolved items is required before publication."
-    )
-elif a3 is not None and a5 is None:
-    st.info("Research results are available. Check the Agent 4/5 status and errors above.")
+                    for item in unresolved:
+                        st.markdown(f"- {item}")

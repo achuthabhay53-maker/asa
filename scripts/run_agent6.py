@@ -111,28 +111,18 @@ def main() -> None:
         "--output",
         type=Path,
         default=ROOT / "agent6_output.json",
-        help="Reviewer result JSON path.",
-    )
-    parser.add_argument(
-        "--markdown-output",
-        type=Path,
-        default=ROOT / "agent6_reviewed.md",
-        help="Revised Markdown article path.",
+        help="Reviewer findings JSON path.",
     )
     args = parser.parse_args()
 
     paths = {f"agent{number}": getattr(args, f"agent{number}") for number in range(1, 6)}
     state = load_review_state(paths, website=args.website)
     output_path = args.output.resolve()
-    markdown_path = args.markdown_output.resolve()
-    if output_path == markdown_path:
-        parser.error("--output and --markdown-output must be different files")
     input_paths = {path.resolve() for path in paths.values()}
-    if output_path in input_paths or markdown_path in input_paths:
+    if output_path in input_paths:
         parser.error("Output paths must not overwrite Agent 1-5 input files")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    markdown_path.parent.mkdir(parents=True, exist_ok=True)
     writer_input = _build_writer_input(state)
     if state.written_article is None:
         raise ValueError("Agent 5 output is missing.")
@@ -144,12 +134,7 @@ def main() -> None:
         json.dumps(output, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
-    markdown_path.write_text(
-        result.revised_blog.article_markdown.rstrip() + "\n",
-        encoding="utf-8",
-    )
-    print(f"Agent 6 review JSON: {output_path}")
-    print(f"Revised blog Markdown: {markdown_path}")
+    print(f"Agent 6 findings JSON: {output_path}")
 
 
 if __name__ == "__main__":

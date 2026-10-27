@@ -18,7 +18,7 @@ from aca.models.writer import (
 _ARTICLE = """# VR Training for Medical Device Teams
 
 VR training can give medical device teams a way to practice procedures through
-interactive simulations. The supplied evidence describes immersive training
+interactive simulations. The supplied evidence describes virtual training
 for medical device teams and procedural practice.
 
 ## How the training works
@@ -42,7 +42,7 @@ Learners practice procedures through interactive simulation.
 
 ### Who can use this training?
 
-Medical device teams can use immersive training to practice procedures.
+Medical device teams can use VR-based training to practice procedures.
 """
 
 
@@ -124,17 +124,14 @@ def test_reviewer_removes_unapproved_source_urls_and_flags_claims():
     assert any("needs human verification" in item for item in sanitized.unresolved_items)
 
 
-def test_reviewer_returns_the_complete_edited_blog():
+def test_reviewer_returns_findings_without_rewriting_the_draft():
     draft = _writer_output()
-    long_meta_description = (
-        "Custom VR surgical simulations & clinical training for medical device companies. "
-        "Ethosh delivers 8–12 week implementations with enterprise analytics. Learn more."
-    )
-    revised_article = draft.article_markdown.replace(
-        "VR training can give medical device teams",
-        "Immersive VR training can give medical device teams",
-        1,
-    )
+    finding = {
+        "area": "grammar",
+        "severity": "medium",
+        "issue": "The opening paragraph repeats a phrase.",
+        "recommendation": "Have a human edit the repeated phrase.",
+    }
     response = SimpleNamespace(
         stop_reason="end_turn",
         content=[
@@ -142,12 +139,8 @@ def test_reviewer_returns_the_complete_edited_blog():
                 type="text",
                 text=json.dumps(
                     {
-                        "summary": "Made one clarity improvement.",
-                        "findings": [],
-                        "title": draft.title,
-                        "seo_title": draft.seo_title,
-                        "meta_description": long_meta_description,
-                        "article_markdown": revised_article,
+                        "summary": "One writing issue needs human review.",
+                        "findings": [finding],
                         "unresolved_items": [],
                     }
                 ),
@@ -162,20 +155,18 @@ def test_reviewer_returns_the_complete_edited_blog():
 
     reviewer = ReviewerAgent.__new__(ReviewerAgent)
     reviewer.model = "test"
-    reviewer.max_tokens = 16384
+    reviewer.max_tokens = 4096
     reviewer.client = SimpleNamespace(messages=SimpleNamespace(create=create))
 
     result = reviewer.review(_writer_input(), draft)
 
-    assert result.revised_blog.article_markdown == revised_article
-    assert len(long_meta_description) > 155
-    assert len(result.revised_blog.meta_description) <= 155
-    assert result.revised_blog.meta_description.startswith("Custom VR surgical simulations")
-    assert any(
-        "meta description exceeded 155 characters" in item for item in result.revised_blog.unresolved_items
-    )
+    assert result.summary == "One writing issue needs human review."
+    assert [item.model_dump() for item in result.findings] == [finding]
+    assert result.unresolved_items == []
+    assert draft.article_markdown == _writer_output().article_markdown
+    assert "revised_blog" not in result.model_dump()
     assert len(calls) == 1
-    assert calls[0]["max_tokens"] == 16384
+    assert calls[0]["max_tokens"] == 4096
     request = json.loads(calls[0]["messages"][0]["content"])
     assert "article_markdown" in request["draft"]
     assert "sections" in request
@@ -185,6 +176,8 @@ def test_reviewer_returns_the_complete_edited_blog():
         "evidence_ids",
         "support_status",
     }
+    assert "do not rewrite" in calls[0]["system"].lower()
+    assert "article_markdown" not in calls[0]["system"]
 
 
 def test_reviewer_normalizes_empty_meta_description_without_failing_review():
@@ -205,10 +198,10 @@ def test_reviewer_reports_when_full_blog_response_is_truncated():
 
     reviewer = ReviewerAgent.__new__(ReviewerAgent)
     reviewer.model = "test"
-    reviewer.max_tokens = 16384
+    reviewer.max_tokens = 4096
     reviewer.client = SimpleNamespace(messages=SimpleNamespace(create=create))
 
-    with pytest.raises(RuntimeError, match="truncated at 16,384 output tokens"):
+    with pytest.raises(RuntimeError, match="truncated at 4,096 output tokens"):
         reviewer.review(_writer_input(), _writer_output())
 
     assert len(calls) == 1
@@ -245,7 +238,10 @@ def _writer_output(
     return WriterOutput(
         title=title,
         seo_title=title[:60],
-        meta_description="How VR training helps medical device teams practice procedures.",
+        meta_description=(
+            "Learn how medical device teams use virtual reality training to practice "
+            "procedures, assess training options, and choose an approach that fits their needs."
+        ),
         article_markdown=article,
         word_count=75,
         sections=[
@@ -704,7 +700,7 @@ def test_writer_keeps_blog_when_metadata_exceeds_seo_limits():
 
     result = agent.write(_writer_input())
 
-    assert result.meta_description == result.title
+    assert len(result.meta_description) <= 155
     assert len(result.seo_title) <= 60
     assert len(result.meta_description) <= 155
     assert len(calls) == 1
@@ -835,15 +831,15 @@ def test_writer_reports_when_retry_is_still_truncated():
         ("# VR Training for Medical Device Teams\n\nNo FAQ.", "missing its Frequently Asked Questions"),
         (
             _ARTICLE.replace(
-                "### Who can use this training?\n\nMedical device teams can use immersive training to practice procedures.\n",
+                "### Who can use this training?\n\nMedical device teams can use VR-based training to practice procedures.\n",
                 "",
             ),
             "3 to 5 questions",
         ),
         (
             _ARTICLE.replace(
-                "### Who can use this training?\n\nMedical device teams can use immersive training to practice procedures.",
-                "### Who can use this training?\n\nMedical device teams can use immersive training to practice procedures.\n\n### What equipment is required?\n\nThe article does not specify equipment.\n\n### How long does training take?\n\nThe article does not say.\n\n### How is progress measured?\n\nThe article does not say.",
+                "### Who can use this training?\n\nMedical device teams can use VR-based training to practice procedures.",
+                "### Who can use this training?\n\nMedical device teams can use VR-based training to practice procedures.\n\n### What equipment is required?\n\nThe article does not specify equipment.\n\n### How long does training take?\n\nThe article does not say.\n\n### How is progress measured?\n\nThe article does not say.",
             ),
             "3 to 5 questions",
         ),
@@ -883,6 +879,79 @@ def test_writer_input_carries_seo_research_and_prompt_requires_article_standards
         "unresolved_items",
         "brief_coverage",
     }
+
+
+def test_human_writing_rules_are_in_the_writer_prompt():
+    prompt = WriterAgent._system_prompt()
+
+    assert "knowledgeable industry practitioner" in prompt
+    assert "first two sentences under each heading" in prompt
+    assert "no more than two dashes" in prompt
+    assert "According to Ethosh" in prompt
+    assert "banned words and phrases" in prompt
+
+
+def test_reviewer_prompt_reports_issues_without_rewriting():
+    prompt = ReviewerAgent._system_prompt()
+
+    assert "Do not rewrite, edit" in prompt
+    assert "for a human to review" in prompt
+    assert '"article_markdown"' not in prompt
+    assert "grammar and spelling errors" in prompt
+
+
+def test_reviewer_parser_accepts_trailing_text_after_valid_json():
+    response = {
+        "summary": "Reviewed the article.",
+        "findings": [],
+        "unresolved_items": [],
+    }
+
+    parsed = ReviewerAgent._parse_json(
+        "```json\n" + json.dumps(response) + "\n```\nAdditional model commentary."
+    )
+
+    assert parsed == response
+
+
+def test_reviewer_parser_identifies_and_ignores_duplicate_response(caplog):
+    response = {
+        "summary": "Reviewed the article.",
+        "findings": [],
+        "unresolved_items": [],
+    }
+    repeated = {
+        **response,
+        "summary": "A duplicate response appended by the model.",
+    }
+
+    parsed = ReviewerAgent._parse_json(json.dumps(response) + "\n" + json.dumps(repeated))
+
+    assert parsed == response
+    assert "a second valid reviewer JSON object" in caplog.text
+    assert "extra content was ignored" in caplog.text
+
+
+def test_reviewer_parser_rejects_response_without_complete_schema_object():
+    with pytest.raises(RuntimeError, match="no complete JSON object"):
+        ReviewerAgent._parse_json('{"summary": "incomplete"')
+
+
+def test_reviewer_parser_reports_schema_fields_without_echoing_response():
+    with pytest.raises(RuntimeError, match="summary: Field required"):
+        ReviewerAgent._parse_json(json.dumps({"findings": []}))
+
+
+def test_reviewer_parser_rejects_rewritten_article_fields():
+    response = {
+        "summary": "Review complete.",
+        "findings": [],
+        "unresolved_items": [],
+        "article_markdown": "# Rewritten draft",
+    }
+
+    with pytest.raises(RuntimeError, match="article_markdown: Extra inputs are not permitted"):
+        ReviewerAgent._parse_json(json.dumps(response))
 
 
 def test_writer_requires_seo_title_and_155_character_meta_description():

@@ -379,7 +379,7 @@ def test_workflow_resumes_at_first_missing_agent_output(monkeypatch):
 
 def test_requested_review_runs_only_after_existing_five_agent_outputs(monkeypatch):
     draft = agent5_output()
-    review = ReviewOutput(summary="Reviewed and revised.", revised_blog=draft)
+    review = ReviewOutput(summary="Review complete.", findings=[])
     calls = []
 
     class FakeReviewerAgent:

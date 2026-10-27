@@ -2,13 +2,13 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
-from aca.models.writer import WriterClaim, WriterOutput
+from aca.models.writer import WriterClaim
 
 
 class ReviewFinding(BaseModel):
-    area: Literal["formatting", "headings", "content", "keywords", "seo", "factual_claims"]
+    area: Literal["grammar", "formatting", "headings", "content", "keywords", "seo", "factual_claims"]
     severity: Literal["critical", "high", "medium", "low"]
     issue: str
     recommendation: str
@@ -27,16 +27,14 @@ class RevisedBlog(BaseModel):
 class ReviewOutput(BaseModel):
     summary: str
     findings: list[ReviewFinding] = Field(default_factory=list)
-    revised_blog: WriterOutput
+    unresolved_items: list[str] = Field(default_factory=list)
 
 
 class ReviewerResponse(BaseModel):
-    """Reviewer response containing the complete revised article."""
+    """Reviewer response containing findings for human follow-up."""
+
+    model_config = ConfigDict(extra="forbid")
 
     summary: str
     findings: list[ReviewFinding] = Field(default_factory=list, max_length=5)
-    title: str
-    seo_title: str
-    meta_description: str
-    article_markdown: str
     unresolved_items: list[str] = Field(default_factory=list, max_length=10)

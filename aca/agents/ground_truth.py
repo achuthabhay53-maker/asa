@@ -833,7 +833,7 @@ Rules:
 
         # Keep each page snippet small so the payload stays within Claude's
         # context window and leaves enough room for a full JSON response.
-        _SNIPPET = 4_000
+        _SNIPPET = 6_000
         trimmed_evidence = [
             {
                 "url": p["url"],

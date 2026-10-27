@@ -16,12 +16,13 @@ from pydantic import ValidationError
 
 from aca.evidence import canonicalize_evidence_url
 from aca.models.writer import WriterEvidence, WriterInput, WriterOutput
+from aca.reviewer_lint import build_retry_message, lint_article
 
 
 class WriterAgent:
     def __init__(
         self,
-        model: str = "claude-haiku-4-5",
+        model: str = "claude-sonnet-5-5",
         max_tokens: int = 11000,
     ) -> None:
         api_key = os.getenv("ANTHROPIC_API_KEY")
@@ -66,9 +67,59 @@ class WriterAgent:
             result = self._sanitize_evidence_references(result, writer_input.evidence)
             result = self._normalize_metadata(result)
             self._validate_seo_requirements(result, writer_input)
+
+        # Style lint runs on the model's own text, before code appends [VERIFY] notes.
+        result, style_notes = self._enforce_style(result, user_prompt, writer_input)
+
         result = self._attach_supporting_evidence(result, writer_input.evidence)
         result = self._flag_unsupported_numeric_claims(result, writer_input.evidence)
-        return self._audit_claims_and_faqs(result)
+        result = self._audit_claims_and_faqs(result)
+        if style_notes:
+            result = result.model_copy(
+                update={"unresolved_items": list(dict.fromkeys([*result.unresolved_items, *style_notes]))}
+            )
+        return result
+
+    def _enforce_style(
+        self,
+        result: WriterOutput,
+        user_prompt: str,
+        writer_input: WriterInput,
+    ) -> tuple[WriterOutput, list[str]]:
+        """Lint the draft; if it fails, ask the model to fix exactly those issues once."""
+        issues = lint_article(
+            result.article_markdown,
+            title=result.title,
+            seo_title=result.seo_title,
+            meta_description=result.meta_description,
+        )
+        if not issues:
+            return result, []
+
+        retry_prompt = (
+            user_prompt
+            + "\n\n"
+            + build_retry_message(issues)
+            + "\n\n<previous_draft>\n"
+            + result.model_dump_json(indent=2)
+            + "\n</previous_draft>"
+        )
+        try:
+            retried = self._generate_output(retry_prompt)
+            retried = self._sanitize_evidence_references(retried, writer_input.evidence)
+            retried = self._normalize_metadata(retried)
+            self._validate_seo_requirements(retried, writer_input)
+        except RuntimeError:
+            # The retry broke the structure or output; keep the first draft and report the issues.
+            return result, [f"Style check: {issue}" for issue in issues]
+
+        remaining = lint_article(
+            retried.article_markdown,
+            title=retried.title,
+            seo_title=retried.seo_title,
+            meta_description=retried.meta_description,
+        )
+        return retried, [f"Style check: {issue}" for issue in remaining]
 
     @staticmethod
     def _flag_unsupported_numeric_claims(
@@ -80,7 +131,7 @@ class WriterAgent:
             r"(?<![\w])(?:[$€£]\s*)?(\d[\d,]*(?:\.\d+)?)"
             r"\s*\+?\s*(%|percent\b|employees?\b|users?\b|weeks?\b|months?\b|"
             r"years?\b|days?\b|hours?\b|million\b|billion\b|times\b|locations?\b|"
-            r"countries\b|clients?\b|customers?\b)?",
+            r"countries\b|clients?\b|customers?\b)?(?![A-Za-z])",
             re.IGNORECASE,
         )
         stop_words = {
@@ -113,10 +164,14 @@ class WriterAgent:
         }
 
         def number_keys(text: str) -> set[tuple[str, str]]:
-            return {
-                (match.group(1).replace(",", ""), (match.group(2) or "").casefold())
-                for match in number_pattern.finditer(text)
-            }
+            keys = set()
+            for match in number_pattern.finditer(text):
+                digits = match.group(1).replace(",", "")
+                unit = (match.group(2) or "").casefold()
+                if not unit and re.fullmatch(r"(19|20)\d\d", digits):
+                    continue  # a bare year is not a numerical claim
+                keys.add((digits, unit))
+            return keys
 
         verified = {
             item.evidence_id: item for item in evidence if item.status == "verified" and item.evidence_quote
@@ -281,19 +336,47 @@ class WriterAgent:
         return result.model_copy(update={"unresolved_items": unresolved})
 
     @staticmethod
+    def _shorten(text: str, limit: int) -> str:
+        """Trim text to a limit at a sentence end if possible, otherwise at a word boundary."""
+        text = text.strip()
+        if len(text) <= limit:
+            return text
+        cut = text[:limit]
+        ends = [m.end() for m in re.finditer(r"[.!?](?=\s|$)", cut)]
+        if ends and ends[-1] >= int(limit * 0.6):
+            return cut[: ends[-1]].strip()
+        if " " in cut:
+            cut = cut.rsplit(" ", 1)[0]
+        return cut.rstrip(" ,;:-")
+
+    @staticmethod
+    def _first_paragraph(article_markdown: str, limit: int) -> str:
+        """First body paragraph after the H1, with link URLs removed, trimmed to a limit."""
+        for block in re.split(r"\n\s*\n", article_markdown):
+            text = block.strip()
+            if text and not text.startswith(("#", "|", "-", "*", ">", "[VERIFY")):
+                plain = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+                return WriterAgent._shorten(plain, limit)
+        return ""
+
+    @staticmethod
     def _normalize_metadata(result: WriterOutput) -> WriterOutput:
-        """Keep a usable blog when Claude returns metadata outside SEO limits."""
+        """Keep a usable blog when Claude returns metadata outside SEO limits.
+
+        A too-long meta description is trimmed, not replaced with the title. An empty one
+        falls back to the article's first paragraph.
+        """
         seo_title = result.seo_title.strip()
         if not seo_title or len(seo_title) > 60:
-            seo_title = result.title.strip()[:60].rsplit(" ", 1)[0]
-            if not seo_title:
-                seo_title = result.title.strip()[:60]
+            seo_title = WriterAgent._shorten(result.title, 60) or result.title.strip()[:60]
 
         meta_description = result.meta_description.strip()
-        if not meta_description or len(meta_description) > 155:
-            meta_description = result.title.strip()
-            if len(meta_description) > 155:
-                meta_description = meta_description[:155].rsplit(" ", 1)[0]
+        if not meta_description:
+            meta_description = WriterAgent._first_paragraph(
+                result.article_markdown, 155
+            ) or WriterAgent._shorten(result.title, 155)
+        elif len(meta_description) > 155:
+            meta_description = WriterAgent._shorten(meta_description, 155)
 
         return result.model_copy(update={"seo_title": seo_title, "meta_description": meta_description})
 
@@ -551,11 +634,71 @@ IMPORTANT: Do not write a company profile, product catalogue, technical
 report, list of capabilities, or marketing brochure unless the brief
 explicitly asks for that format. The default output is a reader-focused blog.
 
+VOICE AND HUMAN WRITING RULES
+
+These rules apply to article_markdown, FAQ answers, and the meta description.
+
+- Write as a knowledgeable industry practitioner explaining the subject to
+  a colleague, not as a brochure or textbook. Each paragraph should give the
+  reader a useful point, explanation, or next step.
+- Open with a concrete situation, a specific reader problem, or the direct
+  answer. Never open with a broad statement about companies facing challenges
+  and never write "this guide will explore/examine/explain." In the first 60
+  words after the H1, state the direct answer to the main question. Do not
+  describe what the article covers.
+- The first two sentences under each heading must answer that heading directly
+  in plain words before adding detail.
+- Before writing each section, pick the one to three verified facts it will
+  rest on. If the evidence for a section is thin, write a shorter section.
+  Never pad it with general statements, repeated points, or lists of what a
+  good vendor "should" offer. Record the gap in unresolved_items.
+- Vary sentence length, including some sentences under eight words. Prefer
+  plain verbs such as "use", "show", "cut", and "start".
+- Banned words and phrases: "leverage", "utilize", "facilitate", "empower",
+  "streamline", "robust", "seamless", "cutting-edge", "game-changing",
+  "landscape", "realm", "holistic", "comprehensive", "near-real", "life-like",
+  "with precision", "in today's fast-paced world", "This means that",
+  "It is important to note", "plays a crucial role", "stems from",
+  "when it comes to", and "not only X but also Y". Use "immersive" and
+  "scalable" at most twice each in the whole article, and "measurable" at
+  most once, even when the sources use them.
+- Use no more than two dashes in the whole article, counting em dashes and
+  spaced en dashes ( – ). Use periods or commas instead. Avoid habitual groups
+  of three. Do not end a paragraph by restating its point.
+- Vary section structure to fit the material. Not every section should be an
+  introduction, bullets, and a wrap-up sentence. Use bullets only for parallel
+  items, at most two bulleted lists in the whole article, and never a bold
+  label before bullets or paragraphs. Tables are fine. Headings should sound
+  like useful reader questions or clear answers.
+- Keep the conclusion to 3 or 4 sentences. Give one supported decision or next
+  step, and do not repeat the introduction.
+- Prefer concrete details from verified evidence over generic adjectives.
+  If a sentence would fit any company in the industry, rewrite or cut it.
+  Use one concrete example or scenario per major section only when it appears
+  in verified ground truth. If none is available, do not invent one. Never
+  infer a reason, mechanism, benefit, process step, timeline detail, security
+  feature, or outcome that the sources do not state. A number from a source
+  does not license an explanation of why.
+- Attribute claims from company pages to the company (for example,
+  "Ethosh says" or "According to Ethosh"). Where something is not published,
+  say so plainly, for example "Ethosh doesn't publish pricing." Hedge only
+  where evidence is weak. Say "confirm with" the company at most once in the
+  article. Address the reader as "you" where natural, and use the company name
+  instead of repeatedly saying "the company" or "the provider."
+- Where evidence supports it, state which buyer or use case the product fits
+  and which it does not. Do not invent a recommendation.
+- The meta description is a one-sentence summary of the post, 120 to 155
+  characters, and is never the title repeated.
+- Before returning, reread and fix generic openings, banned words and phrases,
+  more than two dashes, more than two lists, bold labels, repetitive paragraph
+  endings, generic sentences that could fit any company, unattributed vendor
+  claims, and any sentence that states something the evidence does not say.
+
 BLOG WRITING APPROACH
 
 1. Start with the reader, not the company.
-   Open with the problem, question, decision, misconception, or challenge
-   that brought the reader to this topic. Make the relevance clear.
+   Open with the situation, question, decision, or misconception that
+   brought the reader to this topic. Make the relevance clear.
 
 2. Establish context before introducing the company.
    Explain why the topic matters and what the reader needs to understand.
@@ -579,7 +722,7 @@ BLOG WRITING APPROACH
 
 6. Use a natural blog style.
    Write clear, connected paragraphs with varied sentence structure.
-   Use lists when they improve readability, not as a substitute for
+   Use lists only when they improve readability, not as a substitute for
    explanation. Explain technical terms when the audience needs it.
 
 7. Avoid repetitive promotional language.
@@ -633,14 +776,15 @@ EVIDENCE AND FACTUALITY
 BRIEF AND OUTPUT REQUIREMENTS
 
 16. Follow the brief's search intent, audience, article objective,
-    required topics, style, restrictions, and target word count.
+    required topics, style, and restrictions. Treat the target word count
+    as a rough guide (within 10%). Never reach it by padding.
 
 17. Include a dedicated "Frequently Asked Questions" H2 section in every
     article, with 3 to 5 generic, relevant H3 questions readers might
     naturally ask about the topic. Base them on the article, search intent,
     and available keyword research. Make each answer 40–50 words, clear,
     self-contained, and directly related to the blog; prefer summarizing
-    information already explained.
+    information already explained. Start each answer with the direct answer.
     Do not ask about measurable improvements, ROI, performance changes, or
     outcomes unless the supplied evidence explicitly reports them.
     Do not invent company-specific facts, capabilities, statistics, or
@@ -719,9 +863,9 @@ ARTICLE FORMAT
 
 - Set title to the H1 text and include the primary keyword in it.
 - Set seo_title separately, include the primary keyword, and keep it within
-  60 characters. Set meta_description to no more than 155 characters.
-- In the first 60 words after the H1, include a standalone summary of the
-  article's answer and scope.
+  60 characters. Set meta_description to 120 to 155 characters.
+- In the first 60 words after the H1, state the direct answer to the main
+  question. Do not describe what the article covers.
 - Prefer descriptive H2 headings phrased as questions or clear answers.
   Use H3 headings only when they improve organization.
 - Include at least one concise, useful Markdown table that explains or
@@ -767,16 +911,18 @@ ARTICLE STRUCTURE
 
 - Write an engaging, topic-focused H1 title matching the title field.
 - Write a separate SEO title of no more than 60 characters and a concise,
-  accurate meta description of no more than 155 characters.
-- Begin with an introduction that establishes the reader's problem and
-  explains why the topic matters, then answer the main question directly.
-  Include a standalone summary of the article's answer and scope within the
-  first 60 words after the H1.
+  accurate meta description of 120 to 155 characters that summarizes the post
+  and does not repeat the title.
+- Begin with an introduction that establishes the reader's situation and why
+  the topic matters. State the direct answer to the main question within the
+  first 60 words after the H1. Do not describe what the article covers.
 - Develop the topic in a logical sequence using useful H2 and H3 headings.
 - Include at least one useful Markdown table built only from supported
   information in the writer input. Do not invent table facts or comparisons.
-- Aim for the target_word_count in the writer input. Treat it as a writing
-  target, not a hard limit; the complete article may be longer or shorter.
+- target_word_count in the writer input is a rough guide (within 10%). Never
+  reach it by adding generic filler, repeated points, or lists of what a good
+  vendor "should" offer. If the evidence supports less, write less and record
+  the gap in unresolved_items.
 - Introduce company capabilities in context instead of making the whole
   article a company description.
 - Include concrete, evidence-supported details where available.

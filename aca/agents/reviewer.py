@@ -1,8 +1,9 @@
-"""Agent 6: Review and revise a generated blog before human publication review."""
+"""Agent 6: Review a generated blog and report issues for human review."""
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from typing import Any
@@ -11,21 +12,21 @@ import anthropic
 from pydantic import ValidationError
 
 from aca.evidence import canonicalize_evidence_url
-from aca.models.reviewer import ReviewOutput, ReviewerResponse, RevisedBlog
+from aca.models.reviewer import ReviewOutput, ReviewerResponse
 from aca.models.writer import (
     WriterEvidence,
     WriterInput,
     WriterOutput,
     WrittenSection,
 )
-from aca.agents.writer import WriterAgent
+logger = logging.getLogger(__name__)
 
 
 class ReviewerAgent:
     def __init__(
         self,
         model: str = "claude-haiku-4-5",
-        max_tokens: int = 16384,
+        max_tokens: int = 4096,
     ) -> None:
         api_key = os.getenv("ANTHROPIC_API_KEY")
         if not api_key:
@@ -35,7 +36,7 @@ class ReviewerAgent:
         self.max_tokens = max_tokens
 
     def review(self, writer_input: WriterInput, draft: WriterOutput) -> ReviewOutput:
-        """Review the draft, revise it, and preserve evidence-aware review findings."""
+        """Review the draft and return findings without changing the article."""
         payload = {
             "company_name": writer_input.company_name,
             "company_url": writer_input.company_url,
@@ -66,6 +67,8 @@ class ReviewerAgent:
                 }
                 for item in writer_input.evidence
             ],
+            "draft_unresolved_items": draft.unresolved_items,
+            "brief_coverage": draft.brief_coverage,
             "draft": {
                 "title": draft.title,
                 "seo_title": draft.seo_title,
@@ -96,7 +99,7 @@ class ReviewerAgent:
         if response.stop_reason == "max_tokens":
             raise RuntimeError(
                 f"Reviewer response was truncated at {self.max_tokens:,} output tokens. "
-                "Shorten the draft or reduce its target word count and try again."
+                "Reduce the findings to concise issues and try again."
             )
         if response.stop_reason not in {"end_turn", "stop_sequence"}:
             raise RuntimeError(
@@ -112,26 +115,10 @@ class ReviewerAgent:
         except (ValidationError, ValueError) as exc:
             raise RuntimeError(f"Reviewer Agent returned invalid output: {exc}") from exc
 
-        revision = RevisedBlog(
-            title=result.title,
-            seo_title=result.seo_title,
-            meta_description=result.meta_description,
-            article_markdown=result.article_markdown,
-            claims_used=draft.claims_used,
-            unresolved_items=list(dict.fromkeys([*draft.unresolved_items, *result.unresolved_items])),
-            brief_coverage=draft.brief_coverage,
-        )
-        revised = self._build_writer_output(draft, revision)
-        revised = self._sanitize_revised_blog(revised, writer_input.evidence)
-        revised = self._normalize_revised_metadata(revised)
-        try:
-            WriterAgent._validate_seo_requirements(revised, writer_input)
-        except RuntimeError as exc:
-            raise RuntimeError(f"Reviewer Agent returned an invalid blog: {exc}") from exc
         return ReviewOutput(
             summary=result.summary,
             findings=result.findings,
-            revised_blog=revised,
+            unresolved_items=result.unresolved_items,
         )
 
     @staticmethod
@@ -350,51 +337,122 @@ class ReviewerAgent:
     @staticmethod
     def _parse_json(raw_text: str) -> dict[str, Any]:
         text = raw_text.strip()
-        if text.startswith("```"):
-            text = re.sub(r"^```(?:json)?\s*", "", text)
-            text = re.sub(r"\s*```$", "", text)
-        try:
-            payload = json.loads(text)
-        except json.JSONDecodeError as exc:
+        decoder = json.JSONDecoder()
+        last_json_error: json.JSONDecodeError | None = None
+        last_validation_error: ValidationError | None = None
+        search_from = 0
+
+        while (start := text.find("{", search_from)) != -1:
+            try:
+                payload, end = decoder.raw_decode(text, start)
+            except json.JSONDecodeError as exc:
+                last_json_error = exc
+                search_from = start + 1
+                continue
+
+            search_from = start + 1
+            if not isinstance(payload, dict):
+                continue
+            try:
+                ReviewerResponse.model_validate(payload)
+            except ValidationError as exc:
+                last_validation_error = exc
+                continue
+            trailing_kind = ReviewerAgent._classify_trailing_content(text[end:])
+            if trailing_kind:
+                logger.warning(
+                    "Reviewer response had %s after its first valid JSON object "
+                    "(starting at character %d); extra content was ignored.",
+                    trailing_kind,
+                    end,
+                )
+            return payload
+
+        if last_validation_error is not None:
+            missing_or_invalid_fields = [
+                f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}"
+                for error in last_validation_error.errors(include_input=False)[:5]
+            ]
             raise RuntimeError(
-                f"Reviewer Agent returned invalid JSON at character {exc.pos}: {exc.msg}."
-            ) from exc
-        if not isinstance(payload, dict):
-            raise RuntimeError("Reviewer Agent output must be a JSON object.")
-        return payload
+                "Reviewer Agent response contained JSON, but no object matched "
+                "the required review response schema. "
+                f"Field errors: {'; '.join(missing_or_invalid_fields)}."
+            ) from last_validation_error
+        if last_json_error is not None:
+            raise RuntimeError(
+                "Reviewer Agent response contained no complete JSON object. "
+                f"First syntax error at character {last_json_error.pos}: "
+                f"{last_json_error.msg} (response length: {len(text)} characters)."
+            ) from last_json_error
+        raise RuntimeError(
+            "Reviewer Agent output contained no JSON object "
+            f"(response length: {len(text)} characters)."
+        )
+
+    @staticmethod
+    def _classify_trailing_content(trailing_text: str) -> str | None:
+        trailing = trailing_text.strip()
+        if not trailing or re.fullmatch(r"```(?:json)?\s*```", trailing, flags=re.IGNORECASE):
+            return None
+
+        decoder = json.JSONDecoder()
+        search_from = 0
+        while (start := trailing.find("{", search_from)) != -1:
+            try:
+                payload, _ = decoder.raw_decode(trailing, start)
+            except json.JSONDecodeError:
+                search_from = start + 1
+                continue
+            if isinstance(payload, dict):
+                try:
+                    ReviewerResponse.model_validate(payload)
+                except ValidationError:
+                    return "another JSON object"
+                return "a second valid reviewer JSON object"
+            search_from = start + 1
+        return "non-JSON trailing text"
 
     @staticmethod
     def _system_prompt() -> str:
-        return """You are Agent 6, a light-touch publication reviewer. Check the draft for
-major formatting, headings, completeness, clarity, keyword, SEO, and company-fact
-issues. Make only necessary improvements. Return the complete final blog in
-article_markdown, even when no changes are needed.
+        return """You are Agent 6, the publication reviewer. You only inspect the
+Agent 5 draft and report problems for a human to review. Do not rewrite, edit,
+correct, or return any part of the article. The human in the loop decides whether
+to apply your recommendations.
 
-Use only the supplied draft and evidence. Do not invent facts, URLs, evidence IDs,
-metrics, capabilities, or certifications. Focus evidence checks on the named company,
-its products, services, capabilities, processes, and results; generic industry or
-educational statements do not need company evidence. Preserve uncertain claims and
-report them for human verification instead of asserting they are false. Do not add
-source URLs unless present in approved evidence. Preserve article order: introduction,
-main content, conclusion, FAQs; retain 3–5 FAQs and do not add content without need.
-Keep SEO title within 60 characters and meta description within 155 characters.
+Review the draft for grammar and spelling errors, unnatural or repetitive writing,
+formatting and heading problems, missing brief requirements, weak SEO or keyword
+use, and factual claims that are unsupported, misattributed, or contradicted by
+the supplied evidence. Assess company-specific claims against the supplied
+approved evidence. Do not call a claim false unless evidence directly contradicts
+it. Mark uncertainty for human verification where evidence is incomplete. Generic
+industry explanations do not need company evidence.
 
-Return JSON only:
+Check for generic openings, unsupported vendor claims, repeated paragraph endings,
+awkward headings, and language that conflicts with the writing brief. Treat
+Agent 5's unresolved items as leads for review, not as proof that a claim is wrong.
+Flag generic openers such as "this guide will explore", inflated wording such as
+"leverage" or "cutting-edge", forbidden filler phrases, more than two em dashes,
+and paragraphs that restate their own point. Do not silently correct any of them.
+
+Be specific and actionable. Identify the location using a heading or a short
+quoted phrase when useful. Explain why it needs attention and recommend what a
+human should check or change. Do not invent facts, URLs, evidence IDs, or errors.
+Do not flag stylistic preferences as errors unless they conflict with the brief.
+If you find no material issues, say so in the summary and return empty findings
+and unresolved_items arrays.
+
+Return JSON only, matching this schema:
 {
-  "summary": "One short sentence",
+  "summary": "One short sentence describing the review result",
   "findings": [
     {
-      "area": "formatting|headings|content|keywords|seo|factual_claims",
+      "area": "grammar|formatting|headings|content|keywords|seo|factual_claims",
       "severity": "critical|high|medium|low",
-      "issue": "Short issue",
-      "recommendation": "Short action or verification note"
+      "issue": "Specific issue and where it appears",
+      "recommendation": "Action or verification for the human reviewer"
     }
   ],
-  "title": "Final H1 title",
-  "seo_title": "Final SEO title",
-  "meta_description": "Final meta description",
-  "article_markdown": "The complete final Markdown blog",
-  "unresolved_items": ["Only material items needing human verification"]
+  "unresolved_items": ["Material evidence or brief questions a human must resolve"]
 }
-Return at most 5 findings and 10 unresolved items. Do not repeat the article anywhere
-else in the response. Human approval is still required."""
+Return at most 5 findings and 10 unresolved items. Never include a revised article,
+replacement wording, or a full article excerpt. Human approval is required."""
