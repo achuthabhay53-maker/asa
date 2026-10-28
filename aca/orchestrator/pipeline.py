@@ -1,9 +1,9 @@
 """LangGraph flow for the content workflow.
 
-    agent1 -> agent2 -> agent3 -> agent4 -> agent5 -> optional agent6
+    agent1 -> agent2 -> agent3 -> agent4 -> agent5 -> agent6
 
 The workflow resumes at the first incomplete agent. The website is the
-caller's input. Agent 6 runs only when requested.
+caller's input. Agent 6 always reviews the Agent 5 output.
 """
 
 from __future__ import annotations
@@ -283,7 +283,7 @@ def _entry(state: PipelineState) -> str:
         return END
     if state.written_article is None:
         return "agent5"
-    if state.review_requested and state.review_output is None:
+    if state.review_output is None:
         return "agent6"
     return END
 
@@ -301,7 +301,7 @@ def _after_agent4(state: PipelineState) -> str:
 
 
 def _after_agent5(state: PipelineState) -> str:
-    if state.review_requested and state.review_output is None:
+    if state.review_output is None:
         return "agent6"
     return END
 

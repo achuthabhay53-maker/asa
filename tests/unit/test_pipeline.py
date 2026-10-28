@@ -77,7 +77,7 @@ def test_shared_agent_outputs_satisfy_schema_and_evidence_contracts():
     )
 
 
-def test_pipeline_graph_contains_five_core_agents_and_optional_reviewer():
+def test_pipeline_graph_contains_five_core_agents_and_mandatory_reviewer():
     mermaid = build_pipeline().get_graph().draw_mermaid()
 
     for agent in range(1, 6):
@@ -420,7 +420,7 @@ def test_requested_review_runs_only_after_existing_five_agent_outputs(monkeypatc
             guide=agent3_output(),
             content_brief=agent4_output(),
             written_article=draft,
-            review_requested=True,
+            review_requested=False,
         ),
         config=config,
     )

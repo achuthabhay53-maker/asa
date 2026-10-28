@@ -16,7 +16,7 @@ load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 @contextmanager
 def postgres_checkpointer() -> Iterator[PostgresSaver]:
     """Open and initialize the PostgreSQL checkpointer for one workflow operation."""
-    database_url = os.getenv("DATABASE_URL")
+    database_url = os.getenv("LANGGRAPH_CHECKPOINT_DATABASE_URL")
     if not database_url:
         raise RuntimeError(
             "DATABASE_URL is not configured; PostgreSQL workflow checkpoints cannot be saved."
