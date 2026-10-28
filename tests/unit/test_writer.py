@@ -161,7 +161,7 @@ def test_reviewer_returns_findings_without_rewriting_the_draft():
     result = reviewer.review(_writer_input(), draft)
 
     assert result.summary == "One writing issue needs human review."
-    assert [item.model_dump() for item in result.findings] == [finding]
+    assert [item.model_dump() for item in result.findings] == [{**finding, "target_text": None}]
     assert result.unresolved_items == []
     assert draft.article_markdown == _writer_output().article_markdown
     assert "revised_blog" not in result.model_dump()

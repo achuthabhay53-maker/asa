@@ -435,7 +435,11 @@ Flag generic openers such as "this guide will explore", inflated wording such as
 and paragraphs that restate their own point. Do not silently correct any of them.
 
 Be specific and actionable. Identify the location using a heading or a short
-quoted phrase when useful. Explain why it needs attention and recommend what a
+quoted phrase when useful. For each finding, set target_text to a short,
+verbatim excerpt from the article that uniquely identifies the issue. The excerpt
+must be contiguous plain text as it appears in the article, without Markdown
+markers. If no exact unique excerpt identifies the issue, set target_text to null;
+do not guess a location. Explain why it needs attention and recommend what a
 human should check or change. Do not invent facts, URLs, evidence IDs, or errors.
 Do not flag stylistic preferences as errors unless they conflict with the brief.
 If you find no material issues, say so in the summary and return empty findings
@@ -449,7 +453,8 @@ Return JSON only, matching this schema:
       "area": "grammar|formatting|headings|content|keywords|seo|factual_claims",
       "severity": "critical|high|medium|low",
       "issue": "Specific issue and where it appears",
-      "recommendation": "Action or verification for the human reviewer"
+      "recommendation": "Action or verification for the human reviewer",
+      "target_text": "Exact unique excerpt from article, or null"
     }
   ],
   "unresolved_items": ["Material evidence or brief questions a human must resolve"]

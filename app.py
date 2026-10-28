@@ -20,6 +20,7 @@ from aca.agents.source_intelligence import TOP_N_SOURCES
 from aca.agents.writer import WriterAgent
 from aca.models.writer import WriterInput, WriterOutput, WrittenSection
 from aca.output_storage import clear_agent_outputs, save_agent_output
+from aca.review_annotations import anchorable_finding_indexes, render_annotated_markdown
 from aca.orchestrator.checkpointer import postgres_checkpointer, thread_config
 from aca.orchestrator.pipeline import PipelineState, _build_writer_input, build_pipeline
 from aca.pdf_export import build_article_pdf
@@ -216,14 +217,6 @@ def cached_article_pdf(article: str) -> bytes:
     return build_article_pdf(article)
 
 
-def style_verify_markers(text: str) -> str:
-    """Show '[VERIFY: ...]' placeholders as small orange badges in the preview.
-
-    Only the on-screen preview changes; the PDF/Markdown downloads keep the raw text.
-    """
-    return VERIFY_RE.sub(":orange-badge[⚠ needs source]", text)
-
-
 def pipeline():
     st.subheader("Workflow pipeline")
     steps = [
@@ -340,14 +333,55 @@ def render_final_output(
                         st.code(article, language="markdown", wrap_lines=True)
 
             seo_metadata_panel(seo_title, meta_description)
+            review_output = as_dict(st.session_state.agent6) if st.session_state.agent6 else {}
+            findings = review_output.get("findings") or []
+            anchorable = anchorable_finding_indexes(article, findings)
+            if st.session_state.reviewer_error:
+                st.warning(f"Agent 6 review failed: {st.session_state.reviewer_error}")
+            elif review_output:
+                severity_counts: dict[str, int] = {}
+                for finding in findings:
+                    severity = str(as_dict(finding).get("severity") or "medium").lower()
+                    severity_counts[severity] = severity_counts.get(severity, 0) + 1
+                counts_text = ", ".join(
+                    f"{count} {severity}"
+                    for severity, count in sorted(
+                        severity_counts.items(),
+                        key=lambda item: ["critical", "high", "medium", "low"].index(item[0])
+                        if item[0] in {"critical", "high", "medium", "low"}
+                        else 4,
+                    )
+                )
+                review_summary = f"Agent 6 · {len(findings)} finding(s)"
+                if counts_text:
+                    review_summary += f" ({counts_text})"
+                st.caption(review_summary + ". Hover over highlighted text for the finding and recommendation.")
+                unanchored_count = len(findings) - len(anchorable)
+                if unanchored_count:
+                    st.caption(
+                        f"{unanchored_count} finding(s) could not be matched to one unique exact passage; "
+                        "they remain available in review decisions below."
+                    )
+            else:
+                st.info("Reviewer findings are not available for this draft yet.")
+
+            def render_reviewed_markdown(markdown: str) -> None:
+                if markdown.strip():
+                    rendered, _ = render_annotated_markdown(
+                        markdown,
+                        findings,
+                        allowed_finding_indexes=anchorable,
+                    )
+                    st.html(rendered)
+
             with st.container(border=True, key="blog_card"):
                 if sections.introduction:
-                    st.markdown(style_verify_markers(sections.introduction))
+                    render_reviewed_markdown(sections.introduction)
                 if sections.main_content:
-                    st.markdown(style_verify_markers(sections.main_content))
+                    render_reviewed_markdown(sections.main_content)
                 if sections.conclusion:
                     st.subheader("Conclusion")
-                    st.markdown(style_verify_markers(sections.conclusion))
+                    render_reviewed_markdown(sections.conclusion)
                 if sections.faqs or sections.faq_fallback:
                     st.subheader("Frequently Asked Questions")
                     if sections.faq_intro:
@@ -355,34 +389,9 @@ def render_final_output(
                     if sections.faqs:
                         for question, answer in sections.faqs:
                             with st.expander(question):
-                                st.markdown(style_verify_markers(answer))
+                                render_reviewed_markdown(answer)
                     else:
-                        st.markdown(style_verify_markers(sections.faq_fallback))
-
-    st.subheader("Reviewer report")
-    review_output = as_dict(st.session_state.agent6) if st.session_state.agent6 else {}
-    if st.session_state.reviewer_error:
-        st.error(f"Reviewer: {st.session_state.reviewer_error}")
-    elif review_output:
-        st.caption("The reviewer reports findings only; it does not change the blog.")
-        if review_output.get("summary"):
-            st.info(str(review_output["summary"]))
-        findings = review_output.get("findings") or []
-        if findings:
-            for raw_finding in findings:
-                finding = as_dict(raw_finding)
-                st.markdown(
-                    f"**{finding.get('severity', 'Review')} · "
-                    f"{finding.get('area', 'Content')}** — {finding.get('issue', '')}"
-                )
-                if finding.get("recommendation"):
-                    st.write(finding["recommendation"])
-        else:
-            st.success("No material issues were reported. Human review is still required.")
-        for item in review_output.get("unresolved_items") or []:
-            st.markdown(f"- {item}")
-    else:
-        st.info("Reviewer report is not available for this draft yet.")
+                        render_reviewed_markdown(sections.faq_fallback)
 
 
 # ------------------------------- STATE ------------------------------

@@ -12,6 +12,7 @@ class ReviewFinding(BaseModel):
     severity: Literal["critical", "high", "medium", "low"]
     issue: str
     recommendation: str
+    target_text: str | None = None
 
 
 class RevisedBlog(BaseModel):
