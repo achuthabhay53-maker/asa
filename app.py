@@ -24,51 +24,12 @@ from aca.review_annotations import anchorable_finding_indexes, render_annotated_
 from aca.orchestrator.checkpointer import postgres_checkpointer, thread_config
 from aca.orchestrator.pipeline import PipelineState, _build_writer_input, build_pipeline
 from aca.pdf_export import build_article_pdf
+from ui_theme import inject_theme, render_header, render_pipeline, render_status_pill
 
 
 # ------------------------------- UI ---------------------------------
 st.set_page_config(page_title="AImpact Content Agent", page_icon="✦", layout="wide")
-st.markdown(
-    """
-<style>
-.block-container {padding-top:1.25rem; padding-bottom:3rem; max-width:1450px;}
-h1 {font-size:1.85rem; font-weight:750;}
-[data-testid="stMetric"] {background:rgba(128,128,128,.07); padding:12px; border-radius:12px;}
-
-/* ---- Blog view ---- */
-h1.blog-title {
-    font-size:2.05rem; line-height:1.25; font-weight:750;
-    margin:0 0 .6rem 0; padding:0; letter-spacing:-.01em;
-}
-/* hide the hover "link" icon Streamlit adds next to headings */
-.st-key-blog_header [data-testid="stHeaderActionElements"],
-.st-key-blog_header_reviewed [data-testid="stHeaderActionElements"],
-.st-key-blog_card [data-testid="stHeaderActionElements"],
-.st-key-blog_card_reviewed [data-testid="stHeaderActionElements"] {display:none;}
-
-/* comfortable reading typography inside the article card */
-.st-key-blog_card,
-.st-key-blog_card_reviewed {padding:.5rem .75rem;}
-.st-key-blog_card p,
-.st-key-blog_card li,
-.st-key-blog_card_reviewed p,
-.st-key-blog_card_reviewed li {font-size:1.05rem; line-height:1.8;}
-.st-key-blog_card h2,
-.st-key-blog_card_reviewed h2 {
-    font-size:1.55rem; font-weight:700; line-height:1.3;
-    margin-top:1.8rem; padding-bottom:.4rem;
-    border-bottom:1px solid rgba(128,128,128,.25);
-}
-.st-key-blog_card h3,
-.st-key-blog_card_reviewed h3 {font-size:1.2rem; font-weight:650; margin-top:1.2rem;}
-.st-key-blog_card table,
-.st-key-blog_card_reviewed table {width:100%; font-size:.95rem;}
-.st-key-blog_card th,
-.st-key-blog_card_reviewed th {background:rgba(128,128,128,.12);}
-</style>
-""",
-    unsafe_allow_html=True,
-)
+inject_theme()
 
 
 # ----------------------------- HELPERS ------------------------------
@@ -218,7 +179,6 @@ def cached_article_pdf(article: str) -> bytes:
 
 
 def pipeline():
-    st.subheader("Workflow pipeline")
     steps = [
         ("agent1", "Agent 1", "Prompt", "run_error"),
         ("agent2", "Agent 2", "Sources", "run_error"),
@@ -227,21 +187,18 @@ def pipeline():
         ("agent5", "Agent 5", "Blog writer", "agent5_error"),
         ("agent6", "Agent 6", "Reviewer", "reviewer_error"),
     ]
-    cols = st.columns(6)
-    for col, (key, name, desc, err_key) in zip(cols, steps):
-        with col:
-            if st.session_state.get(key) is not None:
-                value = st.session_state.get(key)
-                verification = as_dict(value).get("verification") if key == "agent3" else None
-                if verification and not verification.get("is_verified", False):
-                    st.warning(f"⚠ {name}")
-                else:
-                    st.success(f"✓ {name}")
-            elif st.session_state.get(err_key):
-                st.error(f"✕ {name}")
-            else:
-                st.info(f"○ {name}")
-            st.caption(desc)
+    items = []
+    for key, name, desc, err_key in steps:
+        value = st.session_state.get(key)
+        if value is not None:
+            verification = as_dict(value).get("verification") if key == "agent3" else None
+            state = "warn" if verification and not verification.get("is_verified", False) else "done"
+        elif st.session_state.get(err_key):
+            state = "error"
+        else:
+            state = "idle"
+        items.append((name, desc, state))
+    render_pipeline(items)
 
 
 def seo_metadata_panel(seo_title: str, meta_description: str):
@@ -424,9 +381,7 @@ for key in KEYS:
 
 
 # ------------------------------ INPUT UI ----------------------------
-st.title("✦ AImpact Content Agent")
-st.caption("Prompt intelligence → source research → ground truth → content brief → blog → review → human editing")
-st.caption("Each valid run refreshes agent1_output.json through agent6_output.json.")
+render_header()
 pipeline()
 
 with st.form("run_workflow", border=True):
@@ -703,10 +658,7 @@ if any(x is not None for x in (a1, a2, a3, a4, a5, a6)):
             )
 
             st.subheader("Human review and editing")
-            if is_approved:
-                st.success(f"Version {draft_version} is approved.")
-            else:
-                st.warning(f"Version {draft_version} is a draft and has not been approved.")
+            render_status_pill(draft_version, is_approved)
             st.caption("Saved workflow run ID")
             st.code(str(st.session_state.workflow_run_id), language=None)
 
