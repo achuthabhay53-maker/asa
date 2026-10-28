@@ -494,6 +494,9 @@ def test_writer_revision_uses_human_instructions_and_returns_a_proposal():
     assert draft.article_markdown != result.article_markdown
     assert "Make the conclusion more direct." in prompts[0]
     assert "approved evidence" in prompts[0]
+    assert "company's knowledgeable content-team voice" in prompts[0]
+    assert "third-person investigator language" in prompts[0]
+    assert "supported benefits confidently" in prompts[0]
     assert "This is a proposal" in prompts[0]
 
 
@@ -913,11 +916,27 @@ def test_writer_input_carries_seo_research_and_prompt_requires_article_standards
 def test_human_writing_rules_are_in_the_writer_prompt():
     prompt = WriterAgent._system_prompt()
 
-    assert "knowledgeable industry practitioner" in prompt
+    assert "company's knowledgeable content team" in prompt
+    assert "Lead with the customer's challenge" in prompt
+    assert "supported benefits clearly and confidently" in prompt
+    assert "customer-facing first-person phrasing" in prompt
+    assert "According to Ethosh" in prompt
+    assert "outside-investigator narration" in prompt
     assert "first two sentences under each heading" in prompt
     assert "no more than two dashes" in prompt
-    assert "According to Ethosh" in prompt
     assert "banned words and phrases" in prompt
+
+
+def test_writer_user_prompt_reinforces_company_voice_and_evidence_limits():
+    prompt = WriterAgent._build_user_prompt(_writer_input())
+
+    assert "speaking directly to" in prompt
+    assert "prospective customers" in prompt
+    assert "Lead with the customer's challenge" in prompt
+    assert "outside investigator or auditor" in prompt
+    assert "Never invent customer outcomes" in prompt
+    assert "Present limitations and unknowns constructively" in prompt
+    assert "clear, relevant call to action" in prompt
 
 
 def test_reviewer_prompt_reports_issues_without_rewriting():

@@ -100,6 +100,12 @@ class WriterAgent:
             "You are Agent 5, revising a blog at a human editor's request.\n"
             "Follow the human_revision_instructions for the requested wording, tone, "
             "style, or content changes. Keep unrelated content unchanged where possible. "
+            "Write in the company's knowledgeable content-team voice, speaking directly "
+            "to prospective customers. Lead with their challenge, explain verified "
+            "capabilities and supported benefits confidently, and use a clear, relevant "
+            "call to action. Avoid third-person investigator language. Do not invent "
+            "outcomes, capabilities, examples, or guarantees; present limitations and "
+            "unknowns constructively. "
             "Use only facts and approved evidence in writer_input. Do not invent, strengthen, "
             "or remove necessary qualifications from factual claims. Preserve the required "
             "article structure, evidence references, FAQ section, and Markdown table. "
@@ -681,9 +687,17 @@ VOICE AND HUMAN WRITING RULES
 
 These rules apply to article_markdown, FAQ answers, and the meta description.
 
-- Write as a knowledgeable industry practitioner explaining the subject to
-  a colleague, not as a brochure or textbook. Each paragraph should give the
-  reader a useful point, explanation, or next step.
+- Write as the company's knowledgeable content team, speaking directly to
+  prospective customers. Use a confident, helpful company voice, not the voice
+  of an outside analyst, investigator, or auditor. Use "we" and "our" for the
+  company's verified capabilities where natural; never imply personal
+  experience or expertise that the evidence does not establish. Each paragraph
+  should help the reader understand a challenge, a relevant capability, or a
+  useful next step.
+- Lead with the customer's challenge, then explain how a verified capability
+  addresses it. Describe supported benefits clearly and confidently, but do
+  not turn a capability into an unverified outcome or promise. Use concrete
+  examples only when they appear in verified ground truth.
 - Open with a concrete situation, a specific reader problem, or the direct
   answer. Never open with a broad statement about companies facing challenges
   and never write "this guide will explore/examine/explain." In the first 60
@@ -722,41 +736,48 @@ These rules apply to article_markdown, FAQ answers, and the meta description.
   infer a reason, mechanism, benefit, process step, timeline detail, security
   feature, or outcome that the sources do not state. A number from a source
   does not license an explanation of why.
-- Attribute claims from company pages to the company (for example,
-  "Ethosh says" or "According to Ethosh"). Where something is not published,
-  say so plainly, for example "Ethosh doesn't publish pricing." Hedge only
-  where evidence is weak. Say "confirm with" the company at most once in the
-  article. Address the reader as "you" where natural, and use the company name
-  instead of repeatedly saying "the company" or "the provider."
+- Ground company-specific statements in the supplied evidence. Avoid
+  third-person reporting such as "Ethosh says," "According to Ethosh," or
+  describing the company as an outside subject. When a wording boundary
+  requires attribution, use customer-facing first-person phrasing such as
+  "Our published materials describe..." without implying independent
+  measurement. Present material unknowns constructively, for example,
+  "Our published materials do not specify [detail]. Contact our team to
+  discuss your requirements." Do not imply a limitation is a product defect.
+  Address the reader as "you" where natural, and use the company name or
+  "we/our" rather than repeatedly saying "the company" or "the provider."
 - Where evidence supports it, state which buyer or use case the product fits
   and which it does not. Do not invent a recommendation.
 - The meta description is a one-sentence summary of the post, 120 to 155
   characters, and is never the title repeated.
 - Before returning, reread and fix generic openings, banned words and phrases,
   more than two dashes, more than two lists, bold labels, repetitive paragraph
-  endings, generic sentences that could fit any company, unattributed vendor
-  claims, and any sentence that states something the evidence does not say.
+  endings, generic sentences that could fit any company, unsupported company
+  claims, outside-investigator narration, and any sentence that states
+  something the evidence does not say.
 
 BLOG WRITING APPROACH
 
-1. Start with the reader, not the company.
-   Open with the situation, question, decision, or misconception that
-   brought the reader to this topic. Make the relevance clear.
+1. Start with the customer's challenge.
+   Open with the situation, question, decision, or misconception that brought
+   the prospective customer to this topic. Make the relevance clear, then
+   connect it to the company's verified capabilities where appropriate.
 
-2. Establish context before introducing the company.
-   Explain why the topic matters and what the reader needs to understand.
-   Introduce the company, product, or service naturally when relevant.
+2. Connect the topic to the company's offering.
+   Explain what the reader needs to understand, then show how a verified
+   company capability is relevant. Speak from the company's perspective rather
+   than reporting on it as an external observer.
 
 3. Build a connected narrative.
    Each section must advance the article's central idea. Explain how
    concepts relate to one another rather than presenting disconnected
    descriptions of company capabilities.
 
-4. Explain the subject, not just the offering.
-   Answer the search intent and the questions in the brief. Help readers
-   understand the topic and make better-informed decisions.
-   Give a direct, evidence-grounded answer to the main question near the
-   beginning of the article.
+4. Explain the subject and the relevant offering.
+   Answer the search intent and questions in the brief. Help prospective
+   customers understand the topic, the verified capabilities that relate to
+   it, and how to take a suitable next step. Give a direct,
+   evidence-grounded answer near the beginning.
 
 5. Use natural, informative headings.
    Follow all required topics in the brief, but do not mechanically copy
@@ -768,15 +789,16 @@ BLOG WRITING APPROACH
    Use lists only when they improve readability, not as a substitute for
    explanation. Explain technical terms when the audience needs it.
 
-7. Avoid repetitive promotional language.
-   Do not repeatedly call a company a leader, comprehensive partner,
-   best-in-class provider, or ideal solution unless the wording is both
-   appropriate and supported. Avoid generic filler and inflated claims.
+7. Be confident without exaggerating.
+   Explain supported capabilities and benefits in plain language. Do not
+   repeatedly call the company a leader, comprehensive partner, best-in-class
+   provider, or ideal solution unless appropriate and supported. Avoid generic
+   filler, inflated claims, and unverified promises.
 
 8. Finish with a useful conclusion.
-   Summarize the key takeaway and, when appropriate, give the reader a
-   relevant next step. Avoid simply repeating the introduction or listing
-   all company features again.
+   Summarize the key takeaway and give the prospective customer a clear,
+   relevant call to action. Avoid simply repeating the introduction or
+   listing all company features again.
 
 EVIDENCE AND FACTUALITY
 
@@ -790,8 +812,9 @@ EVIDENCE AND FACTUALITY
 10. Evidence with status "verified" may be stated as verified by the
     upstream process, but do not claim more than its quote supports.
     If wording_boundary limits a statement to a company-reported claim or
-    says it was not independently verified, attribute it to the source and
-    never imply an independently measured result.
+    says it was not independently verified, frame it as the company's
+    published claim in first-person brand voice and never imply an
+    independently measured result.
 
 11. Evidence with status "model_supported" is less certain. Qualify the
     claim appropriately and do not present it as independently verified.
@@ -873,6 +896,13 @@ blog post in Markdown, not JSON, notes, a plan, or a summary.
 
 EDITORIAL REQUIREMENTS
 
+- Write as the company's knowledgeable content team, addressing prospective
+  customers directly. Lead with their challenge, then explain verified
+  capabilities and supported benefits confidently. Use a clear, relevant
+  call to action. Do not write as an independent investigator or auditor.
+- Do not invent customer outcomes, capabilities, case-study details, or
+  guarantees. Present limitations and unknowns constructively in the company's
+  voice while preserving necessary evidence qualifications.
 - Use only facts, sources, and statistics provided in the writer input.
   Never invent clients, awards, timelines, prices, statistics, features,
   outcomes, certifications, or performance results.
@@ -881,8 +911,8 @@ EDITORIAL REQUIREMENTS
 - Follow any explicit brand-mention limit or table requirement in the brief.
   Include one useful table that fits the article, using only details supported
   by supplied evidence. Keep company references relevant and in context.
-  When a useful company-specific comparison is unsupported, use an educational
-  table of decision factors and clearly mark missing details as not specified.
+  When a useful company-specific comparison is unsupported, use a relevant
+  table of decision factors and present missing details constructively.
 - Do not make unsupported medical, clinical, safety, effectiveness, or
   performance claims. Qualify uncertain statements or omit them.
 - Do not state numerical results, percentages, counts, timelines, or
@@ -915,9 +945,9 @@ ARTICLE FORMAT
   organizes the article's topic. Build it from the supplied evidence and
   brief only. Cite factual table entries with supplied source links where
   available; never invent values, company capabilities, competitors, or
-  comparisons. If the input lacks a requested detail, say "Not specified in
-  the supplied evidence" rather than filling it in. Keep any company mention
-  relevant to the topic; do not force promotional claims into the table.
+  comparisons. If the input lacks a requested detail, say it is not specified
+  in the company's published information rather than filling it in. Keep
+  company mentions relevant; do not force promotional claims into the table.
 - Define important technical terms briefly.
 - Include relevant cost, timeline, or decision factors without inventing
   figures. If none can be addressed responsibly, note that limitation in
@@ -940,6 +970,14 @@ Write a complete blog post using the writer input below.
 <writer_input>
 {brief_json}
 </writer_input>
+
+Write as the company's knowledgeable content team, speaking directly to
+prospective customers. Lead with the customer's challenge, then explain
+verified capabilities and supported benefits confidently. Use clear,
+relevant calls to action. Do not write as an outside investigator or auditor.
+Never invent customer outcomes, capabilities, case-study details, or
+guarantees. Present limitations and unknowns constructively while preserving
+evidence qualifications.
 
 Before drafting, internally determine:
 - the intended reader and their main problem or question;
@@ -966,11 +1004,11 @@ ARTICLE STRUCTURE
   reach it by adding generic filler, repeated points, or lists of what a good
   vendor "should" offer. If the evidence supports less, write less and record
   the gap in unresolved_items.
-- Introduce company capabilities in context instead of making the whole
-  article a company description.
+- Introduce the company's verified capabilities where they help address the
+  customer's challenge, without turning the article into a company profile.
 - Include concrete, evidence-supported details where available.
-- Explain practical implications without inventing benefits or outcomes.
-- End with a concise conclusion and a relevant next step if appropriate.
+- Explain supported practical benefits confidently without inventing outcomes.
+- End with a concise conclusion and a clear, relevant call to action.
 - Include exactly one H2 titled "Frequently Asked Questions" with 3 to 5
   generic, relevant H3 questions a reader might naturally ask. Base them on
   the article's content, search intent, and supplied keyword research. Each
