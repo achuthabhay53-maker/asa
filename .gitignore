@@ -18,3 +18,6 @@ crawl4ai_output.json
 crawl4ai_site_checkpoint.json
 crawl4ai_site_output.json
 crawler_output.json
+
+# DeepEval local telemetry/cache
+.deepeval/

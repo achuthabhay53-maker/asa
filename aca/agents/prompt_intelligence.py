@@ -19,28 +19,11 @@ from typing import Any
 import httpx
 from dotenv import load_dotenv
 
+from aca.agents._shared import extract_json_object as _extract_json
+from aca.agents._shared import field_value as _value
 from aca.models.prompt_intelligence import PromptAnalysis
 
 load_dotenv()
-
-
-def _value(obj: Any, key: str, default: Any = None) -> Any:
-    return obj.get(key, default) if isinstance(obj, dict) else getattr(obj, key, default)
-
-
-def _extract_json(text: str) -> dict[str, Any]:
-    text = re.sub(r"^\s*```(?:json)?\s*", "", text.strip(), flags=re.I)
-    text = re.sub(r"\s*```\s*$", "", text)
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        start, end = text.find("{"), text.rfind("}")
-        if start < 0 or end <= start:
-            raise ValueError("Claude did not return a valid JSON object.")
-        data = json.loads(text[start:end + 1])
-    if not isinstance(data, dict):
-        raise ValueError("Expected a JSON object from Claude.")
-    return data
 
 
 def _get_answers(prompt_evidence: Any) -> tuple[str, list[dict[str, str]]]:
