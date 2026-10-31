@@ -248,6 +248,3 @@ This is the target product vision. Steps such as WordPress publishing and score-
 
 ---
 
-## Author
-
-Aditya Pasare · 2026-09-29
