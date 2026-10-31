@@ -25,13 +25,15 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      
       - name: Run Claude Code
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           base_branch: setup-claude-github
           claude_args: |
-            "--max-turns 30 --allowedTools Bash"
-            --allowedTools "Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git branch:*),Bash(git add:*),Bash(git commit:*),Bash(git push:*),Bash(pytest:*),Bash(ruff:*),Bash(mypy:*)"
+            --max-turns 30
+            --allowedTools "Bash(pytest:*),Bash(python:*),Bash(pip:*),Bash(ruff:*),Bash(mypy:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git branch:*),Bash(git add:*),Bash(git commit:*),Bash(git push:*)"
+
 
 
