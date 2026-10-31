@@ -40,3 +40,14 @@
 - Do not delete files or make unrelated refactors without approval.
 - Create a summary of changes for human review.
 - Keep changes limited to the task and current feature branch.
+- ## GitHub Actions branch workflow
+- When a task is triggered from a GitHub Issue, work on the
+  dedicated Claude-created branch for that task.
+- Use `setup-claude-github` as the base branch for new task branches.
+- Never directly push changes to `main` or `setup-claude-github`.
+- Never switch branches manually.
+- Provide a Pull Request link targeting `setup-claude-github`
+  when the task is complete.
+- Run relevant tests before considering the task complete.
+- Human review and approval are required before merging.
+
