@@ -1,5 +1,17 @@
-import asyncio
-from aca.agents import prompt_intelligence as P
+# ruff: noqa: E402
+import pytest
+
+# Obsolete: this file tests the pre-LangGraph Agent 1 API (AnswerRecord, CitationRecord,
+# make_agent1_node, aca.orchestrator.workflow.ACAState, aca.orchestrator.agent_schemas),
+# none of which exist anymore. The current Agent 1 is aca.agents.prompt_intelligence.run_agent1.
+# Skipped instead of deleted pending human approval (see CLAUDE.md).
+pytest.skip(
+    "obsolete: targets removed Agent 1 API and aca.orchestrator.workflow",
+    allow_module_level=True,
+)
+
+import asyncio  # noqa: E402
+from aca.agents import prompt_intelligence as P  # noqa: E402
 from aca.orchestrator.state import PromptEvidence, ModelEvidence, CitedSource
 from aca.orchestrator.workflow import ACAState
 from aca.orchestrator.agent_schemas import OrgInputs
