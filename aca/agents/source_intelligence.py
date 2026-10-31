@@ -20,6 +20,8 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 import httpx
 from dotenv import load_dotenv
 
+from aca.agents._shared import extract_json_object as _extract_json
+from aca.agents._shared import field_value as _value
 from aca.models.source_intelligence import (
     AnalyzedSource,
     CitationSummary,
@@ -145,10 +147,6 @@ def _clean_whitespace(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
-def _value(obj: Any, key: str, default: Any = None) -> Any:
-    return obj.get(key, default) if isinstance(obj, dict) else getattr(obj, key, default)
-
-
 def _public_id(value: Any) -> int | str:
     text = str(value).strip()
     return int(text) if text.isdigit() else text
@@ -171,21 +169,6 @@ def _normalize_url(url: str) -> str:
 def _is_redirect_host(url: str) -> bool:
     host = urlparse(url).netloc.lower()
     return host in _REDIRECT_HOSTS or "grounding-api-redirect" in url
-
-
-def _extract_json(text: str) -> dict[str, Any]:
-    text = re.sub(r"^\s*```(?:json)?\s*", "", text.strip(), flags=re.I)
-    text = re.sub(r"\s*```\s*$", "", text)
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        start, end = text.find("{"), text.rfind("}")
-        if start < 0 or end <= start:
-            raise ValueError("Claude did not return a valid JSON object.")
-        data = json.loads(text[start:end + 1])
-    if not isinstance(data, dict):
-        raise ValueError("Expected a JSON object from Claude.")
-    return data
 
 
 def _string_list(raw: Any) -> list[str]:
