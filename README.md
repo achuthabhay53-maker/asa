@@ -4,29 +4,34 @@ The current interactive application is a Streamlit workflow that reads AImpact p
 
 **Current flow:** Agent 1 → Agent 2 → Agent 3 → Agent 4 → Agent 5 → optional Agent 6 (Reviewer). Agent 6 runs only when requested from the Streamlit interface and makes one model call. It returns the full revised article with a 16,384-token output limit. Human review is required before publishing.
 
-The repository also contains a separate FastAPI entrypoint and deployment configuration; those are not used by the Streamlit workflow.
+The repository also contains a separate FastAPI entrypoint and deployment configuration. The Streamlit workflow doesn't use them, and they don't currently start (see [Known gaps](#known-gaps)).
+
+A Mermaid diagram of the current flow is in [`current-agent-flow.md`](current-agent-flow.md).
 
 ---
 
-## Documentation map
+## How the workflow runs
 
-The four foundational diagrams live in [`docs/images/`](docs/images). Each has an extensive companion document:
+The pipeline is a LangGraph `StateGraph` built by `build_pipeline()` in
+`aca/orchestrator/pipeline.py`. All agents share one `PipelineState`.
 
-| # | Diagram | Companion doc |
-|---|---|---|
-| 1 | Architecture — components and boundaries | [`docs/01-architecture.md`](docs/01-architecture.md) |
-| 2 | Runtime coordination — the 20-hop workflow | [`docs/02-workflow.md`](docs/02-workflow.md) |
-| 3 | System architecture — infra, network, data, SaaS | [`docs/03-system-architecture.md`](docs/03-system-architecture.md) |
-| 4 | Code architecture — repo layout, module dependencies | [`docs/04-code-architecture.md`](docs/04-code-architecture.md) |
+```
+Agent 1 → Agent 2 → Agent 3 ─(verified?)→ Agent 4 ─(brief has sections?)→ Agent 5 ─(review requested?)→ Agent 6
+                         └─ no → END             └─ no → END                       └─ no → END
+```
 
-Supporting docs:
+The entry router starts at the first agent whose output is missing. Because of this, Agent 6 can run on its own once Agents 1–5 have produced their outputs.
 
-- [`docs/05-agents.md`](docs/05-agents.md) — deep dive on the content agents.
-- [`docs/06-data-model.md`](docs/06-data-model.md) — schema + retention + ER notes.
-- [`docs/07-api-reference.md`](docs/07-api-reference.md) — every ACA endpoint with request/response shapes.
-- [`docs/08-integration-aimpact.md`](docs/08-integration-aimpact.md) — exact AImpact endpoints ACA calls, plus the small additive changes AImpact must ship.
-- [`docs/09-deployment.md`](docs/09-deployment.md) — App Runner, Neon, CloudFront, env vars, rollout.
-- [`docs/10-security.md`](docs/10-security.md) — auth, secrets, multi-tenant, blast-radius rules.
+| # | Agent | Code | Output model | What it does |
+|---|---|---|---|---|
+| 1 | Prompt Intelligence | `aca/agents/prompt_intelligence.py` | `PromptAnalysis` | Interprets the prompt and stored AI answers; works out customer visibility and competitor mentions |
+| 2 | Source Intelligence | `aca/agents/source_intelligence.py` | `SourceIntelligence` | Ranks cited URLs, fetches and parses those pages, and analyses their structure and style |
+| 3 | Ground Truth & Research | `aca/agents/ground_truth.py` | `GroundTruthGuide` + `Agent4HandoffPackage` | Researches the customer website with Exa, checks quotes against page text, sorts claims into verified, limited or unresolved, and builds the Agent 3 → 4 handoff |
+| 4 | Content Brief | `aca/agents/content_brief.py` | `ContentBrief` | Turns the outputs of Agents 1–3 into a section plan and writing guidance |
+| 5 | Writer | `aca/agents/writer.py` | `WriterOutput` | Streams the article and adds SEO metadata, a FAQ, tables and claim/citation tracking |
+| 6 | Reviewer (optional) | `aca/agents/reviewer.py` | `ReviewOutput` | Makes one Claude call that returns the full revised article and its findings |
+
+The output models live in `aca/models/`, one file per agent. All agents call Claude through the `anthropic` SDK.
 
 ---
 
@@ -34,20 +39,26 @@ Supporting docs:
 
 ```
 aca/
-├── main.py                 FastAPI entrypoint · CORS · routers · lifespan
-├── config.py               pydantic-settings, one place to read env
-├── api/                    HTTP surface
-├── orchestrator/           LangGraph state machine + async runner
-├── agents/                 Prompt · Sources · Ground truth · Brief · Writer · Reviewer
-├── tools/                  AImpact REST, Claude, WordPress, Langfuse
-├── models/                 SQLAlchemy ORM — 7 tables
-├── db/                     Engine + Alembic migrations
-├── workers/                APScheduler nightly picker + day-7/30 feedback
-├── security/               API-token verify + KMS envelope encryption
-└── observability/          OpenTelemetry setup
+├── agents/            The six agent classes (table above)
+├── models/            Pydantic input/output schemas, one file per agent
+├── orchestrator/
+│   ├── pipeline.py    LangGraph graph, nodes, routing, PipelineState
+│   └── state.py       Older shared models (still imported by tools/aimpact.py and tests)
+├── tools/
+│   ├── aimpact.py         Direct psycopg queries against the AImpact PostgreSQL DB
+│   ├── web_research.py    Exa search (HTTP API) + page extraction, used by Agent 3
+│   └── source_fetcher.py  Tavily fetcher + site URL discovery (used only by a manual test)
+├── evidence.py        Evidence URL canonicalisation shared by Agents 3, 5 and 6
+├── article_sections.py, review_diff.py, pdf_export.py, output_storage.py   UI/output helpers
+├── config.py          pydantic-settings (used only by the FastAPI entrypoint)
+├── main.py            FastAPI entrypoint (not working, see Known gaps)
+├── workers/           APScheduler setup; feedback job is a stub
+└── observability/     Telemetry stub
+app.py                 Streamlit UI (main way to run the workflow)
+scripts/               Run single agents or the workflow, evaluator, debugging helpers
+tests/unit/            Offline unit tests (synthetic fixtures in tests/agent_fixtures.py)
+current-agent-flow.md  Mermaid diagram of the current flow
 ```
-
-See [`docs/04-code-architecture.md`](docs/04-code-architecture.md) for module-by-module explanation and the dependency graph.
 
 ---
 
@@ -55,19 +66,40 @@ See [`docs/04-code-architecture.md`](docs/04-code-architecture.md) for module-by
 
 ```bash
 cp .env.example .env
-# fill in DATABASE_URL, AIMPACT_API_TOKEN, ANTHROPIC_API_KEY at minimum
-python -m venv .venv && source .venv/Scripts/activate   # or .venv/bin/activate
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-alembic upgrade head
-scripts/dev_run.sh
+streamlit run app.py
 ```
 
-The service listens on `http://localhost:8002`. `GET /aca/health` should return `{"status":"ok"}`.
+Environment variables used by the Streamlit workflow:
 
-Run tests:
+| Variable | Used by |
+|---|---|
+| `DATABASE_URL` | `aca/tools/aimpact.py`: reads prompts, stored AI answers and citations from AImpact PostgreSQL |
+| `ANTHROPIC_API_KEY` | All agents and the evaluator |
+| `ANTHROPIC_MODEL_NAME` | Agents 1–4 and the evaluator (defaults to `claude-haiku-4-5-20251001` when unset). Agents 5 and 6 don't read it; they default to `claude-haiku-4-5` in code |
+| `EXA_API_KEY` | Agent 3 web research |
+| `TAVILY_API_KEY` | Only `aca/tools/source_fetcher.py` (manual test) |
+
+`ANTHROPIC_MODEL_NAME` and `TAVILY_API_KEY` are not yet listed in `.env.example`, so add them to `.env` yourself. The `AIMPACT_*`, `ANTHROPIC_MODEL_HAIKU`/`_SONNET`, AWS, Langfuse and cost-cap variables in `.env.example` are read only by `aca/config.py` (FastAPI path). The Streamlit workflow doesn't use them.
+
+The Streamlit form takes a campaign ID, a prompt ID, the customer website, an optional customer name, the number of sources to analyse (1–20) and a blog target word count. `Run Agents 1–5` runs the pipeline. Agent 6 runs only when you request it from its tab.
+
+### Command-line scripts
+
+| Script | Purpose |
+|---|---|
+| `scripts/run_workflow.py --campaign-id 81 --prompt-id 1409 --website https://example.com` | Runs the pipeline from the CLI; saves `agent1_output.json`–`agent3_output.json` and `workflow_output.json` |
+| `scripts/run_agent3.py --website … --agent1 … --agent2 …` | Runs Agent 3 on saved Agent 1/2 JSON |
+| `scripts/run_agent4.py` | Runs Agent 4 on saved Agent 1–3 JSON |
+| `scripts/run_agent5.py <input.json>` | Runs Agent 5 on a `WriterInput` JSON (see `scripts/agent5_input.example.json`) |
+| `scripts/run_agent6.py` | Runs the Reviewer on saved Agent 1–5 JSON (details below) |
+| `scripts/evaluate_agent_outputs.py` | DeepEval G-Eval scoring of saved outputs (details below) |
+
+Run tests (offline; no model calls):
 
 ```bash
-pytest
+pytest tests/unit
 ```
 
 ## Evaluate real agent outputs
@@ -193,7 +225,21 @@ by ordinary pytest.
 
 ---
 
-## The 30-second pitch
+## Known gaps
+
+The following are not implemented yet, or don't match the original design:
+
+- **FastAPI / App Runner path doesn't work.** `aca/main.py` imports `aca.api`, which doesn't exist. As a result, `scripts/dev_run.sh` and `apprunner.yaml` (`uvicorn aca.main:app`) fail at startup.
+- **No ORM database or migrations.** There is no `aca/db/` and no Alembic setup. `aca/models/` contains Pydantic schemas, not SQLAlchemy tables.
+- **Not built yet:** WordPress publishing, post-publication re-audits, the API-token/KMS security layer, OpenTelemetry/Langfuse tracing (`observability/telemetry.py` is a stub), and the scheduled feedback job (`workers/feedback.py` is a stub; the scheduler job is commented out).
+- **Agent 2's output reaches Agent 3 but isn't used there.** Agent 4 uses it.
+- **Two sets of state models.** `aca/orchestrator/state.py` is from an earlier design, but `tools/aimpact.py` still imports it.
+
+---
+
+## The 30-second pitch (product goal)
+
+This is the target product vision. Steps such as WordPress publishing and score-lift tracking are not implemented yet (see [Known gaps](#known-gaps)).
 
 1. AImpact tells you which prompts you lose on **and which URLs the models cite** when they answer those prompts.
 2. ACA reads both. It figures out what the cited sources cover that you don't, forms a content-gap hypothesis with an editorial angle, drafts a blog against it, human approves, publishes to WordPress.
