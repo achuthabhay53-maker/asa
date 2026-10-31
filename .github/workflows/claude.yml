@@ -1,4 +1,4 @@
-```yaml
+
 name: Claude
 
 on:
@@ -33,4 +33,3 @@ jobs:
           claude_args: |
             --max-turns 30
             --allowedTools "Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git branch:*),Bash(git add:*),Bash(git commit:*),Bash(git push:*),Bash(pytest:*),Bash(ruff:*),Bash(mypy:*)"
-```
