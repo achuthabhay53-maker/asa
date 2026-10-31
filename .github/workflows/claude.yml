@@ -1,7 +1,7 @@
-
+```yaml
 name: Claude
 
-'on':
+on:
   issue_comment:
     types: [created]
   pull_request_review_comment:
@@ -29,4 +29,8 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          claude_args: "--max-turns 30"
+          base_branch: setup-claude-github
+          claude_args: |
+            --max-turns 30
+            --allowedTools "Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git branch:*),Bash(git add:*),Bash(git commit:*),Bash(git push:*),Bash(pytest:*),Bash(ruff:*),Bash(mypy:*)"
+```
