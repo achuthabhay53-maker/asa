@@ -31,7 +31,7 @@ jobs:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           base_branch: setup-claude-github
           claude_args: |
-            claude_args: "--max-turns 30 --allowedTools Bash"
+            "--max-turns 30 --allowedTools Bash"
             --allowedTools "Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git branch:*),Bash(git add:*),Bash(git commit:*),Bash(git push:*),Bash(pytest:*),Bash(ruff:*),Bash(mypy:*)"
 
 
