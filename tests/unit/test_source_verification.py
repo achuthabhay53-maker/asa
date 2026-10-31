@@ -1,8 +1,20 @@
-import httpx
+# ruff: noqa: E402
 import pytest
-from langchain_core.prompts import ChatPromptTemplate
 
-from aca.agents import analyzer as analyzer_module
+# Obsolete: this file tests aca.agents.analyzer (SourceAnalyzer) and the old
+# aca.tools.source_fetcher helpers (_fetch_page, _extract_page_text, _validate_public_url),
+# which were removed. Agent 2 is now aca.agents.source_intelligence and is covered by
+# tests/unit/test_source_intelligence.py. Skipped instead of deleted pending human
+# approval (see CLAUDE.md).
+pytest.skip(
+    "obsolete: targets removed aca.agents.analyzer and old source_fetcher helpers",
+    allow_module_level=True,
+)
+
+import httpx  # noqa: E402
+from langchain_core.prompts import ChatPromptTemplate  # noqa: E402
+
+from aca.agents import analyzer as analyzer_module  # noqa: E402
 from aca.agents.analyzer import (
     ClaimCheck,
     SourceAnalysis,
