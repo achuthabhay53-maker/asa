@@ -19,6 +19,7 @@ from aca.models.writer import (
     WriterOutput,
     WrittenSection,
 )
+from aca.observability.token_usage import record_claude_response
 logger = logging.getLogger(__name__)
 
 
@@ -96,6 +97,7 @@ class ReviewerAgent:
                 }
             ],
         )
+        record_claude_response(response, self.model)
         if response.stop_reason == "max_tokens":
             raise RuntimeError(
                 f"Reviewer response was truncated at {self.max_tokens:,} output tokens. "

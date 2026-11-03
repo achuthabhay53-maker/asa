@@ -20,6 +20,7 @@ import httpx
 from dotenv import load_dotenv
 
 from aca.models.prompt_intelligence import PromptAnalysis
+from aca.observability.token_usage import record_claude_response
 
 load_dotenv()
 
@@ -218,8 +219,10 @@ Rules:
             },
             timeout=90.0,
         )
+        record_claude_response(response, self.model)
         response.raise_for_status()
-        blocks = response.json().get("content") or []
+        response_data = response.json()
+        blocks = response_data.get("content") or []
         text_blocks = [block.get("text", "") for block in blocks if block.get("type") == "text"]
         if not text_blocks:
             raise RuntimeError("Claude returned no text for Agent 1.")

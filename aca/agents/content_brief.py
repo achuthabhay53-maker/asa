@@ -19,6 +19,7 @@ import httpx
 from dotenv import load_dotenv
 
 from aca.models.content_brief import BriefSection, ContentBrief, WritingStyleGuide
+from aca.observability.token_usage import record_claude_response
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -255,6 +256,7 @@ JSON only."""
             json=request,
             timeout=120.0,
         )
+        record_claude_response(response, self.model)
         response.raise_for_status()
         response_data = response.json()
         blocks = response_data.get("content") or []
@@ -280,6 +282,7 @@ JSON only."""
                 json=retry_request,
                 timeout=120.0,
             )
+            record_claude_response(retry, self.model)
             retry.raise_for_status()
             retry_data = retry.json()
             retry_blocks = retry_data.get("content") or []

@@ -251,17 +251,17 @@ class CompanyTalkingPoint(BaseModel):
 
 
 class Agent4HandoffPackage(BaseModel):
-    """Clean, structured research handoff package from Agent 3 to Agent 4."""
+    """Agent 4 context; research lists are serialized once on GroundTruthGuide."""
 
     task: str = "Create evidence-backed content brief and strategy"
-    topic: str = ""
-    search_intent: str = ""
-    target_audience: str = ""
-    relevant_findings: list[CompanyTalkingPoint] = Field(default_factory=list)
-    evidence: list[EvidenceItem] = Field(default_factory=list)
-    information_still_needed: list[ResearchGap] = Field(default_factory=list)
-    candidate_subtopics: list[CandidateSubtopic] = Field(default_factory=list)
-    boundaries: list[str] = Field(default_factory=list)
+    topic: str = Field(default="", exclude=True)
+    search_intent: str = Field(default="", exclude=True)
+    target_audience: str = Field(default="", exclude=True)
+    relevant_findings: list[CompanyTalkingPoint] = Field(default_factory=list, exclude=True)
+    evidence: list[EvidenceItem] = Field(default_factory=list, exclude=True)
+    information_still_needed: list[ResearchGap] = Field(default_factory=list, exclude=True)
+    candidate_subtopics: list[CandidateSubtopic] = Field(default_factory=list, exclude=True)
+    boundaries: list[str] = Field(default_factory=list, exclude=True)
     company: CompanyInfo | None = None
     verification: VerificationHandoff | None = None
 
@@ -276,12 +276,12 @@ class GroundTruthGuide(BaseModel):
     prompt_scope: str = "hybrid"
     relevant_findings: list[CompanyTalkingPoint] = Field(default_factory=list)
     evidence: list[EvidenceItem] = Field(default_factory=list)
-    information_still_needed: list[ResearchGap] = Field(default_factory=list)
+    information_still_needed: list[ResearchGap] = Field(default_factory=list, exclude=True)
     research_gaps: list[ResearchGap] = Field(default_factory=list)
     candidate_subtopics: list[CandidateSubtopic] = Field(default_factory=list)
     verified_facts: list[VerifiedFact] = Field(default_factory=list)
     boundaries: list[str] = Field(default_factory=list)
-    limitations: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list, exclude=True)
     verification: PromptVerification | None = None
     agent4_handoff: Agent4HandoffPackage | None = None
 
@@ -295,7 +295,6 @@ class GroundTruthGuide(BaseModel):
     structured_headings: list[HeadingItem] = Field(default_factory=list, exclude=True)
     related_topics: list[str] = Field(default_factory=list, exclude=True)
     evidence_backed_topics: list[EvidenceBackedTopic] = Field(default_factory=list, exclude=True)
-
 
 
 

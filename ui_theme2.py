@@ -6,6 +6,7 @@ Presentation only. No workflow logic lives here.
 from __future__ import annotations
 
 import html
+from typing import Any
 
 import streamlit as st
 
@@ -221,7 +222,7 @@ def render_sidebar_brand() -> None:
 <div class="acp-brand">
   <div class="acp-mark">✦</div>
   <div>
-    <div class="acp-brand-name">AImpact Content Agent</div>
+    <div class="acp-brand-name">BlogGen</div>
     <div class="acp-brand-sub">Blog workflow for customers</div>
   </div>
 </div>
@@ -287,6 +288,26 @@ def render_kpis(items: list[tuple[str, str, str, str]]) -> None:
         for label, value, hint, tone in items
     )
     st.html(f'<div class="acp-kpis">{cards}</div>')
+
+
+def render_token_usage_panel(
+    input_tokens: int,
+    output_tokens: int,
+    calls: list[dict[str, Any]],
+    missing_count: int = 0,
+) -> None:
+    """Show run totals and individual Claude call usage."""
+    with st.expander(f"Claude token usage · {input_tokens + output_tokens:,} tokens"):
+        render_kpis(
+            [
+                ("Input tokens", f"{input_tokens:,}", "Across all Claude calls", "neutral"),
+                ("Output tokens", f"{output_tokens:,}", "Across all Claude calls", "neutral"),
+                ("Claude calls", str(len(calls)), "Individual API responses", "neutral"),
+            ]
+        )
+        st.table(calls)
+        if missing_count:
+            st.caption(f"Token counts were unavailable for {missing_count} call(s).")
 
 
 def render_empty_state() -> None:

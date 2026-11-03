@@ -15,8 +15,9 @@ import anthropic
 from pydantic import ValidationError
 
 from aca.evidence import canonicalize_evidence_url
-from aca.models.writer import WriterEvidence, WriterInput, WriterOutput
-from aca.reviewer_lint import build_retry_message, lint_article
+from aca.models.writer import WriterEvidence, WriterInput, WriterOutput, WrittenSection
+from aca.observability.token_usage import record_claude_response
+from aca.reviewer_lint import lint_article
 
 
 class WriterAgent:
@@ -36,40 +37,42 @@ class WriterAgent:
     def write(self, writer_input: WriterInput) -> WriterOutput:
         """Generate a reader-focused, evidence-grounded blog post."""
         user_prompt = self._build_user_prompt(writer_input)
-        result = self._generate_output(user_prompt)
+        result = self._generate_output(
+            user_prompt,
+            system_prompt=self._system_prompt(),
+        )
 
         result = self._sanitize_evidence_references(result, writer_input.evidence)
         result = self._normalize_metadata(result)
+        seo_repaired = False
         try:
             self._validate_seo_requirements(result, writer_input)
         except RuntimeError as exc:
             error = str(exc)
-            is_faq_error = "FAQ" in error
-            is_table_error = "Markdown table" in error
-            if not (is_faq_error or is_table_error):
-                raise
-
-            repair_prompt = (
-                user_prompt
-                + "\n\nYour previous draft failed validation: "
-                + error
-                + "\nCorrect the previous draft below and return the complete JSON object. "
-                + "Ensure it includes at least one useful, valid Markdown table and "
-                "3 to 5 relevant FAQ questions with answers. Table entries must be "
-                "supported by supplied evidence; label unavailable details as not "
-                "specified rather than guessing. "
-                + "Preserve all required JSON fields, evidence references, and article quality."
-                + "\n\n<previous_draft>\n"
-                + result.model_dump_json(indent=2)
-                + "\n</previous_draft>"
+            style_issues = lint_article(
+                result.article_markdown,
+                title=result.title,
+                seo_title=result.seo_title,
+                meta_description=result.meta_description,
             )
-            result = self._generate_output(repair_prompt)
+            if style_issues:
+                error += "\nStyle issues to fix in the same repair:\n" + "\n".join(
+                    f"- {issue}" for issue in style_issues
+                )
+
+            repair_prompt = self._build_repair_prompt(result, [error])
+            result = self._generate_targeted_update(result, repair_prompt)
             result = self._sanitize_evidence_references(result, writer_input.evidence)
             result = self._normalize_metadata(result)
             self._validate_seo_requirements(result, writer_input)
+            seo_repaired = True
 
         # Style lint runs on the model's own text, before code appends [VERIFY] notes.
-        result, style_notes = self._enforce_style(result, user_prompt, writer_input)
+        result, style_notes = self._enforce_style(
+            result,
+            writer_input,
+            allow_retry=not seo_repaired,
+        )
 
         result = self._attach_supporting_evidence(result, writer_input.evidence)
         result = self._flag_unsupported_numeric_claims(result, writer_input.evidence)
@@ -92,34 +95,71 @@ class WriterAgent:
             raise ValueError("Revision instructions must not be empty.")
 
         payload = {
-            "writer_input": writer_input.model_dump(mode="json"),
-            "current_draft": draft.model_dump(mode="json"),
+            "revision_context": {
+                "company_name": writer_input.company_name,
+                "title": writer_input.title,
+                "article_objective": writer_input.article_objective,
+                "target_audience": writer_input.target_audience,
+                "primary_keyword": writer_input.primary_keyword,
+                "secondary_keywords": writer_input.secondary_keywords,
+                "unsupported_claims_to_avoid": writer_input.unsupported_claims_to_avoid,
+                "evidence": [
+                    item.model_dump(mode="json", exclude_none=True)
+                    for item in writer_input.evidence
+                ],
+            },
+            "current_draft": {
+                "title": draft.title,
+                "seo_title": draft.seo_title,
+                "meta_description": draft.meta_description,
+                "article_markdown": draft.article_markdown,
+            },
             "human_revision_instructions": instructions,
         }
         prompt = (
-            "You are Agent 5, revising a blog at a human editor's request.\n"
-            "Follow the human_revision_instructions for the requested wording, tone, "
-            "style, or content changes. Keep unrelated content unchanged where possible. "
-            "Write in the company's knowledgeable content-team voice, speaking directly "
-            "to prospective customers. Lead with their challenge, explain verified "
-            "capabilities and supported benefits confidently, and use a clear, relevant "
-            "call to action. Avoid third-person investigator language. Do not invent "
-            "outcomes, capabilities, examples, or guarantees; present limitations and "
-            "unknowns constructively. "
-            "Use only facts and approved evidence in writer_input. Do not invent, strengthen, "
-            "or remove necessary qualifications from factual claims. Preserve the required "
-            "article structure, evidence references, FAQ section, and Markdown table. "
-            "Return one complete JSON object matching the WriterOutput schema. "
-            "This is a proposal; do not state that it was accepted or approved.\n\n"
+            "Make only the requested human revision. Keep unrelated text unchanged. "
+            "Use only supplied evidence; do not invent facts or remove qualifications. "
+            "Preserve the article structure, source links, table, and FAQs. Return a JSON "
+            "patch with `metadata` and `edits` keys, not a rewritten article. Metadata "
+            "contains only changed title/seo_title/meta_description strings. Each edit "
+            "contains an exact `old_text` and replacement `new_text`; old_text must occur "
+            "once, and insertions must preserve their unique anchor in new_text. "
+            "This is a proposal, not an accepted change.\n\n"
             "<revision_request>\n"
             + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
             + "\n</revision_request>"
         )
-        result = self._generate_output(prompt)
+        result = self._generate_targeted_update(draft, prompt)
         result = self._sanitize_evidence_references(result, writer_input.evidence)
         result = self._normalize_metadata(result)
-        self._validate_seo_requirements(result, writer_input)
-        result, style_notes = self._enforce_style(result, prompt, writer_input)
+        try:
+            self._validate_seo_requirements(result, writer_input)
+            seo_issues = []
+        except RuntimeError as exc:
+            seo_issues = [str(exc)]
+
+        style_issues = lint_article(
+            result.article_markdown,
+            title=result.title,
+            seo_title=result.seo_title,
+            meta_description=result.meta_description,
+        )
+        issues = seo_issues + [f"Style: {issue}" for issue in style_issues]
+        style_notes = []
+        if issues:
+            repair_prompt = self._build_repair_prompt(result, issues)
+            result = self._generate_targeted_update(result, repair_prompt)
+            result = self._sanitize_evidence_references(result, writer_input.evidence)
+            result = self._normalize_metadata(result)
+            self._validate_seo_requirements(result, writer_input)
+            remaining = lint_article(
+                result.article_markdown,
+                title=result.title,
+                seo_title=result.seo_title,
+                meta_description=result.meta_description,
+            )
+            style_notes = [f"Style check: {issue}" for issue in remaining]
+
         result = self._attach_supporting_evidence(result, writer_input.evidence)
         result = self._flag_unsupported_numeric_claims(result, writer_input.evidence)
         result = self._audit_claims_and_faqs(result)
@@ -129,11 +169,105 @@ class WriterAgent:
             )
         return result
 
+    @staticmethod
+    def _sections_from_markdown(
+        article_markdown: str,
+        existing_sections: list[WrittenSection] | None = None,
+    ) -> list[WrittenSection]:
+        """Derive section content from Markdown so the model need not repeat the article."""
+        existing_by_heading = {
+            section.heading.casefold(): section.evidence_ids_used
+            for section in existing_sections or []
+        }
+        lines = article_markdown.splitlines()
+        headings = [
+            (index, len(match.group(1)), match.group(2).strip())
+            for index, line in enumerate(lines)
+            if (match := re.match(r"^(#{2,3})\s+(.+?)\s*#*\s*$", line.strip()))
+        ]
+        sections = []
+        for position, (start, level, heading) in enumerate(headings):
+            end = len(lines)
+            for next_start, next_level, _ in headings[position + 1 :]:
+                if next_level <= level:
+                    end = next_start
+                    break
+            sections.append(
+                WrittenSection(
+                    heading=heading,
+                    content_markdown="\n".join(lines[start + 1 : end]).strip(),
+                    evidence_ids_used=existing_by_heading.get(heading.casefold(), []),
+                )
+            )
+        return sections
+
+    def _generate_targeted_update(self, draft: WriterOutput, prompt: str) -> WriterOutput:
+        """Apply exact-text edits without asking the model to regenerate the complete article."""
+        repair_token_limit = min(self.max_tokens, 4096)
+        with self.client.messages.stream(
+            model=self.model,
+            max_tokens=repair_token_limit,
+            system=self._repair_system_prompt(),
+            messages=[{"role": "user", "content": prompt}],
+        ) as stream:
+            response = stream.get_final_message()
+        record_claude_response(response, self.model)
+        if response.stop_reason == "max_tokens":
+            raise RuntimeError(
+                f"Writer repair was truncated at {repair_token_limit:,} output tokens."
+            )
+
+        raw_text = "\n".join(
+            block.text for block in response.content if getattr(block, "type", None) == "text"
+        ).strip()
+        if not raw_text:
+            raise RuntimeError("Writer repair returned an empty response.")
+
+        payload = self._parse_json(raw_text)
+        metadata = payload.get("metadata", {})
+        edits = payload.get("edits", [])
+        if not isinstance(metadata, dict) or not isinstance(edits, list):
+            raise RuntimeError("Writer repair must return metadata and edits in the expected JSON format.")
+        if set(metadata) - {"title", "seo_title", "meta_description"}:
+            raise RuntimeError("Writer repair returned unsupported metadata fields.")
+
+        article = draft.article_markdown
+        for edit in edits:
+            if not isinstance(edit, dict):
+                raise RuntimeError("Writer repair edits must be JSON objects.")
+            old_text = edit.get("old_text")
+            new_text = edit.get("new_text")
+            if not isinstance(old_text, str) or not old_text or not isinstance(new_text, str):
+                raise RuntimeError("Each Writer repair edit needs non-empty old_text and string new_text.")
+            occurrences = article.count(old_text)
+            if occurrences != 1:
+                raise RuntimeError(
+                    "Writer repair anchor must occur exactly once in the current draft; "
+                    f"found {occurrences} occurrences."
+                )
+            article = article.replace(old_text, new_text, 1)
+
+        updates = {}
+        for key, value in metadata.items():
+            if not isinstance(value, str):
+                raise RuntimeError(f"Writer repair metadata field {key!r} must be a string.")
+            if value != getattr(draft, key):
+                updates[key] = value
+        if article == draft.article_markdown and not updates:
+            raise RuntimeError("Writer repair returned no changes.")
+
+        updates.update({
+            "article_markdown": article,
+            "word_count": len(re.findall(r"\b[\w’'-]+\b", article)),
+            "sections": self._sections_from_markdown(article, draft.sections),
+        })
+        return draft.model_copy(update=updates)
+
     def _enforce_style(
         self,
         result: WriterOutput,
-        user_prompt: str,
         writer_input: WriterInput,
+        allow_retry: bool = True,
     ) -> tuple[WriterOutput, list[str]]:
         """Lint the draft; if it fails, ask the model to fix exactly those issues once."""
         issues = lint_article(
@@ -144,23 +278,23 @@ class WriterAgent:
         )
         if not issues:
             return result, []
+        if not allow_retry:
+            return result, [f"Style check: {issue}" for issue in issues]
 
-        retry_prompt = (
-            user_prompt
-            + "\n\n"
-            + build_retry_message(issues)
-            + "\n\n<previous_draft>\n"
-            + result.model_dump_json(indent=2)
-            + "\n</previous_draft>"
+        retry_prompt = self._build_repair_prompt(
+            result,
+            [f"Style: {issue}" for issue in issues],
         )
         try:
-            retried = self._generate_output(retry_prompt)
+            retried = self._generate_targeted_update(result, retry_prompt)
             retried = self._sanitize_evidence_references(retried, writer_input.evidence)
             retried = self._normalize_metadata(retried)
             self._validate_seo_requirements(retried, writer_input)
-        except RuntimeError:
+        except RuntimeError as exc:
             # The retry broke the structure or output; keep the first draft and report the issues.
-            return result, [f"Style check: {issue}" for issue in issues]
+            notes = [f"Style check: {issue}" for issue in issues]
+            notes.append(f"Style repair failed: {exc}")
+            return result, notes
 
         remaining = lint_article(
             retried.article_markdown,
@@ -169,6 +303,44 @@ class WriterAgent:
             meta_description=retried.meta_description,
         )
         return retried, [f"Style check: {issue}" for issue in remaining]
+
+    @staticmethod
+    def _build_repair_prompt(result: WriterOutput, issues: list[str]) -> str:
+        issue_list = "\n".join(f"- {issue}" for issue in issues)
+        requirements = []
+        if any("Markdown table" in issue for issue in issues):
+            requirements.append(
+                "For a table issue, include at least one useful, valid Markdown table "
+                "using only facts already supported by the draft."
+            )
+        if any("FAQ" in issue for issue in issues):
+            requirements.append(
+                "For an FAQ issue, include 3 to 5 relevant FAQ questions with answers."
+            )
+        targeted_requirements = "\n".join(requirements)
+        return (
+            "Fix only these validation issues in the supplied draft:\n"
+            f"{issue_list}\n\n"
+            f"{targeted_requirements}\n"
+            "Preserve unrelated wording, facts, evidence references, and structure. "
+            "Do not add facts, claims, sources, or URLs. Do not return the full article. "
+            "Return JSON with `metadata` (only changed title/seo_title/meta_description "
+            "values) and `edits` (objects with exact `old_text` and replacement `new_text`). "
+            "Each old_text must occur exactly once. For insertions, keep the unique anchor "
+            "in new_text and add the new text around it.\n\n"
+            "<previous_draft>\n"
+            f"{json.dumps(result.model_dump(include={'title', 'seo_title', 'meta_description', 'article_markdown'}), ensure_ascii=False, separators=(',', ':'))}"
+            "\n</previous_draft>"
+        )
+
+    @staticmethod
+    def _repair_system_prompt() -> str:
+        return (
+            "You are Agent 5. Make the smallest requested change to the supplied article. "
+            "Use only its existing facts and source links; do not invent or strengthen claims. "
+            "Return only a JSON patch with metadata and exact-text edits. Never return the "
+            "complete article; each edit's old_text must match one unique span in the draft."
+        )
 
     @staticmethod
     def _flag_unsupported_numeric_claims(
@@ -429,24 +601,25 @@ class WriterAgent:
 
         return result.model_copy(update={"seo_title": seo_title, "meta_description": meta_description})
 
-    def _generate_output(self, user_prompt: str) -> WriterOutput:
-        token_limits = [self.max_tokens, min(self.max_tokens * 2, 32000)]
-        for attempt, token_limit in enumerate(token_limits):
-            with self.client.messages.stream(
-                model=self.model,
-                max_tokens=token_limit,
-                system=self._system_prompt(),
-                messages=[{"role": "user", "content": user_prompt}],
-            ) as stream:
-                response = stream.get_final_message()
-            if response.stop_reason != "max_tokens":
-                break
-            if attempt == len(token_limits) - 1:
-                raise RuntimeError(
-                    "Writer response was truncated at "
-                    f"{token_limit:,} output tokens after one retry. "
-                    "Reduce target_word_count or shorten the supplied brief."
-                )
+    def _generate_output(
+        self,
+        user_prompt: str,
+        system_prompt: str | None = None,
+    ) -> WriterOutput:
+        with self.client.messages.stream(
+            model=self.model,
+            max_tokens=self.max_tokens,
+            system=system_prompt or self._system_prompt(),
+            messages=[{"role": "user", "content": user_prompt}],
+        ) as stream:
+            response = stream.get_final_message()
+        record_claude_response(response, self.model)
+        if response.stop_reason == "max_tokens":
+            raise RuntimeError(
+                "Writer response was truncated at "
+                f"{self.max_tokens:,} output tokens. "
+                "Shorten the article requirements or reduce the requested scope."
+            )
 
         raw_text = "\n".join(
             block.text for block in response.content if getattr(block, "type", None) == "text"
@@ -464,9 +637,11 @@ class WriterAgent:
             raise RuntimeError(f"Writer returned invalid output: {exc}") from exc
 
         actual_word_count = len(re.findall(r"\b[\w’'-]+\b", result.article_markdown))
+        sections = self._sections_from_markdown(result.article_markdown, result.sections)
         return result.model_copy(
             update={
                 "word_count": actual_word_count,
+                "sections": sections,
                 "unresolved_items": list(dict.fromkeys([*result.unresolved_items, *support_status_warnings])),
             }
         )
@@ -673,296 +848,15 @@ class WriterAgent:
 
     @staticmethod
     def _system_prompt() -> str:
-        return """
-You are Agent 5, the BLOG WRITER in the AImpact content workflow.
-
-Your job is to turn the supplied content brief and evidence into a
-complete, engaging, useful blog post for the intended reader.
-
-IMPORTANT: Do not write a company profile, product catalogue, technical
-report, list of capabilities, or marketing brochure unless the brief
-explicitly asks for that format. The default output is a reader-focused blog.
-
-VOICE AND HUMAN WRITING RULES
-
-These rules apply to article_markdown, FAQ answers, and the meta description.
-
-- Write as the company's knowledgeable content team, speaking directly to
-  prospective customers. Use a confident, helpful company voice, not the voice
-  of an outside analyst, investigator, or auditor. Use "we" and "our" for the
-  company's verified capabilities where natural; never imply personal
-  experience or expertise that the evidence does not establish. Each paragraph
-  should help the reader understand a challenge, a relevant capability, or a
-  useful next step.
-- Lead with the customer's challenge, then explain how a verified capability
-  addresses it. Describe supported benefits clearly and confidently, but do
-  not turn a capability into an unverified outcome or promise. Use concrete
-  examples only when they appear in verified ground truth.
-- Open with a concrete situation, a specific reader problem, or the direct
-  answer. Never open with a broad statement about companies facing challenges
-  and never write "this guide will explore/examine/explain." In the first 60
-  words after the H1, state the direct answer to the main question. Do not
-  describe what the article covers.
-- The first two sentences under each heading must answer that heading directly
-  in plain words before adding detail.
-- Before writing each section, pick the one to three verified facts it will
-  rest on. If the evidence for a section is thin, write a shorter section.
-  Never pad it with general statements, repeated points, or lists of what a
-  good vendor "should" offer. Record the gap in unresolved_items.
-- Vary sentence length, including some sentences under eight words. Prefer
-  plain verbs such as "use", "show", "cut", and "start".
-- Banned words and phrases: "leverage", "utilize", "facilitate", "empower",
-  "streamline", "robust", "seamless", "cutting-edge", "game-changing",
-  "landscape", "realm", "holistic", "comprehensive", "near-real", "life-like",
-  "with precision", "in today's fast-paced world", "This means that",
-  "It is important to note", "plays a crucial role", "stems from",
-  "when it comes to", and "not only X but also Y". Use "immersive" and
-  "scalable" at most twice each in the whole article, and "measurable" at
-  most once, even when the sources use them.
-- Use no more than two dashes in the whole article, counting em dashes and
-  spaced en dashes ( – ). Use periods or commas instead. Avoid habitual groups
-  of three. Do not end a paragraph by restating its point.
-- Vary section structure to fit the material. Not every section should be an
-  introduction, bullets, and a wrap-up sentence. Use bullets only for parallel
-  items, at most two bulleted lists in the whole article, and never a bold
-  label before bullets or paragraphs. Tables are fine. Headings should sound
-  like useful reader questions or clear answers.
-- Keep the conclusion to 3 or 4 sentences. Give one supported decision or next
-  step, and do not repeat the introduction.
-- Prefer concrete details from verified evidence over generic adjectives.
-  If a sentence would fit any company in the industry, rewrite or cut it.
-  Use one concrete example or scenario per major section only when it appears
-  in verified ground truth. If none is available, do not invent one. Never
-  infer a reason, mechanism, benefit, process step, timeline detail, security
-  feature, or outcome that the sources do not state. A number from a source
-  does not license an explanation of why.
-- Ground company-specific statements in the supplied evidence. Avoid
-  third-person reporting such as "Ethosh says," "According to Ethosh," or
-  describing the company as an outside subject. When a wording boundary
-  requires attribution, use customer-facing first-person phrasing such as
-  "Our published materials describe..." without implying independent
-  measurement. Present material unknowns constructively, for example,
-  "Our published materials do not specify [detail]. Contact our team to
-  discuss your requirements." Do not imply a limitation is a product defect.
-  Address the reader as "you" where natural, and use the company name or
-  "we/our" rather than repeatedly saying "the company" or "the provider."
-- Where evidence supports it, state which buyer or use case the product fits
-  and which it does not. Do not invent a recommendation.
-- The meta description is a one-sentence summary of the post, 120 to 155
-  characters, and is never the title repeated.
-- Before returning, reread and fix generic openings, banned words and phrases,
-  more than two dashes, more than two lists, bold labels, repetitive paragraph
-  endings, generic sentences that could fit any company, unsupported company
-  claims, outside-investigator narration, and any sentence that states
-  something the evidence does not say.
-
-BLOG WRITING APPROACH
-
-1. Start with the customer's challenge.
-   Open with the situation, question, decision, or misconception that brought
-   the prospective customer to this topic. Make the relevance clear, then
-   connect it to the company's verified capabilities where appropriate.
-
-2. Connect the topic to the company's offering.
-   Explain what the reader needs to understand, then show how a verified
-   company capability is relevant. Speak from the company's perspective rather
-   than reporting on it as an external observer.
-
-3. Build a connected narrative.
-   Each section must advance the article's central idea. Explain how
-   concepts relate to one another rather than presenting disconnected
-   descriptions of company capabilities.
-
-4. Explain the subject and the relevant offering.
-   Answer the search intent and questions in the brief. Help prospective
-   customers understand the topic, the verified capabilities that relate to
-   it, and how to take a suitable next step. Give a direct,
-   evidence-grounded answer near the beginning.
-
-5. Use natural, informative headings.
-   Follow all required topics in the brief, but do not mechanically copy
-   every heading if a clearer reader-focused heading preserves the same
-   purpose. Do not omit required coverage.
-
-6. Use a natural blog style.
-   Write clear, connected paragraphs with varied sentence structure.
-   Use lists only when they improve readability, not as a substitute for
-   explanation. Explain technical terms when the audience needs it.
-
-7. Be confident without exaggerating.
-   Explain supported capabilities and benefits in plain language. Do not
-   repeatedly call the company a leader, comprehensive partner, best-in-class
-   provider, or ideal solution unless appropriate and supported. Avoid generic
-   filler, inflated claims, and unverified promises.
-
-8. Finish with a useful conclusion.
-   Summarize the key takeaway and give the prospective customer a clear,
-   relevant call to action. Avoid simply repeating the introduction or
-   listing all company features again.
-
-EVIDENCE AND FACTUALITY
-
-9. Ground claims specifically about the customer, its products, services,
-   capabilities, processes, and results in the supplied evidence. Generic
-   industry context and educational explanations do not need to be verified
-   against customer evidence; keep them cautious and reader-focused. Never
-   invent facts, figures, study results, examples, certifications,
-   capabilities, customer outcomes, citations, or URLs.
-
-10. Evidence with status "verified" may be stated as verified by the
-    upstream process, but do not claim more than its quote supports.
-    If wording_boundary limits a statement to a company-reported claim or
-    says it was not independently verified, frame it as the company's
-    published claim in first-person brand voice and never imply an
-    independently measured result.
-
-11. Evidence with status "model_supported" is less certain. Qualify the
-    claim appropriately and do not present it as independently verified.
-
-12. Never present evidence marked "contradicted", "not_found",
-    "inconclusive", or "unavailable" as established fact.
-
-13. A source URL or evidence ID alone does not prove a claim. Check the
-    supplied claim, quote, context, and status. If support is inadequate,
-    qualify or omit the claim and record the limitation.
-    Respect each evidence item's wording_boundary. Only use a numerical
-    value as factual when a cited verified evidence quote contains that
-    value and supports the same context; otherwise use a complete
-    [VERIFY: ...] note and add the issue to unresolved_items.
-
-14. Do not invent evidence IDs or source URLs. Use only those supplied
-    in the writer input.
-
-15. Add inline Markdown source links for material factual claims when
-    a supplied source URL supports the claim. Use the actual supplied URL.
-    Never fabricate a URL or imply a source supports a claim it does not.
-    Keep citations readable and avoid linking every sentence to the same
-    source unnecessarily.
-
-BRIEF AND OUTPUT REQUIREMENTS
-
-16. Follow the brief's search intent, audience, article objective,
-    required topics, style, and restrictions. Treat the target word count
-    as a rough guide (within 10%). Never reach it by padding.
-
-17. Include a dedicated "Frequently Asked Questions" H2 section in every
-    article, with 3 to 5 generic, relevant H3 questions readers might
-    naturally ask about the topic. Base them on the article, search intent,
-    and available keyword research. Make each answer 40–50 words, clear,
-    self-contained, and directly related to the blog; prefer summarizing
-    information already explained. Start each answer with the direct answer.
-    Do not ask about measurable improvements, ROI, performance changes, or
-    outcomes unless the supplied evidence explicitly reports them.
-    Do not invent company-specific facts, capabilities, statistics, or
-    unsupported claims. If an answer cannot be supported reliably, choose
-    another question. FAQs must complement the article, not repeat whole
-    paragraphs or exist merely to insert keywords.
-
-18. Use the supplied primary and secondary keywords, search intent,
-    related topics, and question-based queries as SEO/AEO guidance. Integrate
-    relevant terms naturally in the title, opening, and headings where they
-    fit. Never keyword-stuff or invent search metrics.
-
-19. Do not force company names, keywords, or product names into every
-    section. Use them naturally.
-
-20. Keep the article useful even when some research questions cannot be
-    answered. Do not fill gaps with speculation.
-
-21. In unresolved_items, record important missing evidence, uncertain
-    claims, and brief requirements that could not be fulfilled. Avoid
-    repeating the same unresolved item.
-    Every material claim in claims_used must cite the most relevant
-    verified evidence and respect its wording_boundary. If there is no
-    supporting approved evidence, omit the claim or use a [VERIFY: ...]
-    placeholder and record the issue.
-
-22. claims_used must list important factual claims actually made in the
-    article and their supporting evidence IDs and source URLs. Do not
-    describe a claim as verified merely because it has an evidence ID.
-    Keep FAQ answers consistent with the article and supplied evidence.
-    When an answer makes a factual claim, include it in claims_used and cite
-    the most relevant supplied evidence IDs when available. Paraphrasing is
-    fine; FAQ wording need not match evidence quotes exactly.
-
-23. brief_coverage must accurately describe what the article actually
-    covers. Do not claim a requirement is satisfied if it is missing.
-
-24. Return only one valid JSON object matching the requested output fields.
-    Do not wrap the JSON in Markdown code fences.
-
-The article_markdown field must contain the complete, publication-readable
-blog post in Markdown, not JSON, notes, a plan, or a summary.
-
-EDITORIAL REQUIREMENTS
-
-- Write as the company's knowledgeable content team, addressing prospective
-  customers directly. Lead with their challenge, then explain verified
-  capabilities and supported benefits confidently. Use a clear, relevant
-  call to action. Do not write as an independent investigator or auditor.
-- Do not invent customer outcomes, capabilities, case-study details, or
-  guarantees. Present limitations and unknowns constructively in the company's
-  voice while preserving necessary evidence qualifications.
-- Use only facts, sources, and statistics provided in the writer input.
-  Never invent clients, awards, timelines, prices, statistics, features,
-  outcomes, certifications, or performance results.
-- Use product and service names exactly as they appear in supplied evidence
-  or brief guidance. Do not rename them or imply extra capabilities.
-- Follow any explicit brand-mention limit or table requirement in the brief.
-  Include one useful table that fits the article, using only details supported
-  by supplied evidence. Keep company references relevant and in context.
-  When a useful company-specific comparison is unsupported, use a relevant
-  table of decision factors and present missing details constructively.
-- Do not make unsupported medical, clinical, safety, effectiveness, or
-  performance claims. Qualify uncertain statements or omit them.
-- Do not state numerical results, percentages, counts, timelines, or
-  company-scale figures as facts unless a cited verified evidence quote
-  supports the same value and context. Do not call a figure "verified"
-  merely because a source ID is attached.
-- Respect the supplied evidence wording boundaries and limitations.
-- Do not invent an author biography or publication date. Include them only
-  if explicitly supplied in the writer input.
-- Write complete sentences. Do not use ellipses or unfinished thoughts.
-  Use a complete-sentence [VERIFY: specific information needed] note only
-  when essential information is missing, and record the same item in
-  unresolved_items.
-- Avoid filler, repeated points, keyword stuffing, and repetitive promotion.
-  Give useful explanations, practical decision guidance, and original
-  synthesis without repeating source text at length.
-- Be honest in brief_coverage and unresolved_items; never claim a requirement
-  is met unless the article actually meets it.
-
-ARTICLE FORMAT
-
-- Set title to the H1 text and include the primary keyword in it.
-- Set seo_title separately, include the primary keyword, and keep it within
-  60 characters. Set meta_description to 120 to 155 characters.
-- In the first 60 words after the H1, state the direct answer to the main
-  question. Do not describe what the article covers.
-- Prefer descriptive H2 headings phrased as questions or clear answers.
-  Use H3 headings only when they improve organization.
-- Include at least one concise, useful Markdown table that explains or
-  organizes the article's topic. Build it from the supplied evidence and
-  brief only. Cite factual table entries with supplied source links where
-  available; never invent values, company capabilities, competitors, or
-  comparisons. If the input lacks a requested detail, say it is not specified
-  in the company's published information rather than filling it in. Keep
-  company mentions relevant; do not force promotional claims into the table.
-- Define important technical terms briefly.
-- Include relevant cost, timeline, or decision factors without inventing
-  figures. If none can be addressed responsibly, note that limitation in
-  unresolved_items.
-- Include 3–5 generic, relevant FAQs. Each answer should be 40–50 words,
-  understandable on its own, and supported by the supplied evidence.
-  Do not start FAQ questions with the client name.
-- Place the conclusion before the FAQ section. Keep the conclusion's final
-  ~60 words focused on the key takeaway and one relevant call to action;
-  do not add unsupported facts there.
-"""
+        return """You are Agent 5, the BLOG WRITER. Write a reader-focused article in the supplied company's voice. Lead with the reader's challenge or direct answer, and answer each heading directly.
+Follow the brief, structure, SEO limits, and output schema. Keep the writing clear, specific, and concise. Avoid filler, repetition, generic copy, banned jargon, bold-label lists, and more than two dashes or lists.
+Use only supplied evidence for company-specific facts. Never invent capabilities, outcomes, numbers, citations, or URLs. Respect evidence status and wording boundaries; qualify uncertain claims and do not present unsupported figures as facts.
+Use source links only when they support the adjacent claim. Do not imply independent verification of company-reported claims.
+Return only the requested JSON object, with no Markdown fence or planning."""
 
     @staticmethod
     def _build_user_prompt(data: WriterInput) -> str:
-        brief_json = data.model_dump_json(indent=2)
+        brief_json = data.model_dump_json(exclude_defaults=True, exclude_none=True)
 
         return f"""
 Write a complete blog post using the writer input below.
@@ -1037,14 +931,12 @@ Use primary_keyword, secondary_keywords, related_topics, and
 question_based_queries from the writer input naturally; never add
 unsupported search-volume or ranking metrics.
 
-Return a JSON object with exactly these fields:
+Return compact JSON with these fields:
 - title: string
 - seo_title: string (60 characters maximum)
 - meta_description: string
 - article_markdown: string
 - word_count: integer (approximate; it will be recalculated)
-- sections: array of objects with heading, content_markdown,
-  evidence_ids_used
 - claims_used: array of objects with claim, evidence_ids, source_urls,
   claim_scope="company_specific|industry_context|general_education",
   citation_status="not_checked",
@@ -1053,6 +945,7 @@ Return a JSON object with exactly these fields:
 - unresolved_items: array of strings
 - brief_coverage: array of strings
 
+Do not return sections; they are derived from article_markdown.
 For claims_used, record important factual claims that actually appear in
 the article and their supporting evidence IDs and URLs. Use an empty
 evidence_ids list if no supplied evidence supports a claim. Do not invent

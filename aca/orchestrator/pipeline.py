@@ -29,6 +29,7 @@ from aca.models.ground_truth import ClientInput, GroundTruthGuide
 from aca.models.prompt_intelligence import PromptAnalysis
 from aca.models.reviewer import ReviewOutput
 from aca.models.source_intelligence import SourceIntelligence
+from aca.models.token_usage import ClaudeTokenUsage
 from aca.models.writer import (
     WriterEvidence,
     WriterInput,
@@ -36,6 +37,7 @@ from aca.models.writer import (
     WriterSectionInput,
 )
 from aca.orchestrator.checkpointer import postgres_checkpointer, thread_config
+from aca.observability.token_usage import merge_token_usage, token_usage_scope
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +64,7 @@ class PipelineState(BaseModel):
     proposed_revision: dict[str, Any] | None = None
     reviewed_draft_fingerprint: str | None = None
     finding_statuses: dict[str, str] = Field(default_factory=dict)
+    token_usage: list[ClaudeTokenUsage] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
 
 
@@ -76,17 +79,20 @@ def _run_stage(
         state.run_id,
         stage,
     )
-    try:
-        result = operation()
-    except Exception as exc:
-        logger.exception(
-            "run_id=%s stage=%s status=failed error_type=%s duration_ms=%.1f",
-            state.run_id,
-            stage,
-            type(exc).__name__,
-            (time.perf_counter() - started) * 1000,
-        )
-        raise
+    with token_usage_scope(state.run_id, stage) as usage_records:
+        try:
+            result = operation()
+        except Exception as exc:
+            state.token_usage = merge_token_usage(state.token_usage, usage_records)
+            logger.exception(
+                "run_id=%s stage=%s status=failed error_type=%s duration_ms=%.1f",
+                state.run_id,
+                stage,
+                type(exc).__name__,
+                (time.perf_counter() - started) * 1000,
+            )
+            raise
+    state.token_usage = merge_token_usage(state.token_usage, usage_records)
     logger.info(
         "run_id=%s stage=%s status=success duration_ms=%.1f",
         state.run_id,
@@ -106,7 +112,11 @@ def agent1_node(state: PipelineState) -> dict[str, Any]:
             state.company_name.strip() or None,
         ),
     )
-    return {"prompt_analysis": result, "company_name": result.customer_name}
+    return {
+        "prompt_analysis": result,
+        "company_name": result.customer_name,
+        "token_usage": state.token_usage,
+    }
 
 
 def agent2_node(state: PipelineState) -> dict[str, Any]:
@@ -115,7 +125,7 @@ def agent2_node(state: PipelineState) -> dict[str, Any]:
         "agent2",
         lambda: run_agent2(state.campaign_id, state.prompt_id, top_n=state.top_n),
     )
-    return {"source_analysis": result}
+    return {"source_analysis": result, "token_usage": state.token_usage}
 
 
 def agent3_node(state: PipelineState) -> dict[str, Any]:
@@ -140,11 +150,12 @@ def agent3_node(state: PipelineState) -> dict[str, Any]:
         )
         return {
             "guide": guide,
+            "token_usage": state.token_usage,
             "errors": [
                 "Prompt/customer verification did not pass; Agents 4 and 5 were skipped. " f"{reason}"
             ],
         }
-    return {"guide": guide}
+    return {"guide": guide, "token_usage": state.token_usage}
 
 
 def agent4_node(state: PipelineState) -> dict[str, Any]:
@@ -165,9 +176,10 @@ def agent4_node(state: PipelineState) -> dict[str, Any]:
     if not brief.sections:
         return {
             "content_brief": brief,
+            "token_usage": state.token_usage,
             "errors": ["Agent 4 returned no usable sections. Agent 5 was not run."],
         }
-    return {"content_brief": brief}
+    return {"content_brief": brief, "token_usage": state.token_usage}
 
 
 def _build_writer_input(state: PipelineState) -> WriterInput:
@@ -253,7 +265,7 @@ def agent5_node(state: PipelineState) -> dict[str, Any]:
         "agent5",
         lambda: WriterAgent().write(writer_input),
     )
-    return {"written_article": article}
+    return {"written_article": article, "token_usage": state.token_usage}
 
 
 def agent6_node(state: PipelineState) -> dict[str, Any]:
@@ -265,7 +277,7 @@ def agent6_node(state: PipelineState) -> dict[str, Any]:
         "agent6",
         lambda: ReviewerAgent().review(writer_input, state.written_article),
     )
-    return {"review_output": reviewed}
+    return {"review_output": reviewed, "token_usage": state.token_usage}
 
 
 def _entry(state: PipelineState) -> str:
