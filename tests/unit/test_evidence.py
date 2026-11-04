@@ -1,4 +1,4 @@
-from aca.evidence import canonicalize_evidence_url
+from src.utils.evidence import canonicalize_evidence_url
 
 
 def test_canonicalize_evidence_url_normalizes_host_scheme_port_fragment_and_slash():

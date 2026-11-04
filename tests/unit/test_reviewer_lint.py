@@ -1,4 +1,4 @@
-from aca.reviewer_lint import build_retry_message, count_list_blocks, lint_article
+from src.utils.reviewer_lint import build_retry_message, count_list_blocks, lint_article
 
 
 def test_count_list_blocks_keeps_blank_lines_inside_a_list_together():

@@ -1,4 +1,4 @@
-from aca.article_sections import split_article_sections
+from src.ui.article_sections import split_article_sections
 
 
 def test_split_article_sections_places_conclusion_before_expandable_faqs():

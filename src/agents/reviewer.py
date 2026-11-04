@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
 import re
 from typing import Any
@@ -11,16 +10,71 @@ from typing import Any
 import anthropic
 from pydantic import ValidationError
 
-from aca.evidence import canonicalize_evidence_url
-from aca.models.reviewer import ReviewOutput, ReviewerResponse
-from aca.models.writer import (
+from src.models.reviewer import ReviewOutput, ReviewerResponse
+from src.models.writer import (
     WriterEvidence,
     WriterInput,
     WriterOutput,
     WrittenSection,
 )
-from aca.observability.token_usage import record_claude_response
-logger = logging.getLogger(__name__)
+from src.observability.token_usage import record_claude_response
+from src.utils.evidence import canonicalize_evidence_url
+
+_REVIEW_RESPONSE_TOOL = {
+    "name": "submit_review",
+    "description": "Submit structured review findings for a human to assess.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string"},
+            "findings": {
+                "type": "array",
+                "maxItems": 5,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "area": {
+                            "type": "string",
+                            "enum": [
+                                "grammar",
+                                "formatting",
+                                "headings",
+                                "content",
+                                "keywords",
+                                "seo",
+                                "factual_claims",
+                            ],
+                        },
+                        "severity": {
+                            "type": "string",
+                            "enum": ["critical", "high", "medium", "low"],
+                        },
+                        "issue": {"type": "string"},
+                        "recommendation": {"type": "string"},
+                        "target_text": {
+                            "anyOf": [{"type": "string"}, {"type": "null"}],
+                        },
+                    },
+                    "required": [
+                        "area",
+                        "severity",
+                        "issue",
+                        "recommendation",
+                        "target_text",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+            "unresolved_items": {
+                "type": "array",
+                "maxItems": 10,
+                "items": {"type": "string"},
+            },
+        },
+        "required": ["summary", "findings", "unresolved_items"],
+        "additionalProperties": False,
+    },
+}
 
 
 class ReviewerAgent:
@@ -90,6 +144,8 @@ class ReviewerAgent:
             model=self.model,
             max_tokens=self.max_tokens,
             system=self._system_prompt(),
+            tools=[_REVIEW_RESPONSE_TOOL],
+            tool_choice={"type": "tool", "name": _REVIEW_RESPONSE_TOOL["name"]},
             messages=[
                 {
                     "role": "user",
@@ -103,18 +159,15 @@ class ReviewerAgent:
                 f"Reviewer response was truncated at {self.max_tokens:,} output tokens. "
                 "Reduce the findings to concise issues and try again."
             )
-        if response.stop_reason not in {"end_turn", "stop_sequence"}:
+        if response.stop_reason != "tool_use":
             raise RuntimeError(
-                "Reviewer did not finish its response " f"(stop reason: {response.stop_reason or 'unknown'})."
+                "Reviewer did not return its required structured review tool "
+                f"(stop reason: {response.stop_reason or 'unknown'})."
             )
-        raw_text = "\n".join(
-            block.text for block in response.content if getattr(block, "type", None) == "text"
-        ).strip()
-        if not raw_text:
-            raise RuntimeError("Reviewer Agent returned an empty response.")
+        payload = self._extract_review_tool_input(response)
         try:
-            result = ReviewerResponse.model_validate(self._parse_json(raw_text))
-        except (ValidationError, ValueError) as exc:
+            result = ReviewerResponse.model_validate(payload)
+        except ValidationError as exc:
             raise RuntimeError(f"Reviewer Agent returned invalid output: {exc}") from exc
 
         return ReviewOutput(
@@ -337,82 +390,27 @@ class ReviewerAgent:
         )
 
     @staticmethod
-    def _parse_json(raw_text: str) -> dict[str, Any]:
-        text = raw_text.strip()
-        decoder = json.JSONDecoder()
-        last_json_error: json.JSONDecodeError | None = None
-        last_validation_error: ValidationError | None = None
-        search_from = 0
-
-        while (start := text.find("{", search_from)) != -1:
-            try:
-                payload, end = decoder.raw_decode(text, start)
-            except json.JSONDecodeError as exc:
-                last_json_error = exc
-                search_from = start + 1
-                continue
-
-            search_from = start + 1
-            if not isinstance(payload, dict):
-                continue
-            try:
-                ReviewerResponse.model_validate(payload)
-            except ValidationError as exc:
-                last_validation_error = exc
-                continue
-            trailing_kind = ReviewerAgent._classify_trailing_content(text[end:])
-            if trailing_kind:
-                logger.warning(
-                    "Reviewer response had %s after its first valid JSON object "
-                    "(starting at character %d); extra content was ignored.",
-                    trailing_kind,
-                    end,
-                )
-            return payload
-
-        if last_validation_error is not None:
-            missing_or_invalid_fields = [
-                f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}"
-                for error in last_validation_error.errors(include_input=False)[:5]
-            ]
+    def _extract_review_tool_input(response: Any) -> dict[str, Any]:
+        tool_blocks = [
+            block for block in response.content if getattr(block, "type", None) == "tool_use"
+        ]
+        if len(tool_blocks) != 1:
             raise RuntimeError(
-                "Reviewer Agent response contained JSON, but no object matched "
-                "the required review response schema. "
-                f"Field errors: {'; '.join(missing_or_invalid_fields)}."
-            ) from last_validation_error
-        if last_json_error is not None:
+                "Reviewer must return exactly one structured review tool call; "
+                f"received {len(tool_blocks)}."
+            )
+
+        tool_block = tool_blocks[0]
+        if getattr(tool_block, "name", None) != _REVIEW_RESPONSE_TOOL["name"]:
             raise RuntimeError(
-                "Reviewer Agent response contained no complete JSON object. "
-                f"First syntax error at character {last_json_error.pos}: "
-                f"{last_json_error.msg} (response length: {len(text)} characters)."
-            ) from last_json_error
-        raise RuntimeError(
-            "Reviewer Agent output contained no JSON object "
-            f"(response length: {len(text)} characters)."
-        )
+                "Reviewer returned an unexpected tool call "
+                f"({getattr(tool_block, 'name', 'unnamed')})."
+            )
 
-    @staticmethod
-    def _classify_trailing_content(trailing_text: str) -> str | None:
-        trailing = trailing_text.strip()
-        if not trailing or re.fullmatch(r"```(?:json)?\s*```", trailing, flags=re.IGNORECASE):
-            return None
-
-        decoder = json.JSONDecoder()
-        search_from = 0
-        while (start := trailing.find("{", search_from)) != -1:
-            try:
-                payload, _ = decoder.raw_decode(trailing, start)
-            except json.JSONDecodeError:
-                search_from = start + 1
-                continue
-            if isinstance(payload, dict):
-                try:
-                    ReviewerResponse.model_validate(payload)
-                except ValidationError:
-                    return "another JSON object"
-                return "a second valid reviewer JSON object"
-            search_from = start + 1
-        return "non-JSON trailing text"
+        payload = getattr(tool_block, "input", None)
+        if not isinstance(payload, dict):
+            raise RuntimeError("Reviewer returned invalid structured tool input; expected an object.")
+        return payload
 
     @staticmethod
     def _system_prompt() -> str:
@@ -447,19 +445,6 @@ Do not flag stylistic preferences as errors unless they conflict with the brief.
 If you find no material issues, say so in the summary and return empty findings
 and unresolved_items arrays.
 
-Return JSON only, matching this schema:
-{
-  "summary": "One short sentence describing the review result",
-  "findings": [
-    {
-      "area": "grammar|formatting|headings|content|keywords|seo|factual_claims",
-      "severity": "critical|high|medium|low",
-      "issue": "Specific issue and where it appears",
-      "recommendation": "Action or verification for the human reviewer",
-      "target_text": "Exact unique excerpt from article, or null"
-    }
-  ],
-  "unresolved_items": ["Material evidence or brief questions a human must resolve"]
-}
-Return at most 5 findings and 10 unresolved items. Never include a revised article,
+Submit the review using the required submit_review tool. Return at most 5 findings
+and 10 unresolved items. Never include a revised article,
 replacement wording, or a full article excerpt. Human approval is required."""

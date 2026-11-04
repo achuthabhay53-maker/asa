@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from aca.tools.aimpact import _normalize_sources, get_campaign, get_connection, get_project
+from src.tools.aimpact import _normalize_sources, get_campaign, get_connection, get_project
 
 
 def _source_row(source) -> dict:

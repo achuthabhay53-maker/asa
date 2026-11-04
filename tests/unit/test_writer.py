@@ -3,10 +3,12 @@ from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
-from aca.agents.writer import WriterAgent
-from aca.agents.reviewer import ReviewerAgent
-from aca.models.writer import (
+from src.agents.writer import WriterAgent
+from src.agents.reviewer import ReviewerAgent
+from src.models.reviewer import ReviewerResponse
+from src.models.writer import (
     WriterClaim,
     WriterEvidence,
     WriterInput,
@@ -131,19 +133,19 @@ def test_reviewer_returns_findings_without_rewriting_the_draft():
         "severity": "medium",
         "issue": "The opening paragraph repeats a phrase.",
         "recommendation": "Have a human edit the repeated phrase.",
+        "target_text": None,
     }
     response = SimpleNamespace(
-        stop_reason="end_turn",
+        stop_reason="tool_use",
         content=[
             SimpleNamespace(
-                type="text",
-                text=json.dumps(
-                    {
-                        "summary": "One writing issue needs human review.",
-                        "findings": [finding],
-                        "unresolved_items": [],
-                    }
-                ),
+                type="tool_use",
+                name="submit_review",
+                input={
+                    "summary": "One writing issue needs human review.",
+                    "findings": [finding],
+                    "unresolved_items": [],
+                },
             )
         ],
     )
@@ -167,6 +169,12 @@ def test_reviewer_returns_findings_without_rewriting_the_draft():
     assert "revised_blog" not in result.model_dump()
     assert len(calls) == 1
     assert calls[0]["max_tokens"] == 4096
+    assert calls[0]["tool_choice"] == {"type": "tool", "name": "submit_review"}
+    assert calls[0]["tools"][0]["input_schema"]["required"] == [
+        "summary",
+        "findings",
+        "unresolved_items",
+    ]
     request = json.loads(calls[0]["messages"][0]["content"])
     assert "article_markdown" in request["draft"]
     assert "sections" in request
@@ -208,7 +216,7 @@ def test_reviewer_reports_when_full_blog_response_is_truncated():
 
 
 def test_reviewer_rebuilds_writer_sections_from_compact_markdown_response():
-    from aca.models.reviewer import RevisedBlog
+    from src.models.reviewer import RevisedBlog
 
     draft = _writer_output()
     revision = RevisedBlog(
@@ -266,6 +274,25 @@ def _writer_output(
 
 class _FakeMessageStream:
     def __init__(self, response):
+        if response.stop_reason == "end_turn":
+            text_blocks = [
+                block for block in response.content
+                if getattr(block, "type", None) == "text"
+            ]
+            if text_blocks:
+                payload = json.loads("\n".join(block.text for block in text_blocks))
+                is_patch = "metadata" in payload or "edits" in payload
+                response = SimpleNamespace(
+                    stop_reason="tool_use",
+                    content=[
+                        SimpleNamespace(
+                            type="tool_use",
+                            name="submit_writer_patch" if is_patch else "submit_writer_output",
+                            input=payload,
+                        )
+                    ],
+                    usage=getattr(response, "usage", None),
+                )
         self.response = response
 
     def __enter__(self):
@@ -429,7 +456,19 @@ def test_writer_repairs_faq_after_evidence_validation_failure():
     outputs = iter(
         [
             _writer_output(invalid_article).model_dump(mode="json"),
-            _writer_output().model_dump(mode="json"),
+            {
+                "metadata": {},
+                "edits": [
+                    {
+                        "old_text": "### What is VR training used for?\n\n",
+                        "new_text": (
+                            "### What is VR training used for?\n\n"
+                            "It supports immersive training for medical device teams and lets "
+                            "learners practice procedures through interactive simulation.\n\n"
+                        ),
+                    }
+                ],
+            },
         ]
     )
     prompts = []
@@ -456,6 +495,7 @@ def test_writer_repairs_faq_after_evidence_validation_failure():
     assert "### What is VR training used for?" in result.article_markdown
     assert len(prompts) == 2
     assert "3 to 5 relevant FAQ questions with answers" in prompts[1]
+    assert "Do not return the full article" in prompts[1]
 
 
 def test_writer_attaches_source_quote_and_status_to_each_claim():
@@ -481,11 +521,11 @@ def test_writer_revision_uses_human_instructions_and_returns_a_proposal():
     prompts = []
     agent = WriterAgent.__new__(WriterAgent)
 
-    def generate(prompt):
+    def generate(draft, prompt):
         prompts.append(prompt)
         return proposed
 
-    agent._generate_output = generate
+    agent._generate_targeted_update = generate
 
     result = agent.revise(_writer_input(), draft, "Make the conclusion more direct.")
 
@@ -493,11 +533,13 @@ def test_writer_revision_uses_human_instructions_and_returns_a_proposal():
     assert draft.article_markdown == _writer_output().article_markdown
     assert draft.article_markdown != result.article_markdown
     assert "Make the conclusion more direct." in prompts[0]
-    assert "approved evidence" in prompts[0]
-    assert "company's knowledgeable content-team voice" in prompts[0]
-    assert "third-person investigator language" in prompts[0]
-    assert "supported benefits confidently" in prompts[0]
     assert "This is a proposal" in prompts[0]
+    request = json.loads(prompts[0].split("<revision_request>\n", 1)[1].split("\n</revision_request>", 1)[0])
+    assert "revision_context" in request
+    assert request["revision_context"]["evidence"][0]["evidence_id"] == "ev_001"
+    assert "sections" not in request["current_draft"]
+    assert "claims_used" not in request["current_draft"]
+    assert len(prompts) == 1
 
 
 def test_writer_revision_rejects_empty_instructions():
@@ -775,24 +817,22 @@ def test_writer_returns_blog_even_when_it_exceeds_word_count_target():
     assert len(calls) == 1
 
 
-def test_writer_retries_truncated_response_with_larger_token_limit():
+def test_writer_uses_one_generation_when_response_fits():
+    output = _writer_output().model_dump(mode="json")
+    output.pop("sections")
     responses = [
-        SimpleNamespace(stop_reason="max_tokens", content=[]),
         SimpleNamespace(
             stop_reason="end_turn",
-            content=[
-                SimpleNamespace(
-                    type="text",
-                    text=json.dumps(_writer_output().model_dump(mode="json")),
-                )
-            ],
-        ),
+            content=[SimpleNamespace(type="text", text=json.dumps(output))],
+        )
     ]
     token_limits = []
+    requests = []
 
     class FakeMessages:
         @staticmethod
         def stream(**kwargs):
+            requests.append(kwargs)
             token_limits.append(kwargs["max_tokens"])
             return _FakeMessageStream(responses.pop(0))
 
@@ -804,7 +844,53 @@ def test_writer_retries_truncated_response_with_larger_token_limit():
     result = agent._generate_output("test prompt")
 
     assert result.title == "VR Training for Medical Device Teams"
-    assert token_limits == [11000, 22000]
+    assert token_limits == [11000]
+    assert requests[0]["tool_choice"] == {
+        "type": "tool",
+        "name": "submit_writer_output",
+    }
+    assert set(requests[0]["tools"][0]["input_schema"]["required"]) >= {
+        "title",
+        "article_markdown",
+        "word_count",
+    }
+    assert [section.heading for section in result.sections] == [
+        "How the training works",
+        "Frequently Asked Questions",
+        "What is VR training used for?",
+        "How do learners practice?",
+        "Who can use this training?",
+    ]
+
+
+def test_writer_targeted_repair_rejects_ambiguous_edit_anchors():
+    response = SimpleNamespace(
+        stop_reason="end_turn",
+        content=[
+            SimpleNamespace(
+                type="text",
+                text=json.dumps(
+                    {
+                        "metadata": {},
+                        "edits": [{"old_text": "practice", "new_text": "train"}],
+                    }
+                ),
+            )
+        ],
+    )
+
+    class FakeMessages:
+        @staticmethod
+        def stream(**_kwargs):
+            return _FakeMessageStream(response)
+
+    agent = WriterAgent.__new__(WriterAgent)
+    agent.client = SimpleNamespace(messages=FakeMessages())
+    agent.model = "test"
+    agent.max_tokens = 11000
+
+    with pytest.raises(RuntimeError, match="anchor must occur exactly once"):
+        agent._generate_targeted_update(_writer_output(), "Apply a small edit.")
 
 
 def test_writer_normalizes_invalid_claim_support_status_without_calling_it_supported():
@@ -837,7 +923,7 @@ def test_writer_normalizes_invalid_claim_support_status_without_calling_it_suppo
     )
 
 
-def test_writer_reports_when_retry_is_still_truncated():
+def test_writer_reports_truncation_without_retrying():
     token_limits = []
 
     class FakeMessages:
@@ -851,10 +937,10 @@ def test_writer_reports_when_retry_is_still_truncated():
     agent.model = "test"
     agent.max_tokens = 11000
 
-    with pytest.raises(RuntimeError, match="truncated at 22,000 output tokens"):
+    with pytest.raises(RuntimeError, match="truncated at 11,000 output tokens"):
         agent._generate_output("test prompt")
 
-    assert token_limits == [11000, 22000]
+    assert token_limits == [11000]
 
 
 @pytest.mark.parametrize(
@@ -893,13 +979,11 @@ def test_writer_input_carries_seo_research_and_prompt_requires_article_standards
     assert "40–50 words" in prompt
     assert "search intent" in prompt
     system_prompt = WriterAgent._system_prompt()
-    assert "seo_title separately" in system_prompt
-    assert "first 60 words" in system_prompt
-    assert "40–50 words" in system_prompt
-    assert "conclusion before the FAQ section" in system_prompt
-    assert "[VERIFY: specific information needed]" in system_prompt
-    assert "at least one concise, useful Markdown table" in system_prompt
-    assert "never invent values, company capabilities, competitors, or" in system_prompt
+    assert "BLOG WRITER" in system_prompt
+    assert "Use only supplied evidence" in system_prompt
+    assert "Never invent capabilities, outcomes, numbers, citations, or URLs" in system_prompt
+    assert len(system_prompt) < 1000
+    assert "Do not return sections; they are derived from article_markdown." in prompt
     assert set(WriterOutput.model_fields) == {
         "title",
         "seo_title",
@@ -916,15 +1000,10 @@ def test_writer_input_carries_seo_research_and_prompt_requires_article_standards
 def test_human_writing_rules_are_in_the_writer_prompt():
     prompt = WriterAgent._system_prompt()
 
-    assert "company's knowledgeable content team" in prompt
-    assert "Lead with the customer's challenge" in prompt
-    assert "supported benefits clearly and confidently" in prompt
-    assert "customer-facing first-person phrasing" in prompt
-    assert "According to Ethosh" in prompt
-    assert "outside-investigator narration" in prompt
-    assert "first two sentences under each heading" in prompt
-    assert "no more than two dashes" in prompt
-    assert "banned words and phrases" in prompt
+    assert "company's voice" in prompt
+    assert "Keep the writing clear" in prompt
+    assert "Respect evidence status and wording boundaries" in prompt
+    assert "Do not imply independent verification" in prompt
 
 
 def test_writer_user_prompt_reinforces_company_voice_and_evidence_limits():
@@ -948,58 +1027,53 @@ def test_reviewer_prompt_reports_issues_without_rewriting():
     assert "grammar and spelling errors" in prompt
 
 
-def test_reviewer_parser_accepts_trailing_text_after_valid_json():
-    response = {
-        "summary": "Reviewed the article.",
-        "findings": [],
-        "unresolved_items": [],
-    }
-
-    parsed = ReviewerAgent._parse_json(
-        "```json\n" + json.dumps(response) + "\n```\nAdditional model commentary."
+def test_reviewer_requires_exactly_one_submit_review_tool_call():
+    response = SimpleNamespace(
+        content=[
+            SimpleNamespace(
+                type="tool_use",
+                name="submit_review",
+                input={
+                    "summary": "Reviewed the article.",
+                    "findings": [],
+                    "unresolved_items": [],
+                },
+            )
+        ]
     )
 
-    assert parsed == response
-
-
-def test_reviewer_parser_identifies_and_ignores_duplicate_response(caplog):
-    response = {
+    assert ReviewerAgent._extract_review_tool_input(response) == {
         "summary": "Reviewed the article.",
         "findings": [],
         "unresolved_items": [],
     }
-    repeated = {
-        **response,
-        "summary": "A duplicate response appended by the model.",
-    }
 
-    parsed = ReviewerAgent._parse_json(json.dumps(response) + "\n" + json.dumps(repeated))
-
-    assert parsed == response
-    assert "a second valid reviewer JSON object" in caplog.text
-    assert "extra content was ignored" in caplog.text
+    with pytest.raises(RuntimeError, match="exactly one structured review tool call"):
+        ReviewerAgent._extract_review_tool_input(SimpleNamespace(content=[]))
 
 
-def test_reviewer_parser_rejects_response_without_complete_schema_object():
-    with pytest.raises(RuntimeError, match="no complete JSON object"):
-        ReviewerAgent._parse_json('{"summary": "incomplete"')
+def test_reviewer_rejects_unexpected_tool_call():
+    response = SimpleNamespace(
+        content=[SimpleNamespace(type="tool_use", name="other_tool", input={})]
+    )
+
+    with pytest.raises(RuntimeError, match="unexpected tool call"):
+        ReviewerAgent._extract_review_tool_input(response)
 
 
-def test_reviewer_parser_reports_schema_fields_without_echoing_response():
-    with pytest.raises(RuntimeError, match="summary: Field required"):
-        ReviewerAgent._parse_json(json.dumps({"findings": []}))
+def test_reviewer_schema_rejects_invalid_tool_input():
+    response = SimpleNamespace(
+        content=[
+            SimpleNamespace(
+                type="tool_use",
+                name="submit_review",
+                input={"findings": []},
+            )
+        ]
+    )
 
-
-def test_reviewer_parser_rejects_rewritten_article_fields():
-    response = {
-        "summary": "Review complete.",
-        "findings": [],
-        "unresolved_items": [],
-        "article_markdown": "# Rewritten draft",
-    }
-
-    with pytest.raises(RuntimeError, match="article_markdown: Extra inputs are not permitted"):
-        ReviewerAgent._parse_json(json.dumps(response))
+    with pytest.raises(ValidationError, match="summary"):
+        ReviewerResponse.model_validate(ReviewerAgent._extract_review_tool_input(response))
 
 
 def test_writer_requires_seo_title_and_155_character_meta_description():
@@ -1044,7 +1118,82 @@ def test_writer_repairs_article_when_table_is_missing():
     outputs = iter(
         [
             _writer_output(article_without_table).model_dump(mode="json"),
-            _writer_output().model_dump(mode="json"),
+            {
+                "metadata": {},
+                "edits": [
+                    {
+                        "old_text": "## Frequently Asked Questions",
+                        "new_text": (
+                            "| Consideration | What the supplied evidence says |\n"
+                            "| --- | --- |\n"
+                            "| Training approach | Immersive training supports procedural practice. |\n\n"
+                            "## Frequently Asked Questions"
+                        ),
+                    }
+                ],
+            },
+        ]
+    )
+    calls = []
+
+    class FakeMessages:
+        @staticmethod
+        def stream(**kwargs):
+            calls.append(kwargs)
+            return _FakeMessageStream(
+                SimpleNamespace(
+                    stop_reason="end_turn",
+                    content=[SimpleNamespace(type="text", text=json.dumps(next(outputs)))],
+                )
+            )
+
+    agent = WriterAgent.__new__(WriterAgent)
+    agent.client = SimpleNamespace(messages=FakeMessages())
+    agent.model = "test"
+    agent.max_tokens = 1000
+
+    result = agent.write(_writer_input())
+
+    assert "| Consideration | What the supplied evidence says |" in result.article_markdown
+    expected_claim = _writer_output(article_without_table).claims_used[0]
+    assert result.claims_used[0].claim == expected_claim.claim
+    assert result.claims_used[0].evidence_ids == expected_claim.evidence_ids
+    assert len(calls) == 2
+    assert calls[1]["max_tokens"] == 1000
+    assert "at least one useful, valid Markdown table" in calls[1]["messages"][0]["content"]
+
+
+def test_writer_combines_seo_and_style_repairs_in_one_retry():
+    article_with_issues = _ARTICLE.replace(
+        "can give medical device teams",
+        "can leverage medical device teams",
+    ).replace(
+        "| Consideration | What the supplied evidence says |\n"
+        "| --- | --- |\n"
+        "| Training approach | Immersive training supports procedural practice. |\n\n",
+        "",
+    )
+    outputs = iter(
+        [
+            _writer_output(article_with_issues).model_dump(mode="json"),
+            {
+                "metadata": {},
+                "edits": [
+                    {
+                        "old_text": "can leverage medical device teams",
+                        "new_text": "can give medical device teams",
+                    },
+                    {
+                        "old_text": "## Frequently Asked Questions",
+                        "new_text": (
+                            "| Consideration | What the supplied evidence says |\n"
+                            "| --- | --- |\n"
+                            "| Training approach | Immersive training supports procedural practice. |\n\n"
+                            "## Frequently Asked Questions"
+                        ),
+                    },
+                ],
+            },
         ]
     )
     calls = []
@@ -1069,7 +1218,16 @@ def test_writer_repairs_article_when_table_is_missing():
 
     assert "| Consideration | What the supplied evidence says |" in result.article_markdown
     assert len(calls) == 2
-    assert "at least one useful, valid Markdown table" in calls[1]["messages"][0]["content"]
+    repair_prompt = calls[1]["messages"][0]["content"]
+    assert "Markdown table" in repair_prompt
+    assert "Style issues to fix in the same repair" in repair_prompt
+    assert "leverage" in repair_prompt
+    assert "<previous_draft>" in repair_prompt
+    assert "<writer_input>" not in repair_prompt
+    assert "Do not return the full article" in repair_prompt
+    assert "claims_used" not in repair_prompt
+    assert "BLOG WRITER" in calls[0]["system"]
+    assert "BLOG WRITER" not in calls[1]["system"]
 
 
 def test_writer_word_count_target_does_not_block_valid_article():

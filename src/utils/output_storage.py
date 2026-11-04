@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[2] / "outputs"
+
 
 def save_agent_output(
     agent_number: int,
@@ -23,6 +25,7 @@ def save_agent_output(
             raise TypeError("output must be a JSON object when run_id is provided")
         output = {**output, "_run_id": run_id}
     path = Path(output_dir) / f"agent{agent_number}_output.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(output, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
@@ -32,5 +35,6 @@ def save_agent_output(
 
 def clear_agent_outputs(output_dir: str | Path) -> None:
     directory = Path(output_dir)
+    directory.mkdir(parents=True, exist_ok=True)
     for agent_number in range(1, 7):
         (directory / f"agent{agent_number}_output.json").unlink(missing_ok=True)

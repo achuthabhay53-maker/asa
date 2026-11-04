@@ -2,7 +2,20 @@ import json
 
 import pytest
 
-from aca.agents.content_brief import ContentBriefAgent, _extract_json
+from src.agents.content_brief import ContentBriefAgent
+
+
+def _tool_response(output):
+    return {
+        "stop_reason": "tool_use",
+        "content": [
+            {
+                "type": "tool_use",
+                "name": "submit_content_brief",
+                "input": output,
+            }
+        ],
+    }
 
 
 def _brief_inputs():
@@ -45,8 +58,6 @@ def test_content_brief_passes_agent3_search_signals_into_seo_fields(monkeypatch)
             "Who benefits from immersive training?",
         ],
     }
-    encoded = json.dumps(output)
-    response_text = encoded[len('{"article_objective":'):]
     captured = {}
 
     class FakeResponse:
@@ -55,13 +66,13 @@ def test_content_brief_passes_agent3_search_signals_into_seo_fields(monkeypatch)
 
         @staticmethod
         def json():
-            return {"content": [{"type": "text", "text": response_text}]}
+            return _tool_response(output)
 
     def fake_post(url, **kwargs):
         captured.update(kwargs)
         return FakeResponse()
 
-    monkeypatch.setattr("aca.agents.content_brief.httpx.post", fake_post)
+    monkeypatch.setattr("src.agents.content_brief.httpx.post", fake_post)
     brief = ContentBriefAgent(api_key="test").build_brief(*_brief_inputs())
 
     assert brief.primary_keyword == "immersive training"
@@ -69,44 +80,37 @@ def test_content_brief_passes_agent3_search_signals_into_seo_fields(monkeypatch)
     assert brief.related_topics == ["Training design"]
     assert brief.question_based_queries == ["How does immersive training work?"]
     assert len(brief.faq_questions) == 3
+    assert captured["json"]["tool_choice"] == {
+        "type": "tool",
+        "name": "submit_content_brief",
+    }
+    assert set(captured["json"]["tools"][0]["input_schema"]["required"]) == set(
+        captured["json"]["tools"][0]["input_schema"]["properties"]
+    )
     user_payload = json.loads(captured["json"]["messages"][0]["content"])
     assert user_payload["agent3_ground_truth"]["question_based_queries"] == [
         "How does immersive training work?"
     ]
 
 
-def test_content_brief_retries_once_when_model_returns_malformed_json(monkeypatch):
-    valid_brief = {
-        "article_objective": "Explain the topic",
-        "sections": [],
-    }
-    responses = [
-        {"content": [{"type": "text", "text": "not valid JSON"}]},
-        {"content": [{"type": "text", "text": json.dumps(valid_brief)}]},
-    ]
+def test_content_brief_fails_explicitly_without_required_tool_response(monkeypatch):
     requests = []
 
     class FakeResponse:
-        def __init__(self, data):
-            self.data = data
-
         def raise_for_status(self):
             pass
 
         def json(self):
-            return self.data
+            return {"stop_reason": "end_turn", "content": []}
 
     def fake_post(url, **kwargs):
         requests.append(kwargs["json"])
-        return FakeResponse(responses.pop(0))
+        return FakeResponse()
 
-    monkeypatch.setattr("aca.agents.content_brief.httpx.post", fake_post)
-    brief = ContentBriefAgent(api_key="test").build_brief(*_brief_inputs())
-
-    assert brief.article_objective == "Explain the topic"
-    assert len(requests) == 2
-    assert requests[1]["max_tokens"] == 8192
-    assert "syntactically valid JSON" in requests[1]["messages"][0]["content"]
+    monkeypatch.setattr("src.agents.content_brief.httpx.post", fake_post)
+    with pytest.raises(RuntimeError, match="required structured response"):
+        ContentBriefAgent(api_key="test").build_brief(*_brief_inputs())
+    assert len(requests) == 1
 
 
 def test_content_brief_links_section_urls_to_valid_evidence_ids(monkeypatch):
@@ -120,18 +124,16 @@ def test_content_brief_links_section_urls_to_valid_evidence_ids(monkeypatch):
             }
         ]
     }
-    response_text = json.dumps(output)[len('{"article_objective":'):]
-
     class FakeResponse:
         def raise_for_status(self):
             pass
 
         @staticmethod
         def json():
-            return {"content": [{"type": "text", "text": response_text}]}
+            return _tool_response(output)
 
     monkeypatch.setattr(
-        "aca.agents.content_brief.httpx.post",
+        "src.agents.content_brief.httpx.post",
         lambda *_args, **_kwargs: FakeResponse(),
     )
     agent1, agent2, agent3 = _brief_inputs()
@@ -163,18 +165,16 @@ def test_content_brief_drops_urls_not_linked_to_section_evidence(monkeypatch, ca
             }
         ],
     }
-    response_text = json.dumps(output)[len('{"article_objective":'):]
-
     class FakeResponse:
         def raise_for_status(self):
             pass
 
         @staticmethod
         def json():
-            return {"content": [{"type": "text", "text": response_text}]}
+            return _tool_response(output)
 
     monkeypatch.setattr(
-        "aca.agents.content_brief.httpx.post",
+        "src.agents.content_brief.httpx.post",
         lambda *_args, **_kwargs: FakeResponse(),
     )
     agent1, agent2, agent3 = _brief_inputs()
@@ -203,24 +203,17 @@ def test_content_brief_rejects_unknown_evidence_ids(monkeypatch):
         "article_objective": "Plan article",
         "sections": [{"heading": "Unsupported", "evidence_ids": ["ev_missing"]}],
     }
-    response_text = json.dumps(output)[len('{"article_objective":'):]
-
     class FakeResponse:
         def raise_for_status(self):
             pass
 
         @staticmethod
         def json():
-            return {"content": [{"type": "text", "text": response_text}]}
+            return _tool_response(output)
 
     monkeypatch.setattr(
-        "aca.agents.content_brief.httpx.post",
+        "src.agents.content_brief.httpx.post",
         lambda *_args, **_kwargs: FakeResponse(),
     )
     with pytest.raises(RuntimeError, match="unknown evidence IDs"):
         ContentBriefAgent(api_key="test").build_brief(*_brief_inputs())
-
-
-def test_extract_json_reports_error_location_and_context():
-    with pytest.raises(ValueError, match=r"line 1, column"):
-        _extract_json('{"article_objective": ]}')

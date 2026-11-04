@@ -1,8 +1,13 @@
 import json
+from pathlib import Path
 
 import pytest
 
-from aca.output_storage import clear_agent_outputs, save_agent_output
+from src.utils.output_storage import DEFAULT_OUTPUT_DIR, clear_agent_outputs, save_agent_output
+
+
+def test_default_output_directory_is_named_outputs():
+    assert DEFAULT_OUTPUT_DIR == Path(__file__).resolve().parents[2] / "outputs"
 
 
 def test_saves_and_overwrites_agent_output(tmp_path):
@@ -11,6 +16,23 @@ def test_saves_and_overwrites_agent_output(tmp_path):
 
     assert path.name == "agent1_output.json"
     assert json.loads(path.read_text(encoding="utf-8")) == {"prompt_id": "second"}
+
+
+def test_creates_output_directory_when_saving(tmp_path):
+    output_dir = tmp_path / "outputs"
+
+    path = save_agent_output(1, {"prompt_id": "first"}, output_dir)
+
+    assert path.parent == output_dir
+    assert path.exists()
+
+
+def test_clear_creates_output_directory(tmp_path):
+    output_dir = tmp_path / "outputs"
+
+    clear_agent_outputs(output_dir)
+
+    assert output_dir.is_dir()
 
 
 def test_clears_only_current_agent_output_files(tmp_path):

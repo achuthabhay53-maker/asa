@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from aca.orchestrator.pipeline import build_pipeline
+from src.orchestrator.pipeline import build_pipeline
 
 pipeline = build_pipeline()
 graph = pipeline.get_graph()

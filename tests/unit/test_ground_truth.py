@@ -2,23 +2,28 @@
 
 from __future__ import annotations
 
+import json
+import logging
+from datetime import date
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from aca.agents.ground_truth import (
+from src.agents.ground_truth import (
     GroundTruthAgent,
     CheckedClaim,
     _EvidenceRegistry,
     _apply,
     _assemble,
+    _deduplicate_claims,
     _is_superlative,
     _handoff_boundaries,
     _merge_pairs,
     _mismatch_reason,
+    _relevant_snippet,
     _scope_note,
     build_prompt_context,
 )
-from aca.models.ground_truth import (
+from src.models.ground_truth import (
     CandidateSubtopic,
     ClientInput,
     Evidence,
@@ -30,9 +35,9 @@ from aca.models.ground_truth import (
     TopicVerdict,
     VerifiedFact,
 )
-from aca.models.prompt_intelligence import PromptAnalysis
-from aca.orchestrator.pipeline import PipelineState, agent3_node
-from aca.tools.web_research import ExtractedPage, SearchResponse, SearchResult
+from src.models.prompt_intelligence import PromptAnalysis
+from src.orchestrator.pipeline import PipelineState, agent3_node
+from src.tools.web_research import ExtractedPage, SearchResponse, SearchResult
 
 
 def _mock_agent1_data():
@@ -116,7 +121,7 @@ def test_verification_keeps_valid_intent_separate_from_customer_relevance():
     )
     captured_prompt = ""
 
-    def complete(system: str, payload: dict, max_tokens: int) -> dict:
+    def complete(system: str, payload: dict, max_tokens: int, **_audit_fields: str) -> dict:
         nonlocal captured_prompt
         captured_prompt = system
         return {
@@ -127,7 +132,10 @@ def test_verification_keeps_valid_intent_separate_from_customer_relevance():
             "is_verified": False,
             "intent_valid": True,
             "customer_relevant": False,
+            "human_review_required": False,
             "reason": "The retrieved pages did not establish this customer's VR training capability.",
+            "quote": "",
+            "source_url": "",
         }
 
     with (
@@ -145,6 +153,459 @@ def test_verification_keeps_valid_intent_separate_from_customer_relevance():
     assert result["is_verified"] is False
     assert "intent_valid: true and customer_relevant: false" in captured_prompt
     assert "virtual reality / VR, immersive training, XR, and simulation" in captured_prompt
+
+
+def test_agent3_call_audit_logs_hash_claims_sources_and_actual_input_tokens(monkeypatch, caplog):
+    monkeypatch.setenv("ACA_AGENT3_CALL_AUDIT", "1")
+    response = SimpleNamespace(
+        json=lambda: {
+            "usage": {"input_tokens": 321, "output_tokens": 14},
+            "stop_reason": "tool_use",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "name": "submit_agent3_result",
+                    "input": {"result": "ok"},
+                }
+            ],
+        },
+        raise_for_status=lambda: None,
+    )
+    agent = GroundTruthAgent(api_key="mock-key", model="mock-model")
+    payload = {
+        "claim_id": "fact_007",
+        "claim": "The company provides a biomarker assay.",
+        "pages": [
+            {"url": "HTTPS://WWW.Example.com:443/product/#details"},
+            {"url": "https://www.example.com/product/"},
+        ],
+    }
+    request = {}
+
+    def fake_post(_url, **kwargs):
+        request.update(kwargs)
+        return response
+
+    with patch("src.agents.ground_truth.httpx.post", side_effect=fake_post), caplog.at_level(
+        logging.INFO,
+        logger="src.agents.ground_truth",
+    ):
+        result = agent._complete(
+            "Check the claim.",
+            payload,
+            max_tokens=500,
+            stage="_read_pages",
+            purpose="Check whether supplied pages support the claim.",
+            schema={
+                "type": "object",
+                "properties": {"result": {"type": "string"}},
+                "required": ["result"],
+                "additionalProperties": False,
+            },
+        )
+
+    audit_record = next(
+        json.loads(record.getMessage().split("=", 1)[1])
+        for record in caplog.records
+        if record.getMessage().startswith("agent3_call_audit=")
+    )
+    assert result == {"result": "ok"}
+    assert audit_record["stage"] == "_read_pages"
+    assert audit_record["purpose"] == "Check whether supplied pages support the claim."
+    assert len(audit_record["input_hash"]) == 64
+    assert "fact_007" in audit_record["claim_ids"]
+    assert len(audit_record["claim_ids"]) == 2
+    assert audit_record["source_urls"] == ["https://www.example.com/product"]
+    assert audit_record["input_tokens"] == 321
+    assert "biomarker assay" not in json.dumps(audit_record)
+    assert request["json"]["tool_choice"] == {
+        "type": "tool",
+        "name": "submit_agent3_result",
+    }
+    assert request["json"]["tools"][0]["input_schema"]["required"] == ["result"]
+    assert len(request["json"]["messages"]) == 1
+
+
+def test_agent3_call_audit_is_disabled_by_default(monkeypatch, caplog):
+    monkeypatch.delenv("ACA_AGENT3_CALL_AUDIT", raising=False)
+    response = SimpleNamespace(
+        json=lambda: {
+            "usage": {"input_tokens": 10, "output_tokens": 2},
+            "stop_reason": "tool_use",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "name": "submit_agent3_result",
+                    "input": {"result": "ok"},
+                }
+            ],
+        },
+        raise_for_status=lambda: None,
+    )
+    agent = GroundTruthAgent(api_key="mock-key", model="mock-model")
+
+    with patch("src.agents.ground_truth.httpx.post", return_value=response), caplog.at_level(
+        logging.INFO,
+        logger="src.agents.ground_truth",
+    ):
+        agent._complete(
+            "Check.",
+            {"claim": "A test claim."},
+            max_tokens=100,
+            schema={
+                "type": "object",
+                "properties": {"result": {"type": "string"}},
+                "required": ["result"],
+                "additionalProperties": False,
+            },
+        )
+
+    assert not any("agent3_call_audit=" in record.getMessage() for record in caplog.records)
+
+
+def test_agent3_deduplicates_near_identical_claims_before_verification():
+    claims = _deduplicate_claims(
+        [
+            {
+                "claim": "Example Bio provides VR training for medical device teams.",
+                "claim_type": "service",
+                "relevance": "medium",
+                "relevance_to_topic": "low",
+                "checked_from": "prompt",
+            },
+            {
+                "claim": "Example Bio provides VR training to medical device teams.",
+                "claim_type": "service",
+                "relevance": "high",
+                "relevance_to_topic": "high",
+                "checked_from": "content_opportunity",
+            },
+        ]
+    )
+
+    assert len(claims) == 1
+    assert claims[0]["relevance"] == "high"
+    assert claims[0]["relevance_to_topic"] == "high"
+
+
+def test_agent3_batches_claim_verification_with_deduplicated_pages():
+    page_quote = (
+        "Example Bio provides immersive VR training for medical device teams "
+        "through interactive clinical simulation."
+    )
+    page_text = ("General company overview without claim details. " * 90) + page_quote
+
+    class Research:
+        @staticmethod
+        def search(*_args, **_kwargs):
+            return SimpleNamespace(
+                failed=False,
+                results=[
+                    SimpleNamespace(
+                        url="https://example.com/training",
+                        published="2026-11-02",
+                    ),
+                    SimpleNamespace(
+                        url="https://example.com/training/",
+                        published="2026-11-02",
+                    ),
+                ],
+            )
+
+        @staticmethod
+        def extract(url, **_kwargs):
+            return SimpleNamespace(url=url, text=page_text)
+
+    agent = GroundTruthAgent(api_key="mock-key", model="mock-model", research=Research())
+    claims = [
+        {
+            "topic": "Capability",
+            "claim": f"Example Bio supports training option {index}.",
+            "claim_type": "platform_capability",
+            "relevance": "high",
+            "relevance_to_topic": "high",
+            "checked_from": "prompt",
+        }
+        for index in range(1, 5)
+    ]
+    calls = []
+
+    def complete(_system, payload, max_tokens=None, **audit_fields):
+        calls.append((payload, audit_fields))
+        assert max_tokens is not None
+        json.dumps(payload)
+        assert payload["pages"][0]["published"] == "2026-11-02"
+        return {
+            "claims": [
+                {
+                    "claim_id": claim["claim_id"],
+                    "pages": [
+                        {
+                            "page_id": claim["page_ids"][0],
+                            "support": "full",
+                            "quote": page_quote,
+                            "narrow_statement": "",
+                            "wording_limit": "",
+                        }
+                    ],
+                }
+                for claim in payload["claims"]
+            ]
+        }
+
+    agent._complete = complete
+    checked, pages = agent._check_questions_batch(claims, "Example Bio", "example.com")
+
+    assert len(checked) == 4
+    assert all(result.fact.status == "verified" for result in checked)
+    assert len(calls) == 1
+    assert len(calls[0][0]["claims"]) == 4
+    assert len(calls[0][0]["pages"]) == 1
+    assert len(calls[0][0]["pages"][0]["text"]) <= 2_200
+    assert len(calls[0][0]["pages"][0]["text"]) < len(page_text) // 2
+    assert page_quote in calls[0][0]["pages"][0]["text"]
+    assert calls[0][0]["pages"][0]["text"].count("General company overview") <= 1
+    assert calls[0][1]["stage"] == "_read_pages_batch"
+    assert len(pages) == 1
+    assert checked[0].fact.evidence[0].published == date(2026, 11, 2)
+
+
+def test_agent3_reuses_cached_page_extraction_across_claim_searches():
+    page_text = "Example Bio provides immersive VR training for medical device teams."
+    calls = {"extract": 0}
+
+    class Research:
+        @staticmethod
+        def search(*_args, **_kwargs):
+            return SimpleNamespace(
+                failed=False,
+                results=[SimpleNamespace(url="https://example.com/training/", published=None)],
+            )
+
+        @staticmethod
+        def extract(url, **_kwargs):
+            calls["extract"] += 1
+            return SimpleNamespace(url=url, text=page_text)
+
+    agent = GroundTruthAgent(api_key="mock-key", model="mock-model", research=Research())
+
+    first, first_failed = agent._collect_pages("VR training", "example.com", "Example Bio", True)
+    second, second_failed = agent._collect_pages("medical device simulation", "example.com", "Example Bio", True)
+
+    assert not first_failed and not second_failed
+    assert calls["extract"] == 1
+    assert first[0]["text"] == second[0]["text"] == page_text
+
+
+def test_agent3_relevant_snippet_keeps_source_text_and_drops_irrelevant_page_text():
+    relevant = "Ethosh offers VR clinical scenario simulations for medical device teams."
+    page_text = ("Corporate overview with generic company history. " * 30) + relevant
+
+    snippet = _relevant_snippet(page_text, "VR clinical scenario simulations medical device", 500)
+
+    assert len(snippet) <= 500
+    assert len(snippet) < len(page_text) // 5
+    assert relevant in snippet
+    assert snippet.count("Corporate overview") <= 1
+
+
+def test_agent3_generates_prompt_and_opportunity_claims_in_one_llm_call():
+    agent = GroundTruthAgent(api_key="mock-key", model="mock-model")
+    context = build_prompt_context(
+        _mock_agent1_data(),
+        "https://example.com",
+        "Example Bio",
+    )
+    opportunity = context.content_opportunities[0]
+    calls = []
+
+    def complete(_system, payload, max_tokens=None, **audit_fields):
+        calls.append((payload, audit_fields))
+        assert max_tokens == 3500
+        return {
+            "questions": [
+                {
+                    "axis": "capability",
+                    "claim_type": "service",
+                    "relevance_to_original_prompt": "high",
+                    "relevance_to_topic": "high",
+                    "topic": "VR training",
+                    "claim": "Example Bio provides VR training for medical device companies.",
+                }
+            ],
+            "opportunities": [
+                {
+                    "opportunity": opportunity,
+                    "topic": "VR training",
+                    "claim": "Example Bio provides VR training for medical device companies.",
+                    "claim_type": "service",
+                    "relevance_to_original_prompt": "high",
+                    "relevance_to_topic": "high",
+                }
+            ],
+        }
+
+    agent._complete = complete
+    items = agent._research_items(context)
+    questions = agent._normalize_questions(items)
+    opportunities = agent._normalize_opportunity_claims(context, items)
+
+    assert len(calls) == 1
+    assert calls[0][1]["stage"] == "_research_items"
+    assert len(questions) == 1
+    assert len(opportunities) == 1
+
+
+def test_subtopic_discovery_sends_compact_verified_evidence_and_builds_facts_deterministically():
+    agent = GroundTruthAgent(api_key="mock-key", model="mock-model")
+    agent1 = {
+        **_mock_agent1_data(),
+        "prompt": "Find VR training providers for medical device teams.",
+        "prompt_understanding": {
+            "intent": "Find VR training providers",
+            "topic": "VR training for medical device teams",
+            "audience": "Medical device teams",
+            "user_goal": "Find providers",
+            "key_questions": [],
+        },
+        "content_opportunities": [],
+    }
+    context = build_prompt_context(agent1, "https://example.com", "Example Bio")
+    quote = "Example Bio offers immersive VR clinical scenario simulations for device teams."
+    page_text = quote + " " + ("Unrelated website detail without claims. " * 400)
+    claim = "Example Bio offers immersive VR clinical scenario simulations for device teams."
+    page_url = "https://example.com/vr-training"
+    checked = _apply(
+        "fact_001",
+        "Capability",
+        claim,
+        [
+            {
+                "support": "full",
+                "quote": quote,
+                "url": page_url,
+                "published": None,
+                "client_host": "example.com",
+                "narrow_statement": "",
+                "wording_limit": "",
+            }
+        ],
+        False,
+        "service",
+        "high",
+        "high",
+        "prompt",
+        [page_url],
+    )
+    understanding = {
+        "main_topic": "VR training for medical device teams",
+        "search_intent": "Find training providers",
+        "target_audience": "Medical device teams",
+        "prompt_scope": "hybrid",
+        "is_verified": True,
+        "intent_valid": True,
+        "customer_relevant": True,
+        "reason": "The official page supports the topic.",
+        "quote": quote,
+        "source_url": page_url,
+        "retrieved_pages": [{"url": page_url, "text": page_text, "published": None}],
+    }
+    captured = {}
+
+    def complete(_system, payload, max_tokens=None, **_audit_fields):
+        captured.update(payload)
+        return {
+            "main_topic": "VR training for medical device teams",
+            "search_intent": "Find training providers",
+            "target_audience": "Medical device teams",
+            "prompt_scope": "hybrid",
+            "candidate_subtopics": [
+                {
+                    "title": "VR Clinical Scenario Simulations",
+                    "description": "Training scenarios for device teams.",
+                    "topic_angle": "company_capability",
+                    "relevance_to_main_topic": "high",
+                    "evidence_quotes": [quote],
+                }
+            ],
+            "research_gaps": [],
+            "limitations": [],
+        }
+
+    agent._complete = complete
+    guide = agent._discover_subtopics_and_evidence(
+        context,
+        understanding,
+        [{"url": page_url, "text": page_text, "published": None}],
+        [(
+            {
+                "topic": "Capability",
+                "claim": claim,
+                "claim_type": "service",
+                "relevance": "high",
+                "relevance_to_topic": "high",
+                "checked_from": "prompt",
+            },
+            checked,
+        )],
+        [],
+        "Example Bio",
+        "example.com",
+    )
+
+    assert "research_evidence" not in captured
+    assert "known_facts" not in captured
+    assert len(captured["verified_evidence"]) == 1
+    assert captured["verified_evidence"][0]["source_url"] == page_url
+    assert captured["verified_evidence"][0]["supporting_quote"] == quote
+    assert len(json.dumps(captured, ensure_ascii=False)) < len(page_text) // 4
+    assert json.dumps(captured, ensure_ascii=False).count("Unrelated website detail") == 0
+    assert guide.verified_facts[0].fact_id == "fact_001"
+    assert guide.verified_facts[0].statement == claim
+    assert guide.verified_facts[0].status == "verified"
+    assert guide.candidate_subtopics[0].verified_fact_ids == ["fact_001"]
+    assert guide.candidate_subtopics[0].support_status == "fully_supported"
+
+
+def test_ground_truth_serializes_duplicate_lists_once():
+    gap = ResearchGap(
+        gap_id="gap_001",
+        topic_or_question="Training delivery",
+        missing_claim="The company provides onsite training.",
+        reason="The website does not specify delivery location.",
+    )
+    finding = {"claim": "Example Bio provides VR training."}
+    evidence = {"evidence_id": "ev_001", "url": "https://example.com", "quote": "A verified quote."}
+    subtopic = {"title": "VR training", "description": "Training approach"}
+    guide = GroundTruthGuide(
+        relevant_findings=[finding],
+        evidence=[evidence],
+        information_still_needed=[gap],
+        research_gaps=[gap],
+        candidate_subtopics=[subtopic],
+        boundaries=["Do not infer outcomes."],
+        limitations=["Do not infer outcomes."],
+        agent4_handoff={
+            "topic": "VR training",
+            "search_intent": "Find providers",
+            "target_audience": "Medical device teams",
+            "relevant_findings": [finding],
+            "evidence": [evidence],
+            "information_still_needed": [gap],
+            "candidate_subtopics": [subtopic],
+            "boundaries": ["Do not infer outcomes."],
+            "company": {"name": "Example Bio", "website": "https://example.com"},
+        },
+    )
+
+    payload = guide.model_dump(mode="json")
+
+    assert len(payload["research_gaps"]) == 1
+    assert len(payload["evidence"]) == 1
+    assert len(payload["relevant_findings"]) == 1
+    assert "information_still_needed" not in payload
+    assert "limitations" not in payload
+    assert set(payload["agent4_handoff"]) == {"task", "company", "verification"}
 
 
 def test_verification_rejects_missing_or_non_boolean_flags():
@@ -213,7 +674,7 @@ def test_evidence_registry_only_accepts_official_site_quotes():
 
 
 def test_evidence_registry_keeps_validated_checked_quote_and_original_source_url():
-    from aca.models.ground_truth import Evidence as GroundTruthEvidence
+    from src.models.ground_truth import Evidence as GroundTruthEvidence
 
     quote = "The product supports a validated immune assay workflow."
     source_url = "https://example.com/product-page"

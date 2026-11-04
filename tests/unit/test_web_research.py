@@ -2,8 +2,8 @@ import json
 
 import httpx
 
-from aca.tools import web_research
-from aca.tools.web_research import WebResearch
+from src.tools import web_research
+from src.tools.web_research import WebResearch
 
 
 def test_search_uses_exa_and_filters_domains():

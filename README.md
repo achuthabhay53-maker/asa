@@ -1,10 +1,12 @@
 # AImpact Content Agent (ACA)
 
-The current interactive application is a Streamlit workflow that reads AImpact prompt evidence, researches sources and company facts, creates a content brief, generates a blog draft, and can optionally review and revise that draft. Human approval is still required before publication; WordPress publishing and post-publication re-audits are not implemented.
+The current interactive application is a Streamlit workflow that reads AImpact prompt evidence, researches sources and company facts, creates a content brief, generates a blog draft, and reviews it. Agent 6 reports issues for a human to assess; it does not revise the draft. Human approval is still required before publication; WordPress publishing and post-publication re-audits are not implemented.
 
-**Current flow:** Agent 1 → Agent 2 → Agent 3 → Agent 4 → Agent 5 → optional Agent 6 (Reviewer). Agent 6 runs only when requested from the Streamlit interface and makes one model call. It returns the full revised article with a 16,384-token output limit. Human review is required before publishing.
+**Current flow:** Agent 1 → Agent 2 → Agent 3 → Agent 4 → Agent 5 → Agent 6 (Reviewer) → human editing and approval. Reviewer findings with an exact, unique article excerpt appear as severity-colored inline highlights with hover explanations; findings without an unambiguous text anchor remain in the review-decision controls. The human can edit directly or request an evidence-constrained Writer revision. Revisions apply as a new draft version without a separate proposal/diff screen; a changed version requires a fresh review and approval.
 
-The repository also contains a separate FastAPI entrypoint and deployment configuration; those are not used by the Streamlit workflow.
+The LangGraph workflow uses a PostgreSQL checkpointer configured by `DATABASE_URL`; each run ID is its checkpoint thread ID. The first run creates or migrates the checkpointer tables. Draft versions, review findings, finding decisions, and approvals are written into the workflow checkpoint and can be restored by entering the run ID under **Resume a saved workflow**. Manual edits and Writer revisions invalidate prior findings and approval; the current version must be reviewed again and explicitly approved.
+
+Claude input and output tokens are recorded for each API call, tagged with the workflow run ID and agent, and saved in the run checkpoint. Expand **Claude token usage** in the Streamlit UI to see run totals and per-call counts, including retries and Writer revisions.
 
 ---
 
@@ -32,19 +34,19 @@ Supporting docs:
 
 ## Repo layout
 
+The Streamlit entry point is `app.py`. Application logic and presentation
+helpers are grouped by responsibility:
+
 ```
-aca/
-├── main.py                 FastAPI entrypoint · CORS · routers · lifespan
-├── config.py               pydantic-settings, one place to read env
-├── api/                    HTTP surface
-├── orchestrator/           LangGraph state machine + async runner
-├── agents/                 Prompt · Sources · Ground truth · Brief · Writer · Reviewer
-├── tools/                  AImpact REST, Claude, WordPress, Langfuse
-├── models/                 SQLAlchemy ORM — 7 tables
-├── db/                     Engine + Alembic migrations
-├── workers/                APScheduler nightly picker + day-7/30 feedback
-├── security/               API-token verify + KMS envelope encryption
-└── observability/          OpenTelemetry setup
+src/
+├── agents/          Agent 1–6 workflow logic
+├── models/          Typed agent inputs and outputs
+├── observability/   Claude token usage and telemetry
+├── orchestrator/    LangGraph state and pipeline
+├── tools/           AImpact, source fetching, and web research
+├── ui/              Streamlit theme, article rendering, PDF, and review UI
+├── utils/           Evidence URLs, output storage, and writer lint helpers
+└── workers/         Background worker scaffolding
 ```
 
 See [`docs/04-code-architecture.md`](docs/04-code-architecture.md) for module-by-module explanation and the dependency graph.
@@ -55,14 +57,13 @@ See [`docs/04-code-architecture.md`](docs/04-code-architecture.md) for module-by
 
 ```bash
 cp .env.example .env
-# fill in DATABASE_URL, AIMPACT_API_TOKEN, ANTHROPIC_API_KEY at minimum
-python -m venv .venv && source .venv/Scripts/activate   # or .venv/bin/activate
+# fill in DATABASE_URL, AIMPACT_API_TOKEN, ANTHROPIC_API_KEY
+python -m venv .venv
+# Windows: .venv\\Scripts\\Activate.ps1
+# macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
-alembic upgrade head
-scripts/dev_run.sh
+streamlit run app.py
 ```
-
-The service listens on `http://localhost:8002`. `GET /aca/health` should return `{"status":"ok"}`.
 
 Run tests:
 
@@ -77,13 +78,12 @@ handoffs. For quality evaluation, `scripts/evaluate_agent_outputs.py` instead
 loads actual saved Agent 1–5 JSON outputs, validates their schemas, and scores
 them with Claude using DeepEval G-Eval. It also runs a Faithfulness check on
 Agent 5's tracked claims against Agent 3's evidence quotes. It does not rerun
-the agents. By default, it reads `agent1_output.json` through
-`agent5_output.json` from the repository root and writes
-`agent_quality_report.json`.
+the agents. By default, it reads `outputs/agent1_output.json` through
+`outputs/agent5_output.json` and writes `outputs/agent_quality_report.json`.
 
 The Streamlit app (`streamlit run app.py`) refreshes those five agent output
-files for every valid run. It clears the previous run's files before starting,
-then saves each agent's JSON as that agent completes. If a run stops early,
+files in the `outputs` folder for every valid run. It clears the previous run's
+files before starting, then saves each agent's JSON as that agent completes. If a run stops early,
 only the completed agents' files remain, so the evaluator will report missing
 outputs instead of combining results from different runs. Each saved output
 also carries a shared `_run_id`, which the evaluator checks for consistency.
@@ -133,7 +133,7 @@ Markdown article, findings, and claims needing verification. Its output limit is
 16,384 tokens. The reviewed
 article view highlights added or changed words in green; unchanged text keeps
 its normal styling. The original draft remains available in `Agent 5 · Draft
-blog`. Agent 6 output is saved separately as `agent6_output.json`; it does
+blog`. Agent 6 output is saved separately as `outputs/agent6_output.json`; it does
 not replace the Agent 5 draft or automatically publish anything.
 
 To run Agent 6 separately from saved Agent outputs, use the standalone script.
@@ -145,12 +145,11 @@ website is not present in Agent 3 output, pass it explicitly:
 .\.venv\Scripts\python.exe .\scripts\run_agent6.py --website https://example.com
 ```
 
-By default, the script reads `agent1_output.json` through `agent5_output.json`
-from the repository root and writes `agent6_output.json` and
-`agent6_reviewed.md`. To use a saved Agent 5 result elsewhere, pass its path
-with `--agent5`; also pass matching Agent 1-4 paths if they are not in the
-repository root. This command makes one Claude API call. The local loader tests
-do not call a model:
+By default, the script reads `outputs/agent1_output.json` through
+`outputs/agent5_output.json` and writes `outputs/agent6_output.json`. To use a
+saved Agent 5 result elsewhere, pass its path with `--agent5`; also pass
+matching Agent 1-4 paths if they are not in the `outputs` folder. This command
+makes one Claude API call. The local loader tests do not call a model:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest .\tests\unit\test_run_agent6.py -q

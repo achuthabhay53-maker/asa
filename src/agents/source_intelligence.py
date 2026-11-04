@@ -14,13 +14,14 @@ import json
 import os
 import re
 from html.parser import HTMLParser
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import httpx
 from dotenv import load_dotenv
 
-from aca.models.source_intelligence import (
+from src.models.source_intelligence import (
     AnalyzedSource,
     CitationSummary,
     ContentAnalysis,
@@ -31,7 +32,9 @@ from aca.models.source_intelligence import (
     SourceIntelligence,
     WritingStyle,
 )
-from aca.observability.token_usage import record_claude_response
+from src.observability.token_usage import record_claude_response
+from src.utils.output_storage import DEFAULT_OUTPUT_DIR
+from src.utils.structured_output import extract_tool_input
 
 load_dotenv()
 
@@ -44,6 +47,43 @@ FETCH_TIMEOUT = 20.0
 MAX_HTML_CHARS = 1_000_000
 MAX_PAGE_CHARS = 24_000
 MAX_HEADINGS = 40
+_SOURCE_ANALYSIS_TOOL = {
+    "name": "submit_source_analysis",
+    "description": "Submit structured analysis of the supplied web page.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string"},
+            "main_topics": {"type": "array", "items": {"type": "string"}},
+            "findings": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "finding": {"type": "string"},
+                        "evidence_quote": {"type": "string"},
+                    },
+                    "required": ["finding", "evidence_quote"],
+                    "additionalProperties": False,
+                },
+            },
+            "writing_style": {
+                "type": "object",
+                "properties": {
+                    "tone": {"type": "string"},
+                    "format": {"type": "string"},
+                    "audience": {"type": "string"},
+                    "paragraph_style": {"type": "string"},
+                    "evidence_style": {"type": "string"},
+                },
+                "required": ["tone", "format", "audience", "paragraph_style", "evidence_style"],
+                "additionalProperties": False,
+            },
+        },
+        "required": ["summary", "main_topics", "findings", "writing_style"],
+        "additionalProperties": False,
+    },
+}
 
 _TRACKING_PARAMS = {
     "utm_source",
@@ -172,21 +212,6 @@ def _normalize_url(url: str) -> str:
 def _is_redirect_host(url: str) -> bool:
     host = urlparse(url).netloc.lower()
     return host in _REDIRECT_HOSTS or "grounding-api-redirect" in url
-
-
-def _extract_json(text: str) -> dict[str, Any]:
-    text = re.sub(r"^\s*```(?:json)?\s*", "", text.strip(), flags=re.I)
-    text = re.sub(r"\s*```\s*$", "", text)
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        start, end = text.find("{"), text.rfind("}")
-        if start < 0 or end <= start:
-            raise ValueError("Claude did not return a valid JSON object.")
-        data = json.loads(text[start:end + 1])
-    if not isinstance(data, dict):
-        raise ValueError("Expected a JSON object from Claude.")
-    return data
 
 
 def _string_list(raw: Any) -> list[str]:
@@ -398,24 +423,7 @@ class SourceIntelligenceAgent:
         structure: ContentStructure,
     ) -> dict[str, Any]:
         system_prompt = """You describe one fetched web page for Agent 2: Source Intelligence.
-Return one JSON object and nothing else:
-{
-  "summary": "",
-  "main_topics": [],
-  "findings": [
-    {
-      "finding": "One concrete observation about this page",
-      "evidence_quote": "Exact contiguous quote copied from page_text"
-    }
-  ],
-  "writing_style": {
-    "tone": "",
-    "format": "",
-    "audience": "",
-    "paragraph_style": "",
-    "evidence_style": ""
-  }
-}
+Submit the page analysis using the required submit_source_analysis tool.
 Rules:
 - Describe only the supplied page. Do not say a style, topic, or structure is common, typical, or shared across sources.
 - summary is a short account of what this page itself says.
@@ -427,7 +435,7 @@ Rules:
 - writing_style describes this page's tone, format, audience, paragraph style, and how it uses evidence.
 - Do not treat companies or claims on the page as verified facts about the customer.
 - Do not propose a blog, outline, or content strategy.
-- Do not add sources, URLs, or fields. JSON only."""
+- Do not add sources, URLs, or fields."""
         payload = {
             "url": url,
             "title": title,
@@ -445,6 +453,8 @@ Rules:
                 "model": self.model,
                 "max_tokens": 1200,
                 "system": system_prompt,
+                "tools": [_SOURCE_ANALYSIS_TOOL],
+                "tool_choice": {"type": "tool", "name": _SOURCE_ANALYSIS_TOOL["name"]},
                 "messages": [{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
             },
             timeout=60.0,
@@ -452,11 +462,12 @@ Rules:
         record_claude_response(response, self.model)
         response.raise_for_status()
         response_data = response.json()
-        blocks = response_data.get("content") or []
-        text_blocks = [block.get("text", "") for block in blocks if block.get("type") == "text"]
-        if not text_blocks:
-            raise RuntimeError("Claude returned no text for Agent 2.")
-        return _extract_json("\n".join(text_blocks))
+        if response_data.get("stop_reason") != "tool_use":
+            raise RuntimeError(
+                "Claude did not return Agent 2's required structured response "
+                f"(stop reason: {response_data.get('stop_reason') or 'unknown'})."
+            )
+        return extract_tool_input(response_data, _SOURCE_ANALYSIS_TOOL["name"])
 
 
 def _fetch_page(url: str) -> dict[str, Any]:
@@ -504,7 +515,7 @@ def run_agent2(
     score_threshold: float = 70,
 ) -> SourceIntelligence:
     """Run Agent 2 using the temporary AImpact PostgreSQL reader."""
-    from aca.tools.aimpact import get_prompt_evidence
+    from src.tools.aimpact import get_prompt_evidence
 
     records = get_prompt_evidence(campaign_id=campaign_id, score_threshold=score_threshold)
     selected = next((item for item in records if str(_value(item, "prompt_id", "")) == str(prompt_id)), None)
@@ -524,14 +535,14 @@ if __name__ == "__main__":
     parser.add_argument("--prompt-id", required=True)
     parser.add_argument("--top-n", type=int, default=TOP_N_SOURCES)
     parser.add_argument("--score-threshold", type=float, default=70)
-    parser.add_argument("--output", default="agent2_output.json")
+    parser.add_argument("--output", default=os.fspath(DEFAULT_OUTPUT_DIR / "agent2_output.json"))
     args = parser.parse_args()
 
     result = run_agent2(args.campaign_id, args.prompt_id, args.top_n, args.score_threshold)
     payload = result.model_dump()
-    with open(args.output, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print("=" * 68)
     print("AIMPACT AGENT 2 — SOURCE INTELLIGENCE")
     print("=" * 68)
@@ -544,4 +555,4 @@ if __name__ == "__main__":
     print(f"Needs retry: {len(result.retry_sources)}")
     for source in result.retry_sources:
         print(f"- {source.source_id} [{source.fetch_status}] {source.url}")
-    print(f"Output saved to: {os.path.abspath(args.output)}")
+    print(f"Output saved to: {output_path.resolve()}")

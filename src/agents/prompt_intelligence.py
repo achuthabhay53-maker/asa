@@ -5,7 +5,7 @@ intent, topics, concepts, mentioned companies, and whether the customer
 appears in those answers.
 
 Reads evidence through the temporary AImpact PostgreSQL reader in
-``aca.tools.aimpact``. It does not fetch citation pages (Agent 2), verify
+``src.tools.aimpact``. It does not fetch citation pages (Agent 2), verify
 customer capabilities (Agent 3), or write content. Citation URLs are not
 sent to the model and are not part of the output.
 """
@@ -14,13 +14,16 @@ from __future__ import annotations
 import json
 import os
 import re
+from pathlib import Path
 from typing import Any
 
 import httpx
 from dotenv import load_dotenv
 
-from aca.models.prompt_intelligence import PromptAnalysis
-from aca.observability.token_usage import record_claude_response
+from src.models.prompt_intelligence import PromptAnalysis
+from src.observability.token_usage import record_claude_response
+from src.utils.output_storage import DEFAULT_OUTPUT_DIR
+from src.utils.structured_output import extract_tool_input
 
 load_dotenv()
 
@@ -29,19 +32,65 @@ def _value(obj: Any, key: str, default: Any = None) -> Any:
     return obj.get(key, default) if isinstance(obj, dict) else getattr(obj, key, default)
 
 
-def _extract_json(text: str) -> dict[str, Any]:
-    text = re.sub(r"^\s*```(?:json)?\s*", "", text.strip(), flags=re.I)
-    text = re.sub(r"\s*```\s*$", "", text)
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        start, end = text.find("{"), text.rfind("}")
-        if start < 0 or end <= start:
-            raise ValueError("Claude did not return a valid JSON object.")
-        data = json.loads(text[start:end + 1])
-    if not isinstance(data, dict):
-        raise ValueError("Expected a JSON object from Claude.")
-    return data
+_PROMPT_ANALYSIS_TOOL = {
+    "name": "submit_prompt_analysis",
+    "description": "Submit structured prompt and answer analysis.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "prompt_understanding": {
+                "type": "object",
+                "properties": {
+                    "intent": {"type": "string"},
+                    "topic": {"type": "string"},
+                    "audience": {"type": ["string", "null"]},
+                    "user_goal": {"type": "string"},
+                    "key_questions": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["intent", "topic", "audience", "user_goal", "key_questions"],
+                "additionalProperties": False,
+            },
+            "answer_understanding": {
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string"},
+                    "key_topics": {"type": "array", "items": {"type": "string"}},
+                    "key_concepts": {"type": "array", "items": {"type": "string"}},
+                    "comparison_criteria": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["summary", "key_topics", "key_concepts", "comparison_criteria"],
+                "additionalProperties": False,
+            },
+            "companies_mentioned": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}, "context": {"type": "string"}},
+                    "required": ["name", "context"],
+                    "additionalProperties": False,
+                },
+            },
+            "cross_model_patterns": {
+                "type": "object",
+                "properties": {
+                    "common_topics": {"type": "array", "items": {"type": "string"}},
+                    "differences": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["common_topics", "differences"],
+                "additionalProperties": False,
+            },
+            "content_opportunities": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": [
+            "prompt_understanding",
+            "answer_understanding",
+            "companies_mentioned",
+            "cross_model_patterns",
+            "content_opportunities",
+        ],
+        "additionalProperties": False,
+    },
+}
 
 
 def _get_answers(prompt_evidence: Any) -> tuple[str, list[dict[str, str]]]:
@@ -164,31 +213,8 @@ class PromptIntelligenceAgent:
         prompt, answers = _get_answers(prompt_evidence)
 
         system_prompt = """You are Agent 1: Prompt & Answer Intelligence for AImpact.
-Analyze only the provided prompt and AI answers. Return one JSON object and nothing else.
-Use exactly this shape:
-{
-  "prompt_understanding": {
-    "intent": "",
-    "topic": "",
-    "audience": "",
-    "user_goal": "",
-    "key_questions": []
-  },
-  "answer_understanding": {
-    "summary": "",
-    "key_topics": [],
-    "key_concepts": [],
-    "comparison_criteria": []
-  },
-  "companies_mentioned": [
-    {"name": "", "context": ""}
-  ],
-  "cross_model_patterns": {
-    "common_topics": [],
-    "differences": []
-  },
-  "content_opportunities": []
-}
+Analyze only the provided prompt and AI answers. Submit your analysis using the
+required submit_prompt_analysis tool.
 Rules:
 - prompt_understanding describes what the user is asking, not what the AI answered.
 - answer_understanding summarizes what the AI answers actually say: topics, concepts, and how they compare options.
@@ -215,6 +241,8 @@ Rules:
                 "model": self.model,
                 "max_tokens": 4000,
                 "system": system_prompt,
+                "tools": [_PROMPT_ANALYSIS_TOOL],
+                "tool_choice": {"type": "tool", "name": _PROMPT_ANALYSIS_TOOL["name"]},
                 "messages": [{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
             },
             timeout=90.0,
@@ -222,11 +250,12 @@ Rules:
         record_claude_response(response, self.model)
         response.raise_for_status()
         response_data = response.json()
-        blocks = response_data.get("content") or []
-        text_blocks = [block.get("text", "") for block in blocks if block.get("type") == "text"]
-        if not text_blocks:
-            raise RuntimeError("Claude returned no text for Agent 1.")
-        data = _extract_json("\n".join(text_blocks))
+        if response_data.get("stop_reason") != "tool_use":
+            raise RuntimeError(
+                "Claude did not return Agent 1's required structured response "
+                f"(stop reason: {response_data.get('stop_reason') or 'unknown'})."
+            )
+        data = extract_tool_input(response_data, _PROMPT_ANALYSIS_TOOL["name"])
 
         understanding = data.get("prompt_understanding") or {}
         answers_view = data.get("answer_understanding") or {}
@@ -266,7 +295,7 @@ def run_agent1(
     score_threshold: float = 70,
 ) -> PromptAnalysis:
     """Run Agent 1 using the temporary AImpact PostgreSQL reader."""
-    from aca.tools.aimpact import get_campaign, get_project, get_prompt_evidence
+    from src.tools.aimpact import get_campaign, get_project, get_prompt_evidence
 
     records = get_prompt_evidence(campaign_id=campaign_id, score_threshold=score_threshold)
     selected = next((p for p in records if str(_value(p, "prompt_id", "")) == str(prompt_id)), None)
@@ -297,14 +326,14 @@ if __name__ == "__main__":
     parser.add_argument("--prompt-id", required=True)
     parser.add_argument("--customer-name")
     parser.add_argument("--score-threshold", type=float, default=70)
-    parser.add_argument("--output", default="agent1_output.json")
+    parser.add_argument("--output", default=DEFAULT_OUTPUT_DIR / "agent1_output.json", type=os.fspath)
     args = parser.parse_args()
 
     result = run_agent1(args.campaign_id, args.prompt_id, args.customer_name, args.score_threshold)
     payload = result.model_dump()
-    with open(args.output, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-        f.write("\n")
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print("=" * 68)
     print("AIMPACT AGENT 1 — PROMPT & ANSWER INTELLIGENCE")
     print("=" * 68)
@@ -314,4 +343,4 @@ if __name__ == "__main__":
     print(f"Topic: {result.prompt_understanding.topic}")
     print(f"Companies mentioned: {len(result.companies_mentioned)}")
     print(f"Customer visibility: {result.customer_visibility.status}")
-    print(f"Output saved to: {os.path.abspath(args.output)}")
+    print(f"Output saved to: {output_path.resolve()}")

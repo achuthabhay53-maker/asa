@@ -1,4 +1,4 @@
-from aca.review_annotations import anchorable_finding_indexes, render_annotated_markdown
+from src.ui.review_annotations import anchorable_finding_indexes, render_annotated_markdown
 
 
 def test_review_finding_is_highlighted_with_actual_reason_and_recommendation():

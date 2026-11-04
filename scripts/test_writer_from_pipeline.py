@@ -26,12 +26,13 @@ load_dotenv(ROOT / ".env")
 
 
 
-from aca.models.writer import (  # noqa: E402
+from src.models.writer import (  # noqa: E402
     WriterEvidence,
     WriterInput,
     WriterSectionInput,
 )
-from aca.agents.writer import WriterAgent  # noqa: E402
+from src.agents.writer import WriterAgent  # noqa: E402
+from src.utils.output_storage import DEFAULT_OUTPUT_DIR  # noqa: E402
 
 
 
@@ -40,26 +41,26 @@ from aca.agents.writer import WriterAgent  # noqa: E402
 # ---------------------------------------------------------------------
 
 ROOT = Path(__file__).resolve().parents[1]
-OUTPUT_PATH = ROOT / "agent5_output.json"
 
 
 def load_json(candidates: list[str]) -> dict[str, Any]:
     """Load the first existing filename from the candidate list."""
-    for filename in candidates:
-        path = ROOT / filename
-        if path.exists():
-            with path.open("r", encoding="utf-8") as file:
-                data = json.load(file)
+    for directory in (DEFAULT_OUTPUT_DIR, ROOT):
+        for filename in candidates:
+            path = directory / filename
+            if path.exists():
+                with path.open("r", encoding="utf-8") as file:
+                    data = json.load(file)
 
-            if not isinstance(data, dict):
-                raise ValueError(f"{path.name} must contain a JSON object.")
+                if not isinstance(data, dict):
+                    raise ValueError(f"{path.name} must contain a JSON object.")
 
-            print(f"[OK] Loaded {path.name}")
-            return data
+                print(f"[OK] Loaded {path.name}")
+                return data
 
     tried = ", ".join(candidates)
     raise FileNotFoundError(
-        f"Could not find any of these files in {ROOT}:\n{tried}"
+        f"Could not find any of these files in {DEFAULT_OUTPUT_DIR} or {ROOT}:\n{tried}"
     )
 
 
@@ -475,7 +476,7 @@ def main() -> None:
     parser.add_argument(
         "--input-output",
         type=Path,
-        default=ROOT / "agent5_input.json",
+        default=DEFAULT_OUTPUT_DIR / "agent5_input.json",
         help="Path for the serialized WriterInput used by standalone Agent 5 runs.",
     )
     args = parser.parse_args()
@@ -630,14 +631,15 @@ def main() -> None:
     result = WriterAgent().write(writer_input)
 
     # Save the structured JSON for Agent 6 and downstream processing.
-    json_path = ROOT / "agent5_output.json"
+    DEFAULT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    json_path = DEFAULT_OUTPUT_DIR / "agent5_output.json"
     json_path.write_text(
         result.model_dump_json(indent=2),
         encoding="utf-8",
     )
 
     # Save a clean Markdown file for reading and reviewing the blog.
-    markdown_path = ROOT / "agent5_article.md"
+    markdown_path = DEFAULT_OUTPUT_DIR / "agent5_article.md"
 
     article_markdown = result.article_markdown.strip()
 

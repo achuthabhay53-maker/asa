@@ -1,18 +1,18 @@
 """Small synthetic outputs shared by workflow contract and quality tests."""
-from aca.models.content_brief import BriefSection, ContentBrief
-from aca.models.ground_truth import (
+from src.models.content_brief import BriefSection, ContentBrief
+from src.models.ground_truth import (
     EvidenceItem,
     GroundTruthGuide,
     PromptVerification,
     VerifiedFact,
 )
-from aca.models.prompt_intelligence import (
+from src.models.prompt_intelligence import (
     AnswerUnderstanding,
     CustomerVisibility,
     PromptAnalysis,
     PromptUnderstanding,
 )
-from aca.models.source_intelligence import (
+from src.models.source_intelligence import (
     AnalyzedSource,
     CitationSummary,
     ContentAnalysis,
@@ -20,7 +20,7 @@ from aca.models.source_intelligence import (
     RankedSource,
     SourceIntelligence,
 )
-from aca.models.writer import (
+from src.models.writer import (
     WriterClaim,
     WriterOutput,
     WrittenSection,

@@ -2,7 +2,7 @@ import pytest
 from markdown_it import MarkdownIt
 from reportlab.platypus import ListFlowable, Paragraph, Table
 
-from aca.pdf_export import _render_blocks, _styles, build_article_pdf
+from src.ui.pdf_export import _render_blocks, _styles, build_article_pdf
 
 
 def test_build_article_pdf_preserves_markdown_structure_and_content():

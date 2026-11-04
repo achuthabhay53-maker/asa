@@ -20,19 +20,20 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
 
-from aca.models.content_brief import ContentBrief  # noqa: E402
-from aca.models.ground_truth import GroundTruthGuide  # noqa: E402
-from aca.models.prompt_intelligence import PromptAnalysis  # noqa: E402
-from aca.models.source_intelligence import SourceIntelligence  # noqa: E402
-from aca.models.writer import WriterOutput  # noqa: E402
+from src.models.content_brief import ContentBrief  # noqa: E402
+from src.models.ground_truth import GroundTruthGuide  # noqa: E402
+from src.models.prompt_intelligence import PromptAnalysis  # noqa: E402
+from src.models.source_intelligence import SourceIntelligence  # noqa: E402
+from src.models.writer import WriterOutput  # noqa: E402
+from src.utils.output_storage import DEFAULT_OUTPUT_DIR  # noqa: E402
 
 
 OUTPUT_FILES = {
-    "agent1": ROOT / "agent1_output.json",
-    "agent2": ROOT / "agent2_output.json",
-    "agent3": ROOT / "agent3_output.json",
-    "agent4": ROOT / "agent4_output.json",
-    "agent5": ROOT / "agent5_output.json",
+    "agent1": DEFAULT_OUTPUT_DIR / "agent1_output.json",
+    "agent2": DEFAULT_OUTPUT_DIR / "agent2_output.json",
+    "agent3": DEFAULT_OUTPUT_DIR / "agent3_output.json",
+    "agent4": DEFAULT_OUTPUT_DIR / "agent4_output.json",
+    "agent5": DEFAULT_OUTPUT_DIR / "agent5_output.json",
 }
 THRESHOLD = 0.7
 
@@ -387,7 +388,7 @@ def main() -> int:
     parser.add_argument(
         "--report",
         type=Path,
-        default=ROOT / "agent_quality_report.json",
+        default=DEFAULT_OUTPUT_DIR / "agent_quality_report.json",
         help="Where to save metric scores and reasons.",
     )
     args = parser.parse_args()

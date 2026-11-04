@@ -1,4 +1,4 @@
-from aca.review_diff import render_markdown_diff
+from src.ui.review_diff import render_markdown_diff
 
 
 def test_highlights_changed_text_while_preserving_markdown_rendering():

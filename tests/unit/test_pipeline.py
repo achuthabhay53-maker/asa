@@ -2,19 +2,20 @@ from contextlib import contextmanager
 
 from langgraph.checkpoint.memory import MemorySaver
 
-from aca.models.content_brief import BriefSection, ContentBrief
-from aca.models.ground_truth import ClientInput, GroundTruthGuide
-from aca.models.prompt_intelligence import (
+from src.models.content_brief import BriefSection, ContentBrief
+from src.models.ground_truth import ClientInput, GroundTruthGuide
+from src.models.prompt_intelligence import (
     AnswerUnderstanding,
     PromptAnalysis,
     PromptUnderstanding,
 )
-from aca.models.writer import WriterInput
-from aca.orchestrator import pipeline as workflow
-from aca.orchestrator.pipeline import PipelineState, _build_writer_input, build_pipeline
-from aca.agents.writer import WriterAgent
-from aca.models.reviewer import ReviewOutput
-from aca.orchestrator.checkpointer import thread_config
+from src.models.writer import WriterInput
+from src.orchestrator import pipeline as workflow
+from src.orchestrator.pipeline import PipelineState, _build_writer_input, build_pipeline
+from src.agents.writer import WriterAgent
+from src.models.reviewer import ReviewOutput
+from src.observability.token_usage import record_claude_response
+from src.orchestrator.checkpointer import thread_config
 from ..agent_fixtures import (
     agent1_output,
     agent2_output,
@@ -87,6 +88,31 @@ def test_pipeline_graph_contains_five_core_agents_and_mandatory_reviewer():
     assert "agent1 --> agent2;" in mermaid
     assert "agent2 --> agent3;" in mermaid
     assert "agent4 -.-> agent5;" in mermaid
+
+
+def test_pipeline_stage_records_claude_usage_in_state():
+    state = PipelineState(
+        run_id="usage-run",
+        campaign_id=1,
+        prompt_id="prompt-1",
+        website="https://example.com",
+    )
+
+    workflow._run_stage(
+        state,
+        "agent3",
+        lambda: record_claude_response(
+            {"usage": {"input_tokens": 25, "output_tokens": 8}},
+            "claude-haiku",
+        ),
+    )
+
+    assert len(state.token_usage) == 1
+    usage = state.token_usage[0]
+    assert usage.run_id == "usage-run"
+    assert usage.agent_name == "agent3"
+    assert usage.input_tokens == 25
+    assert usage.output_tokens == 8
 
 
 def test_pipeline_passes_brief_seo_research_and_faqs_to_writer():

@@ -2,10 +2,10 @@
 
 Usage:
     python scripts/run_agent4.py ^
-        --agent1 agent1_output.json ^
-        --agent2 agent2_output.json ^
-        --agent3 agent3_output.json ^
-        --output agent4_output.json
+        --agent1 outputs\\agent1_output.json ^
+        --agent2 outputs\\agent2_output.json ^
+        --agent3 outputs\\agent3_output.json ^
+        --output outputs\\agent4_output.json
 """
 from __future__ import annotations
 
@@ -22,7 +22,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from aca.agents.content_brief import ContentBriefAgent
+from src.agents.content_brief import ContentBriefAgent  # noqa: E402
+from src.utils.output_storage import DEFAULT_OUTPUT_DIR  # noqa: E402
 
 
 def _load(path: str) -> dict:
@@ -34,10 +35,10 @@ def _load(path: str) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run Agent 4 to generate an evidence-backed blog brief.")
-    parser.add_argument("--agent1", default="agent1_output.json", help="Path to Agent 1 JSON")
-    parser.add_argument("--agent2", default="agent2_output.json", help="Path to Agent 2 JSON")
-    parser.add_argument("--agent3", default="agent3_output.json", help="Path to Agent 3 JSON")
-    parser.add_argument("--output", default="agent4_output.json", help="Path to save Agent 4 brief JSON")
+    parser.add_argument("--agent1", default=str(DEFAULT_OUTPUT_DIR / "agent1_output.json"), help="Path to Agent 1 JSON")
+    parser.add_argument("--agent2", default=str(DEFAULT_OUTPUT_DIR / "agent2_output.json"), help="Path to Agent 2 JSON")
+    parser.add_argument("--agent3", default=str(DEFAULT_OUTPUT_DIR / "agent3_output.json"), help="Path to Agent 3 JSON")
+    parser.add_argument("--output", default=str(DEFAULT_OUTPUT_DIR / "agent4_output.json"), help="Path to save Agent 4 brief JSON")
     parser.add_argument("--model", default=None, help="Anthropic model name override")
     args = parser.parse_args()
 
@@ -57,6 +58,7 @@ def main() -> None:
 
     payload = brief.model_dump(mode="json")
     out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     print("\n" + "=" * 60)

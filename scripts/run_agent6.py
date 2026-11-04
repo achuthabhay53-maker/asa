@@ -22,13 +22,14 @@ if str(ROOT) not in sys.path:
 
 load_dotenv(ROOT / ".env")
 
-from aca.agents.reviewer import ReviewerAgent  # noqa: E402
-from aca.models.content_brief import ContentBrief  # noqa: E402
-from aca.models.ground_truth import GroundTruthGuide  # noqa: E402
-from aca.models.prompt_intelligence import PromptAnalysis  # noqa: E402
-from aca.models.source_intelligence import SourceIntelligence  # noqa: E402
-from aca.models.writer import WriterOutput  # noqa: E402
-from aca.orchestrator.pipeline import PipelineState, _build_writer_input  # noqa: E402
+from src.agents.reviewer import ReviewerAgent  # noqa: E402
+from src.models.content_brief import ContentBrief  # noqa: E402
+from src.models.ground_truth import GroundTruthGuide  # noqa: E402
+from src.models.prompt_intelligence import PromptAnalysis  # noqa: E402
+from src.models.source_intelligence import SourceIntelligence  # noqa: E402
+from src.models.writer import WriterOutput  # noqa: E402
+from src.orchestrator.pipeline import PipelineState, _build_writer_input  # noqa: E402
+from src.utils.output_storage import DEFAULT_OUTPUT_DIR  # noqa: E402
 
 
 def load_review_state(paths: dict[str, Path], website: str = "") -> PipelineState:
@@ -99,8 +100,8 @@ def main() -> None:
         parser.add_argument(
             f"--agent{number}",
             type=Path,
-            default=ROOT / f"agent{number}_output.json",
-            help=f"Agent {number} output JSON (default: agent{number}_output.json)",
+            default=DEFAULT_OUTPUT_DIR / f"agent{number}_output.json",
+            help=f"Agent {number} output JSON (default: outputs/agent{number}_output.json)",
         )
     parser.add_argument(
         "--website",
@@ -110,7 +111,7 @@ def main() -> None:
     parser.add_argument(
         "--output",
         type=Path,
-        default=ROOT / "agent6_output.json",
+        default=DEFAULT_OUTPUT_DIR / "agent6_output.json",
         help="Reviewer findings JSON path.",
     )
     args = parser.parse_args()

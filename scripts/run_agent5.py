@@ -17,8 +17,9 @@ if str(ROOT) not in sys.path:
 
 load_dotenv(ROOT / ".env")
 
-from aca.agents.writer import WriterAgent  # noqa: E402
-from aca.models.writer import WriterInput  # noqa: E402
+from src.agents.writer import WriterAgent  # noqa: E402
+from src.models.writer import WriterInput  # noqa: E402
+from src.utils.output_storage import DEFAULT_OUTPUT_DIR  # noqa: E402
 
 
 def main() -> None:
@@ -27,7 +28,7 @@ def main() -> None:
     parser.add_argument(
         "--output",
         type=Path,
-        default=ROOT / "agent5_independent_output.json",
+        default=DEFAULT_OUTPUT_DIR / "agent5_independent_output.json",
         help="Output JSON path (Markdown is written beside it)",
     )
     args = parser.parse_args()

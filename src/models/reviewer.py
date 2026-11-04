@@ -4,7 +4,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from aca.models.writer import WriterClaim
+from src.models.writer import WriterClaim
 
 
 class ReviewFinding(BaseModel):

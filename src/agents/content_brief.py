@@ -12,45 +12,23 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 from typing import Any
 
 import httpx
 from dotenv import load_dotenv
 
-from aca.models.content_brief import BriefSection, ContentBrief, WritingStyleGuide
-from aca.observability.token_usage import record_claude_response
+from src.models.content_brief import BriefSection, ContentBrief, WritingStyleGuide
+from src.observability.token_usage import record_claude_response
+from src.utils.structured_output import extract_tool_input, model_input_schema
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-
-def _extract_json(text: str) -> dict[str, Any]:
-    text = re.sub(r"^\s*```(?:json)?\s*", "", text.strip(), flags=re.I)
-    text = re.sub(r"\s*```\s*$", "", text)
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as first_error:
-        start, end = text.find("{"), text.rfind("}")
-        if start < 0 or end <= start:
-            raise ValueError(
-                "Agent 4 did not return a JSON object. "
-                f"Response begins: {text[:500]!r}"
-            ) from first_error
-        try:
-            data = json.loads(text[start : end + 1])
-        except json.JSONDecodeError as exc:
-            snippet_start = max(0, exc.pos - 100)
-            snippet_end = min(len(text), exc.pos + 100)
-            raise ValueError(
-                "Agent 4 returned malformed JSON "
-                f"(line {exc.lineno}, column {exc.colno}): {exc.msg}. "
-                f"Near error: {text[snippet_start:snippet_end]!r}"
-            ) from exc
-    if not isinstance(data, dict):
-        raise ValueError("Expected a JSON object from Claude.")
-    return data
-
+_CONTENT_BRIEF_TOOL = {
+    "name": "submit_content_brief",
+    "description": "Submit the structured evidence-backed content brief.",
+    "input_schema": model_input_schema(ContentBrief),
+}
 
 def _to_dict(obj: Any) -> dict[str, Any]:
     if hasattr(obj, "model_dump"):
@@ -245,10 +223,9 @@ JSON only."""
             "model": self.model,
             "max_tokens": 6096,
             "system": system_prompt,
-            "messages": [
-                {"role": "user", "content": user_content},
-                {"role": "assistant", "content": "{\n  \"article_objective\":"},
-            ],
+            "tools": [_CONTENT_BRIEF_TOOL],
+            "tool_choice": {"type": "tool", "name": _CONTENT_BRIEF_TOOL["name"]},
+            "messages": [{"role": "user", "content": user_content}],
         }
         response = httpx.post(
             "https://api.anthropic.com/v1/messages",
@@ -259,45 +236,15 @@ JSON only."""
         record_claude_response(response, self.model)
         response.raise_for_status()
         response_data = response.json()
-        blocks = response_data.get("content") or []
-        raw = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
         try:
-            parsed = _extract_json('{\n  "article_objective":' + raw)
-        except ValueError as first_error:
-            retry_request = {
-                **request,
-                "max_tokens": 8192,
-                "messages": [{
-                    "role": "user",
-                    "content": (
-                        user_content
-                        + "\n\nReturn the entire response as one syntactically valid JSON "
-                        "object matching the schema. Do not add markdown or commentary."
-                    ),
-                }],
-            }
-            retry = httpx.post(
-                "https://api.anthropic.com/v1/messages",
-                headers=headers,
-                json=retry_request,
-                timeout=120.0,
-            )
-            record_claude_response(retry, self.model)
-            retry.raise_for_status()
-            retry_data = retry.json()
-            retry_blocks = retry_data.get("content") or []
-            retry_text = "\n".join(
-                b.get("text", "") for b in retry_blocks if b.get("type") == "text"
-            )
-            try:
-                parsed = _extract_json(retry_text)
-            except ValueError as retry_error:
-                stop_reason = retry_data.get("stop_reason")
+            if response_data.get("stop_reason") != "tool_use":
                 raise RuntimeError(
-                    "Agent 4 returned invalid JSON after one retry. "
-                    f"stop_reason={stop_reason!r}; first error: {first_error}; "
-                    f"retry error: {retry_error}"
-                ) from retry_error
+                    "Agent 4 did not return its required structured response "
+                    f"(stop reason: {response_data.get('stop_reason') or 'unknown'})."
+                )
+            parsed = extract_tool_input(response_data, _CONTENT_BRIEF_TOOL["name"])
+        except RuntimeError as exc:
+            raise RuntimeError(f"Agent 4 returned invalid structured output: {exc}") from exc
 
         # Build BriefSection models
         sections = []

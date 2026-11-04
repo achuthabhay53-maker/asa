@@ -1,12 +1,12 @@
-from aca.agents import source_intelligence
-from aca.agents.source_intelligence import SourceIntelligenceAgent
-from aca.models.source_intelligence import ContentStructure
+from src.agents import source_intelligence
+from src.agents.source_intelligence import SourceIntelligenceAgent
+from src.models.source_intelligence import ContentStructure
 
 
 def test_source_findings_mark_only_exact_page_quotes_as_matched(monkeypatch):
     page_text = "The page says this exact sentence describes the service clearly."
     monkeypatch.setattr(
-        "aca.agents.source_intelligence._fetch_page",
+        "src.agents.source_intelligence._fetch_page",
         lambda _url: {
             "status": "success",
             "final_url": "https://example.com/page",
@@ -65,7 +65,7 @@ def test_run_agent2_uses_same_low_score_threshold_as_agent1(monkeypatch):
             assert selected is prompt_evidence
             return "analyzed"
 
-    monkeypatch.setattr("aca.tools.aimpact.get_prompt_evidence", get_prompt_evidence)
+    monkeypatch.setattr("src.tools.aimpact.get_prompt_evidence", get_prompt_evidence)
     monkeypatch.setattr(source_intelligence, "SourceIntelligenceAgent", FakeSourceAgent)
 
     result = source_intelligence.run_agent2(1, "selected-prompt")

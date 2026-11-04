@@ -4,8 +4,8 @@ The website is typed here. The company name and prompt context come from Agent 1
 
     python scripts/run_agent3.py ^
         --website https://alamarbio.com ^
-        --agent1 agent1_output.json ^
-        --agent2 agent2_output.json
+        --agent1 outputs\\agent1_output.json ^
+        --agent2 outputs\\agent2_output.json
 """
 from __future__ import annotations
 
@@ -22,11 +22,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from aca.agents.ground_truth import MAX_QUESTIONS
-from aca.models.ground_truth import GroundTruthGuide
-from aca.models.prompt_intelligence import PromptAnalysis
-from aca.models.source_intelligence import SourceIntelligence
-from aca.orchestrator.pipeline import PipelineState, agent3_node
+from src.agents.ground_truth import MAX_QUESTIONS  # noqa: E402
+from src.models.ground_truth import GroundTruthGuide  # noqa: E402
+from src.models.prompt_intelligence import PromptAnalysis  # noqa: E402
+from src.models.source_intelligence import SourceIntelligence  # noqa: E402
+from src.orchestrator.pipeline import PipelineState, agent3_node  # noqa: E402
+from src.utils.output_storage import DEFAULT_OUTPUT_DIR  # noqa: E402
 
 
 def _load(path: str) -> dict:
@@ -40,8 +41,9 @@ def main() -> None:
     parser.add_argument("--agent1", required=True, help="Path to Agent 1 JSON")
     parser.add_argument("--agent2", required=True, help="Path to Agent 2 JSON")
     parser.add_argument("--max-questions", type=int, default=MAX_QUESTIONS)
-    parser.add_argument("--output", default="agent3_output.json")
+    parser.add_argument("--output", default=str(DEFAULT_OUTPUT_DIR / "agent3_output.json"))
     args = parser.parse_args()
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
 
     prompt_analysis = _load(args.agent1)
     source_analysis = _load(args.agent2)

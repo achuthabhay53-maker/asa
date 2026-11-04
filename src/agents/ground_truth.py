@@ -21,8 +21,7 @@ from urllib.parse import urlparse
 
 import httpx
 from dotenv import load_dotenv
-from aca.evidence import canonicalize_evidence_url
-from aca.models.ground_truth import (
+from src.models.ground_truth import (
     Agent4HandoffPackage,
     CandidateSubtopic,
     CheckedFrom,
@@ -52,8 +51,10 @@ from aca.models.ground_truth import (
     VerificationHandoff,
     VerifiedFact,
 )
-from aca.observability.token_usage import record_claude_response
-from aca.tools.web_research import WebResearch, get_web_research
+from src.observability.token_usage import record_claude_response
+from src.tools.web_research import WebResearch, get_web_research
+from src.utils.evidence import canonicalize_evidence_url
+from src.utils.structured_output import extract_tool_input
 
 load_dotenv()
 
@@ -144,6 +145,194 @@ _SNIPPET_STOP_WORDS = {
     "was",
     "were",
     "with",
+}
+_AGENT3_TOOL_NAME = "submit_agent3_result"
+
+
+def _agent3_tool(schema: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "name": _AGENT3_TOOL_NAME,
+        "description": "Submit the structured result for this Agent 3 research step.",
+        "input_schema": schema,
+    }
+
+
+_UNDERSTANDING_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "main_topic": {"type": "string"},
+        "search_intent": {"type": "string"},
+        "target_audience": {"type": "string"},
+        "prompt_scope": {"type": "string", "enum": ["broad_industry", "company_specific", "hybrid"]},
+        "is_verified": {"type": "boolean"},
+        "intent_valid": {"type": "boolean"},
+        "customer_relevant": {"type": "boolean"},
+        "human_review_required": {"type": "boolean"},
+        "reason": {"type": ["string", "null"]},
+        "quote": {"type": "string"},
+        "source_url": {"type": "string"},
+    },
+    "required": [
+        "main_topic", "search_intent", "target_audience", "prompt_scope", "is_verified",
+        "intent_valid", "customer_relevant", "human_review_required", "reason", "quote", "source_url",
+    ],
+    "additionalProperties": False,
+}
+_RESEARCH_ITEMS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "questions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "axis": {"type": "string", "enum": ["relevance", "capability", "geography"]},
+                    "claim_type": {"type": "string", "enum": sorted(_CLAIM_TYPES)},
+                    "relevance_to_original_prompt": {"type": "string", "enum": sorted(_RELEVANCE)},
+                    "relevance_to_topic": {"type": "string", "enum": sorted(_RELEVANCE)},
+                    "topic": {"type": "string"},
+                    "claim": {"type": "string"},
+                },
+                "required": [
+                    "axis", "claim_type", "relevance_to_original_prompt",
+                    "relevance_to_topic", "topic", "claim",
+                ],
+                "additionalProperties": False,
+            },
+        },
+        "opportunities": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "opportunity": {"type": "string"},
+                    "topic": {"type": "string"},
+                    "claim": {"type": "string"},
+                    "claim_type": {"type": "string", "enum": sorted(_CLAIM_TYPES)},
+                    "relevance_to_original_prompt": {"type": "string", "enum": sorted(_RELEVANCE)},
+                    "relevance_to_topic": {"type": "string", "enum": sorted(_RELEVANCE)},
+                },
+                "required": [
+                    "opportunity", "topic", "claim", "claim_type",
+                    "relevance_to_original_prompt", "relevance_to_topic",
+                ],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["questions", "opportunities"],
+    "additionalProperties": False,
+}
+_SUBTOPICS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "main_topic": {"type": "string"},
+        "search_intent": {"type": "string"},
+        "target_audience": {"type": "string"},
+        "prompt_scope": {"type": "string", "enum": ["broad_industry", "company_specific", "hybrid"]},
+        "candidate_subtopics": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "description": {"type": "string"},
+                    "topic_angle": {
+                        "type": "string",
+                        "enum": ["company_capability", "industry_context", "comparison_methodology", "educational_guide"],
+                    },
+                    "relevance_to_main_topic": {"type": "string", "enum": sorted(_RELEVANCE)},
+                    "research_needed": {"type": "array", "items": {"type": "string"}},
+                    "suggested_questions": {"type": "array", "items": {"type": "string"}},
+                    "evidence_quotes": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": [
+                    "title", "description", "topic_angle", "relevance_to_main_topic",
+                    "research_needed", "suggested_questions", "evidence_quotes",
+                ],
+                "additionalProperties": False,
+            },
+        },
+        "research_gaps": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "topic_or_question": {"type": "string"},
+                    "missing_claim": {"type": "string"},
+                    "reason": {"type": "string"},
+                    "suggested_search_direction": {"type": ["string", "null"]},
+                    "affects_subtopic_ids": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": [
+                    "topic_or_question", "missing_claim", "reason",
+                    "suggested_search_direction", "affects_subtopic_ids",
+                ],
+                "additionalProperties": False,
+            },
+        },
+        "limitations": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": [
+        "main_topic", "search_intent", "target_audience", "prompt_scope",
+        "candidate_subtopics", "research_gaps", "limitations",
+    ],
+    "additionalProperties": False,
+}
+_PAGES_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "pages": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "support": {"type": "string", "enum": ["full", "partial", "contradicts", "none"]},
+                    "quote": {"type": "string"},
+                    "narrow_statement": {"type": "string"},
+                    "wording_limit": {"type": "string"},
+                },
+                "required": ["url", "support", "quote", "narrow_statement", "wording_limit"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["pages"],
+    "additionalProperties": False,
+}
+_BATCHED_PAGES_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "claims": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "claim_id": {"type": "string"},
+                    "pages": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "page_id": {"type": "string"},
+                                "support": {"type": "string", "enum": ["full", "partial", "contradicts", "none"]},
+                                "quote": {"type": "string"},
+                                "narrow_statement": {"type": "string"},
+                                "wording_limit": {"type": "string"},
+                            },
+                            "required": ["page_id", "support", "quote", "narrow_statement", "wording_limit"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["claim_id", "pages"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["claims"],
+    "additionalProperties": False,
 }
 
 
@@ -440,53 +629,6 @@ def _string_list(raw: Any) -> list[str]:
             seen.add(key)
             values.append(text)
     return values
-
-
-def _extract_json(text: str) -> dict[str, Any]:
-    # Strip markdown fences
-    text = re.sub(r"^\s*```(?:json)?\s*", "", text.strip(), flags=re.I)
-    text = re.sub(r"\s*```\s*$", "", text)
-
-    # Direct parse
-    try:
-        data = json.loads(text, strict=False)
-        if isinstance(data, dict):
-            return data
-    except Exception:
-        pass
-
-    # Slice from first { to last }
-    start, end = text.find("{"), text.rfind("}")
-    if start >= 0 and end > start:
-        candidate = text[start : end + 1]
-        try:
-            data = json.loads(candidate, strict=False)
-            if isinstance(data, dict):
-                return data
-        except Exception:
-            pass
-        # Try json_repair on the sliced candidate
-        try:
-            import json_repair  # type: ignore[import]
-
-            data = json_repair.loads(candidate)
-            if isinstance(data, dict):
-                return data
-        except Exception:
-            pass
-
-    # Last resort: json_repair on the full text
-    try:
-        import json_repair  # type: ignore[import]
-
-        data = json_repair.loads(text)
-        if isinstance(data, dict):
-            return data
-    except Exception:
-        pass
-
-    preview = text[:300].replace("\n", " ")
-    raise ValueError(f"Claude did not return a valid JSON object. Preview: {preview!r}")
 
 
 def _quote_in_page(quote: str, page: str) -> bool:
@@ -788,6 +930,7 @@ Rules:
             max_tokens=1500,
             stage="_understand_prompt_and_verify",
             purpose="Assess prompt intent and company relevance using retrieved official-site pages.",
+            schema=_UNDERSTANDING_SCHEMA,
         )
         data = dict(data)
         data["retrieved_pages"] = retrieved_pages
@@ -1039,6 +1182,7 @@ Rules:
                 max_tokens=8192,
                 stage="_discover_subtopics_and_evidence",
                 purpose="Discover subtopics from compact verified evidence and unsupported claims.",
+                schema=_SUBTOPICS_SCHEMA,
             )
         except (httpx.HTTPError, RuntimeError, ValueError) as exc:
             logger.warning(
@@ -1461,6 +1605,7 @@ Prompt-derived questions should cover relevant capabilities, services, and geogr
             max_tokens=3500,
             stage="_research_items",
             purpose="Generate prompt questions and opportunity claims together for verification.",
+            schema=_RESEARCH_ITEMS_SCHEMA,
         )
 
     @staticmethod
@@ -1708,6 +1853,7 @@ For each claim, assess only the pages whose IDs are listed for that claim. Use t
                 max_tokens=min(1200 * len(claims), 4096),
                 stage="_read_pages_batch",
                 purpose="Assess a small batch of claims against deduplicated official-site pages.",
+                schema=_BATCHED_PAGES_SCHEMA,
             )
         except (httpx.HTTPError, RuntimeError, ValueError) as exc:
             logger.warning(
@@ -1896,6 +2042,7 @@ Rules:
                 max_tokens=1200,
                 stage="_read_pages",
                 purpose="Assess whether supplied page excerpts support this specific claim.",
+                schema=_PAGES_SCHEMA,
             )
         except (httpx.HTTPError, RuntimeError, ValueError) as exc:
             logger.warning(
@@ -1939,13 +2086,10 @@ Rules:
         *,
         stage: str = "unspecified",
         purpose: str = "unspecified",
+        schema: dict[str, Any],
     ) -> dict[str, Any]:
-        """Call the Anthropic API and return the parsed JSON dict.
-
-        Uses an assistant prefill of ``{`` so Claude is forced to emit raw JSON
-        from the very first token, which eliminates preamble text that causes
-        JSON parsing to fail.
-        """
+        """Call Anthropic with a required tool schema and return its input."""
+        tool = _agent3_tool(schema)
         response = httpx.post(
             "https://api.anthropic.com/v1/messages",
             headers={
@@ -1957,11 +2101,9 @@ Rules:
                 "model": self.model,
                 "max_tokens": max_tokens,
                 "system": system,
-                "messages": [
-                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-                    # Prefill: force Claude to start the reply with "{"
-                    {"role": "assistant", "content": "{"},
-                ],
+                "tools": [tool],
+                "tool_choice": {"type": "tool", "name": tool["name"]},
+                "messages": [{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
             },
             timeout=120.0,
         )
@@ -1985,13 +2127,12 @@ Rules:
             )
         response.raise_for_status()
         response_data = response.json()
-        blocks = response_data.get("content") or []
-        raw = "\n".join(block.get("text", "") for block in blocks if block.get("type") == "text")
-        # Prepend the prefill character we sent so the text is a complete object
-        text = "{" + raw
-        if not raw.strip():
-            raise RuntimeError("Claude returned no text for Agent 3.")
-        return _extract_json(text)
+        if response_data.get("stop_reason") != "tool_use":
+            raise RuntimeError(
+                "Claude did not return Agent 3's required structured response "
+                f"(stop reason: {response_data.get('stop_reason') or 'unknown'})."
+            )
+        return extract_tool_input(response_data, tool["name"])
 
 
 def _apply(

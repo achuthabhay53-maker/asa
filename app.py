@@ -11,26 +11,24 @@ import json
 import re
 import traceback
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
 import streamlit as st
-from aca.article_sections import split_article_sections
-from aca.agents.source_intelligence import TOP_N_SOURCES
-from aca.agents.writer import WriterAgent
-from aca.models.writer import WriterInput, WriterOutput, WrittenSection
-from aca.output_storage import clear_agent_outputs, save_agent_output
-from aca.review_annotations import anchorable_finding_indexes, render_annotated_markdown
-from aca.orchestrator.checkpointer import postgres_checkpointer, thread_config
-from aca.orchestrator.pipeline import PipelineState, _build_writer_input, build_pipeline
-from aca.observability.token_usage import (
+from src.agents.source_intelligence import TOP_N_SOURCES
+from src.agents.writer import WriterAgent
+from src.models.writer import WriterInput, WriterOutput, WrittenSection
+from src.orchestrator.checkpointer import postgres_checkpointer, thread_config
+from src.orchestrator.pipeline import PipelineState, _build_writer_input, build_pipeline
+from src.observability.token_usage import (
     merge_token_usage,
     take_run_token_usage,
     token_usage_scope,
     token_usage_totals,
 )
-from aca.pdf_export import build_article_pdf
-from ui_theme2 import (
+from src.ui.article_sections import split_article_sections
+from src.ui.pdf_export import build_article_pdf
+from src.ui.review_annotations import anchorable_finding_indexes, render_annotated_markdown
+from src.ui.theme import (
     inject_theme,
     render_checklist,
     render_empty_state,
@@ -45,6 +43,7 @@ from ui_theme2 import (
     render_versions,
     severity_badge,
 )
+from src.utils.output_storage import DEFAULT_OUTPUT_DIR, clear_agent_outputs, save_agent_output
 
 st.set_page_config(
     page_title="BlogGen",
@@ -290,7 +289,7 @@ KEYS = (
     "reviewed_draft_fingerprint",
     "finding_statuses",
 )
-OUTPUT_DIR = Path(__file__).resolve().parent
+OUTPUT_DIR = DEFAULT_OUTPUT_DIR
 for key in KEYS:
     st.session_state.setdefault(key, None)
 st.session_state.setdefault("active_view", "Article")
@@ -1069,7 +1068,7 @@ def view_approve() -> None:
 
 def view_outputs() -> None:
     st.subheader("Agent outputs")
-    st.caption("Raw output from each agent. Each run also saves these as agent1_output.json through agent6_output.json.")
+    st.caption("Raw output from each agent. Each run saves agent1_output.json through agent6_output.json in the outputs folder.")
     labels = [f"{name} · {desc}" for _, name, desc, _ in AGENT_STEPS]
     for tab, (key, name, desc, _) in zip(st.tabs(labels), AGENT_STEPS):
         with tab:

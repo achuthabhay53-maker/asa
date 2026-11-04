@@ -14,10 +14,50 @@ from typing import Any
 import anthropic
 from pydantic import ValidationError
 
-from aca.evidence import canonicalize_evidence_url
-from aca.models.writer import WriterEvidence, WriterInput, WriterOutput, WrittenSection
-from aca.observability.token_usage import record_claude_response
-from aca.reviewer_lint import lint_article
+from src.models.writer import WriterEvidence, WriterInput, WriterOutput, WrittenSection
+from src.observability.token_usage import record_claude_response
+from src.utils.evidence import canonicalize_evidence_url
+from src.utils.reviewer_lint import lint_article
+from src.utils.structured_output import extract_tool_input, model_input_schema
+
+
+_WRITER_OUTPUT_TOOL = {
+    "name": "submit_writer_output",
+    "description": "Submit the complete structured blog draft.",
+    "input_schema": model_input_schema(WriterOutput),
+}
+_WRITER_PATCH_TOOL = {
+    "name": "submit_writer_patch",
+    "description": "Submit exact-text edits and optional metadata changes.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "metadata": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "seo_title": {"type": "string"},
+                    "meta_description": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+            "edits": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "old_text": {"type": "string"},
+                        "new_text": {"type": "string"},
+                    },
+                    "required": ["old_text", "new_text"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["metadata", "edits"],
+        "additionalProperties": False,
+    },
+}
 
 
 class WriterAgent:
@@ -208,6 +248,8 @@ class WriterAgent:
             model=self.model,
             max_tokens=repair_token_limit,
             system=self._repair_system_prompt(),
+            tools=[_WRITER_PATCH_TOOL],
+            tool_choice={"type": "tool", "name": _WRITER_PATCH_TOOL["name"]},
             messages=[{"role": "user", "content": prompt}],
         ) as stream:
             response = stream.get_final_message()
@@ -217,13 +259,12 @@ class WriterAgent:
                 f"Writer repair was truncated at {repair_token_limit:,} output tokens."
             )
 
-        raw_text = "\n".join(
-            block.text for block in response.content if getattr(block, "type", None) == "text"
-        ).strip()
-        if not raw_text:
-            raise RuntimeError("Writer repair returned an empty response.")
-
-        payload = self._parse_json(raw_text)
+        if response.stop_reason != "tool_use":
+            raise RuntimeError(
+                "Writer repair did not return its required structured response "
+                f"(stop reason: {response.stop_reason or 'unknown'})."
+            )
+        payload = extract_tool_input(response, _WRITER_PATCH_TOOL["name"])
         metadata = payload.get("metadata", {})
         edits = payload.get("edits", [])
         if not isinstance(metadata, dict) or not isinstance(edits, list):
@@ -610,6 +651,8 @@ class WriterAgent:
             model=self.model,
             max_tokens=self.max_tokens,
             system=system_prompt or self._system_prompt(),
+            tools=[_WRITER_OUTPUT_TOOL],
+            tool_choice={"type": "tool", "name": _WRITER_OUTPUT_TOOL["name"]},
             messages=[{"role": "user", "content": user_prompt}],
         ) as stream:
             response = stream.get_final_message()
@@ -621,14 +664,12 @@ class WriterAgent:
                 "Shorten the article requirements or reduce the requested scope."
             )
 
-        raw_text = "\n".join(
-            block.text for block in response.content if getattr(block, "type", None) == "text"
-        ).strip()
-
-        if not raw_text:
-            raise RuntimeError("Writer returned an empty response.")
-
-        payload = self._parse_json(raw_text)
+        if response.stop_reason != "tool_use":
+            raise RuntimeError(
+                "Writer did not return its required structured response "
+                f"(stop reason: {response.stop_reason or 'unknown'})."
+            )
+        payload = extract_tool_input(response, _WRITER_OUTPUT_TOOL["name"])
         payload, support_status_warnings = self._normalize_claim_support_status(payload)
 
         try:
@@ -1041,26 +1082,3 @@ or claims.
                 break
         if not has_table:
             raise RuntimeError("Writer article must include at least one valid Markdown table.")
-
-    @staticmethod
-    def _parse_json(raw_text: str) -> dict[str, Any]:
-        """Parse JSON, allowing a surrounding Markdown fence if present."""
-        text = raw_text.strip()
-
-        if text.startswith("```"):
-            text = re.sub(r"^```(?:json)?\s*", "", text)
-            text = re.sub(r"\s*```$", "", text)
-
-        try:
-            payload = json.loads(text)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                f"Writer returned invalid JSON at character "
-                f"{exc.pos}: {exc.msg}. Raw output begins: "
-                f"{raw_text[:1000]!r}"
-            ) from exc
-
-        if not isinstance(payload, dict):
-            raise RuntimeError("Writer output must be a JSON object.")
-
-        return payload
