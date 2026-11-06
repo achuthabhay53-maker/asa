@@ -17,7 +17,7 @@ if str(ROOT) not in sys.path:
 
 load_dotenv(ROOT / ".env")
 
-from src.agents.writer import WriterAgent  # noqa: E402
+from src.agents.aimpact_blog.writer import WriterAgent  # noqa: E402
 from src.models.writer import WriterInput  # noqa: E402
 from src.utils.output_storage import DEFAULT_OUTPUT_DIR  # noqa: E402
 

@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.agents.content_brief import ContentBriefAgent  # noqa: E402
+from src.agents.aimpact_blog.content_brief import ContentBriefAgent  # noqa: E402
 from src.utils.output_storage import DEFAULT_OUTPUT_DIR  # noqa: E402
 
 

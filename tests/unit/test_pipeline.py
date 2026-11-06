@@ -12,7 +12,7 @@ from src.models.prompt_intelligence import (
 from src.models.writer import WriterInput
 from src.orchestrator import pipeline as workflow
 from src.orchestrator.pipeline import PipelineState, _build_writer_input, build_pipeline
-from src.agents.writer import WriterAgent
+from src.agents.aimpact_blog.writer import WriterAgent
 from src.models.reviewer import ReviewOutput
 from src.observability.token_usage import record_claude_response
 from src.orchestrator.checkpointer import thread_config

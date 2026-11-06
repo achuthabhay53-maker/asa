@@ -18,12 +18,12 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from pydantic import BaseModel, Field
 
-from src.agents.content_brief import ContentBriefAgent
-from src.agents.ground_truth import MAX_QUESTIONS, GroundTruthAgent
-from src.agents.prompt_intelligence import run_agent1
-from src.agents.reviewer import ReviewerAgent
-from src.agents.source_intelligence import TOP_N_SOURCES, run_agent2
-from src.agents.writer import WriterAgent
+from src.agents.aimpact_blog.content_brief import ContentBriefAgent
+from src.agents.aimpact_blog.ground_truth import MAX_QUESTIONS, GroundTruthAgent
+from src.agents.aimpact_blog.prompt_intelligence import run_agent1
+from src.agents.aimpact_blog.reviewer import ReviewerAgent
+from src.agents.aimpact_blog.source_intelligence import TOP_N_SOURCES, run_agent2
+from src.agents.aimpact_blog.writer import WriterAgent
 from src.models.content_brief import ContentBrief
 from src.models.ground_truth import ClientInput, GroundTruthGuide
 from src.models.prompt_intelligence import PromptAnalysis

@@ -1,4 +1,4 @@
-"""Agent 3: Ground truth for AImpact.
+"""ACA Agent 3: Ground truth for AImpact.
 
 Starts from the original prompt and Agent 1's reading of it. The website
 is supplied by the user. Prompt claims and each content opportunity are

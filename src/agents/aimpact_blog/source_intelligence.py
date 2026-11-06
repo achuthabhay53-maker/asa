@@ -1,4 +1,4 @@
-"""Agent 2: Source Intelligence for AImpact.
+"""ACA Agent 2: Source Intelligence for AImpact.
 
 Independently analyzes citations already stored for one prompt. Ranking is
 separate from content analysis: the top sources stay in ``ranked_sources``

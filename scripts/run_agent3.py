@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.agents.ground_truth import MAX_QUESTIONS  # noqa: E402
+from src.agents.aimpact_blog.ground_truth import MAX_QUESTIONS  # noqa: E402
 from src.models.ground_truth import GroundTruthGuide  # noqa: E402
 from src.models.prompt_intelligence import PromptAnalysis  # noqa: E402
 from src.models.source_intelligence import SourceIntelligence  # noqa: E402

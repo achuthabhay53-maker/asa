@@ -28,8 +28,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.agents.ground_truth import MAX_QUESTIONS  # noqa: E402
-from src.agents.source_intelligence import TOP_N_SOURCES  # noqa: E402
+from src.agents.aimpact_blog.ground_truth import MAX_QUESTIONS  # noqa: E402
+from src.agents.aimpact_blog.source_intelligence import TOP_N_SOURCES  # noqa: E402
 from src.orchestrator.checkpointer import postgres_checkpointer, thread_config  # noqa: E402
 from src.orchestrator.pipeline import PipelineState, build_pipeline  # noqa: E402
 from src.utils.output_storage import DEFAULT_OUTPUT_DIR  # noqa: E402

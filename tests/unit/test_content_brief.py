@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from src.agents.content_brief import ContentBriefAgent
+from src.agents.aimpact_blog.content_brief import ContentBriefAgent
 
 
 def _tool_response(output):
@@ -72,7 +72,7 @@ def test_content_brief_passes_agent3_search_signals_into_seo_fields(monkeypatch)
         captured.update(kwargs)
         return FakeResponse()
 
-    monkeypatch.setattr("src.agents.content_brief.httpx.post", fake_post)
+    monkeypatch.setattr("src.agents.aimpact_blog.content_brief.httpx.post", fake_post)
     brief = ContentBriefAgent(api_key="test").build_brief(*_brief_inputs())
 
     assert brief.primary_keyword == "immersive training"
@@ -107,7 +107,7 @@ def test_content_brief_fails_explicitly_without_required_tool_response(monkeypat
         requests.append(kwargs["json"])
         return FakeResponse()
 
-    monkeypatch.setattr("src.agents.content_brief.httpx.post", fake_post)
+    monkeypatch.setattr("src.agents.aimpact_blog.content_brief.httpx.post", fake_post)
     with pytest.raises(RuntimeError, match="required structured response"):
         ContentBriefAgent(api_key="test").build_brief(*_brief_inputs())
     assert len(requests) == 1
@@ -133,7 +133,7 @@ def test_content_brief_links_section_urls_to_valid_evidence_ids(monkeypatch):
             return _tool_response(output)
 
     monkeypatch.setattr(
-        "src.agents.content_brief.httpx.post",
+        "src.agents.aimpact_blog.content_brief.httpx.post",
         lambda *_args, **_kwargs: FakeResponse(),
     )
     agent1, agent2, agent3 = _brief_inputs()
@@ -174,7 +174,7 @@ def test_content_brief_drops_urls_not_linked_to_section_evidence(monkeypatch, ca
             return _tool_response(output)
 
     monkeypatch.setattr(
-        "src.agents.content_brief.httpx.post",
+        "src.agents.aimpact_blog.content_brief.httpx.post",
         lambda *_args, **_kwargs: FakeResponse(),
     )
     agent1, agent2, agent3 = _brief_inputs()
@@ -212,7 +212,7 @@ def test_content_brief_rejects_unknown_evidence_ids(monkeypatch):
             return _tool_response(output)
 
     monkeypatch.setattr(
-        "src.agents.content_brief.httpx.post",
+        "src.agents.aimpact_blog.content_brief.httpx.post",
         lambda *_args, **_kwargs: FakeResponse(),
     )
     with pytest.raises(RuntimeError, match="unknown evidence IDs"):

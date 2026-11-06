@@ -1,4 +1,4 @@
-"""Agent 4: Strategy and Blog Brief Builder for ACA.
+"""ACA Agent 4: Strategy and Blog Brief Builder.
 
 Combines the outputs of:
 - Agent 1 (Prompt & Answer Intelligence)

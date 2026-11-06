@@ -5,8 +5,8 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from src.agents.writer import WriterAgent
-from src.agents.reviewer import ReviewerAgent
+from src.agents.aimpact_blog.writer import WriterAgent
+from src.agents.aimpact_blog.reviewer import ReviewerAgent
 from src.models.reviewer import ReviewerResponse
 from src.models.writer import (
     WriterClaim,
@@ -849,6 +849,8 @@ def test_writer_uses_one_generation_when_response_fits():
         "type": "tool",
         "name": "submit_writer_output",
     }
+    assert "sections" not in requests[0]["tools"][0]["input_schema"]["properties"]
+    assert "sections" not in requests[0]["tools"][0]["input_schema"]["required"]
     assert set(requests[0]["tools"][0]["input_schema"]["required"]) >= {
         "title",
         "article_markdown",
@@ -861,6 +863,50 @@ def test_writer_uses_one_generation_when_response_fits():
         "How do learners practice?",
         "Who can use this training?",
     ]
+
+
+def test_writer_auto_tool_choice_validates_json_text_response():
+    output = _writer_output().model_dump(mode="json")
+    output.pop("sections")
+    requests = []
+
+    class FakeMessages:
+        @staticmethod
+        def stream(**kwargs):
+            requests.append(kwargs)
+            response = SimpleNamespace(
+                stop_reason="end_turn",
+                content=[
+                    SimpleNamespace(
+                        type="text",
+                        text=json.dumps(output),
+                    )
+                ],
+            )
+
+            class RawMessageStream:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_args):
+                    return False
+
+                def get_final_message(self):
+                    return response
+
+            return RawMessageStream()
+
+    agent = WriterAgent.__new__(WriterAgent)
+    agent.client = SimpleNamespace(messages=FakeMessages())
+    agent.model = "claude-sonnet-5-5"
+    agent.max_tokens = 11000
+    agent.tool_choice = "auto"
+
+    result = agent._generate_output("Write a blog.")
+
+    assert result.title == output["title"]
+    assert requests[0]["tool_choice"] == {"type": "auto"}
+    assert requests[0]["tools"][0]["name"] == "submit_writer_output"
 
 
 def test_writer_targeted_repair_rejects_ambiguous_edit_anchors():

@@ -4,6 +4,25 @@ The current interactive application is a Streamlit workflow that reads AImpact p
 
 **Current flow:** Agent 1 → Agent 2 → Agent 3 → Agent 4 → Agent 5 → Agent 6 (Reviewer) → human editing and approval. Reviewer findings with an exact, unique article excerpt appear as severity-colored inline highlights with hover explanations; findings without an unambiguous text anchor remain in the review-decision controls. The human can edit directly or request an evidence-constrained Writer revision. Revisions apply as a new draft version without a separate proposal/diff screen; a changed version requires a fresh review and approval.
 
+### General Blog Generation
+
+The same Streamlit application also includes **General Blog Generation** as a
+separate page in the sidebar. This workflow does not use AImpact data or Agents
+1–4. New intake, research, and brief agents use the company website and
+user-provided reference URLs (including URLs detected in the prompt). Public
+HTML pages and text-based PDFs are supported. Users can also upload up to five
+text-based research PDFs (15 MB each) when a reference link cannot be fetched;
+uploaded documents are parsed in memory and are not saved to disk. Scanned PDFs
+that require OCR are not supported. Blocked or inaccessible sources are
+reported in the result rather than treated as evidence. Exact source quotes are
+matched against their source text before they are passed to the existing Agent 5
+Writer and Agent 6 Reviewer. Blocking review findings trigger a bounded revision
+loop; unresolved blocking findings are surfaced for human review.
+
+The General Blog page uses the existing `ANTHROPIC_API_KEY` and requires
+`EXA_API_KEY` for company-site research. Launch it through the same command:
+`streamlit run app.py`, then select **General Blog** in the Streamlit sidebar.
+
 The LangGraph workflow uses a PostgreSQL checkpointer configured by `DATABASE_URL`; each run ID is its checkpoint thread ID. The first run creates or migrates the checkpointer tables. Draft versions, review findings, finding decisions, and approvals are written into the workflow checkpoint and can be restored by entering the run ID under **Resume a saved workflow**. Manual edits and Writer revisions invalidate prior findings and approval; the current version must be reviewed again and explicitly approved.
 
 Claude input and output tokens are recorded for each API call, tagged with the workflow run ID and agent, and saved in the run checkpoint. Expand **Claude token usage** in the Streamlit UI to see run totals and per-call counts, including retries and Writer revisions.
@@ -34,19 +53,23 @@ Supporting docs:
 
 ## Repo layout
 
-The Streamlit entry point is `app.py`. Application logic and presentation
-helpers are grouped by responsibility:
+The Streamlit entry point is `app.py`; `pages/` contains additional pages in the
+same application. Application logic and presentation helpers are grouped by
+responsibility:
 
 ```
 src/
-├── agents/          Agent 1–6 workflow logic
+├── agents/
+│   ├── aimpact_blog/ ACA Agents 1–6
+│   └── general_blog/ Independent General Blog agents
 ├── models/          Typed agent inputs and outputs
 ├── observability/   Claude token usage and telemetry
-├── orchestrator/    LangGraph state and pipeline
-├── tools/           AImpact, source fetching, and web research
+├── orchestrator/    ACA and General Blog workflow coordinators
+├── tools/           AImpact, web research, and reference retrieval
 ├── ui/              Streamlit theme, article rendering, PDF, and review UI
-├── utils/           Evidence URLs, output storage, and writer lint helpers
+├── utils/           Shared helpers, evidence URLs, and writer lint
 └── workers/         Background worker scaffolding
+pages/               General Blog Streamlit page
 ```
 
 See [`docs/04-code-architecture.md`](docs/04-code-architecture.md) for module-by-module explanation and the dependency graph.
@@ -87,6 +110,13 @@ files before starting, then saves each agent's JSON as that agent completes. If 
 only the completed agents' files remain, so the evaluator will report missing
 outputs instead of combining results from different runs. Each saved output
 also carries a shared `_run_id`, which the evaluator checks for consistency.
+Agent 1's latest structured output is also saved separately to
+`outputs2/agent1/agent1_output.json` for debugging; it includes the same
+`_run_id` and is not cleared when a new run starts.
+General Blog stage diagnostics are saved per run under
+`outputs2/general_blog/<run_id>/`. Each stage JSON includes its inputs,
+validated output (or error), token usage, and duration. Repeated writer and
+reviewer stages use numbered filenames.
 
 The Streamlit form defaults Agent 5's target to 800 words; adjust the
 `Blog target word count` field from 500 to 5,000 as needed. The target guides

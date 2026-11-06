@@ -22,7 +22,7 @@ if str(ROOT) not in sys.path:
 
 load_dotenv(ROOT / ".env")
 
-from src.agents.reviewer import ReviewerAgent  # noqa: E402
+from src.agents.aimpact_blog.reviewer import ReviewerAgent  # noqa: E402
 from src.models.content_brief import ContentBrief  # noqa: E402
 from src.models.ground_truth import GroundTruthGuide  # noqa: E402
 from src.models.prompt_intelligence import PromptAnalysis  # noqa: E402

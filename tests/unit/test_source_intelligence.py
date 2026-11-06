@@ -1,12 +1,12 @@
-from src.agents import source_intelligence
-from src.agents.source_intelligence import SourceIntelligenceAgent
+from src.agents.aimpact_blog import source_intelligence
+from src.agents.aimpact_blog.source_intelligence import SourceIntelligenceAgent
 from src.models.source_intelligence import ContentStructure
 
 
 def test_source_findings_mark_only_exact_page_quotes_as_matched(monkeypatch):
     page_text = "The page says this exact sentence describes the service clearly."
     monkeypatch.setattr(
-        "src.agents.source_intelligence._fetch_page",
+        "src.agents.aimpact_blog.source_intelligence._fetch_page",
         lambda _url: {
             "status": "success",
             "final_url": "https://example.com/page",

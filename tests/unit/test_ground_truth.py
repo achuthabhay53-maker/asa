@@ -8,7 +8,7 @@ from datetime import date
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from src.agents.ground_truth import (
+from src.agents.aimpact_blog.ground_truth import (
     GroundTruthAgent,
     CheckedClaim,
     _EvidenceRegistry,
@@ -186,9 +186,9 @@ def test_agent3_call_audit_logs_hash_claims_sources_and_actual_input_tokens(monk
         request.update(kwargs)
         return response
 
-    with patch("src.agents.ground_truth.httpx.post", side_effect=fake_post), caplog.at_level(
+    with patch("src.agents.aimpact_blog.ground_truth.httpx.post", side_effect=fake_post), caplog.at_level(
         logging.INFO,
-        logger="src.agents.ground_truth",
+        logger="src.agents.aimpact_blog.ground_truth",
     ):
         result = agent._complete(
             "Check the claim.",
@@ -244,9 +244,9 @@ def test_agent3_call_audit_is_disabled_by_default(monkeypatch, caplog):
     )
     agent = GroundTruthAgent(api_key="mock-key", model="mock-model")
 
-    with patch("src.agents.ground_truth.httpx.post", return_value=response), caplog.at_level(
+    with patch("src.agents.aimpact_blog.ground_truth.httpx.post", return_value=response), caplog.at_level(
         logging.INFO,
-        logger="src.agents.ground_truth",
+        logger="src.agents.aimpact_blog.ground_truth",
     ):
         agent._complete(
             "Check.",

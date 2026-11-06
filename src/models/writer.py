@@ -19,6 +19,7 @@ class WriterEvidence(BaseModel):
         "inconclusive",
         "unavailable",
     ]
+    relevance: Literal["direct", "related", "background"] | None = None
     evidence_quote: str | None = None
     source_url: str | None = None
     wording_boundary: str | None = None

@@ -14,8 +14,8 @@ from datetime import datetime
 from typing import Any
 
 import streamlit as st
-from src.agents.source_intelligence import TOP_N_SOURCES
-from src.agents.writer import WriterAgent
+from src.agents.aimpact_blog.source_intelligence import TOP_N_SOURCES
+from src.agents.aimpact_blog.writer import WriterAgent
 from src.models.writer import WriterInput, WriterOutput, WrittenSection
 from src.orchestrator.checkpointer import postgres_checkpointer, thread_config
 from src.orchestrator.pipeline import PipelineState, _build_writer_input, build_pipeline
@@ -43,7 +43,12 @@ from src.ui.theme import (
     render_versions,
     severity_badge,
 )
-from src.utils.output_storage import DEFAULT_OUTPUT_DIR, clear_agent_outputs, save_agent_output
+from src.utils.output_storage import (
+    AGENT1_DEBUG_OUTPUT_DIR,
+    DEFAULT_OUTPUT_DIR,
+    clear_agent_outputs,
+    save_agent_output,
+)
 
 st.set_page_config(
     page_title="BlogGen",
@@ -446,6 +451,13 @@ if submitted:
                                             OUTPUT_DIR,
                                             run_id=state.run_id,
                                         )
+                                        if output_number == 1:
+                                            save_agent_output(
+                                                1,
+                                                as_dict(result),
+                                                AGENT1_DEBUG_OUTPUT_DIR,
+                                                run_id=state.run_id,
+                                            )
                                         completed.add(session_key)
                                         st.write(f"✓ {label} complete")
                                         pipeline(pipeline_slot, running=True)

@@ -1,4 +1,4 @@
-"""Agent 6: Review a generated blog and report issues for human review."""
+"""ACA Agent 6: Review a generated blog and report issues for human review."""
 
 from __future__ import annotations
 

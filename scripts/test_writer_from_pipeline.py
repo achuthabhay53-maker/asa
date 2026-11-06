@@ -31,7 +31,7 @@ from src.models.writer import (  # noqa: E402
     WriterInput,
     WriterSectionInput,
 )
-from src.agents.writer import WriterAgent  # noqa: E402
+from src.agents.aimpact_blog.writer import WriterAgent  # noqa: E402
 from src.utils.output_storage import DEFAULT_OUTPUT_DIR  # noqa: E402
 
 

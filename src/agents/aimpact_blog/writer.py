@@ -1,4 +1,4 @@
-"""Agent 5: Writer Agent.
+"""ACA Agent 5: Writer Agent.
 
 Consumes a validated writer input and produces an evidence-grounded blog
 for Agent 6.
@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from typing import Any
+from typing import Any, Literal
 
 import anthropic
 from pydantic import ValidationError
@@ -21,10 +21,14 @@ from src.utils.reviewer_lint import lint_article
 from src.utils.structured_output import extract_tool_input, model_input_schema
 
 
+_WRITER_OUTPUT_SCHEMA = model_input_schema(WriterOutput)
+_WRITER_OUTPUT_SCHEMA["properties"].pop("sections")
+_WRITER_OUTPUT_SCHEMA["required"].remove("sections")
+
 _WRITER_OUTPUT_TOOL = {
     "name": "submit_writer_output",
     "description": "Submit the complete structured blog draft.",
-    "input_schema": model_input_schema(WriterOutput),
+    "input_schema": _WRITER_OUTPUT_SCHEMA,
 }
 _WRITER_PATCH_TOOL = {
     "name": "submit_writer_patch",
@@ -65,6 +69,7 @@ class WriterAgent:
         self,
         model: str = "claude-sonnet-5-5",
         max_tokens: int = 11000,
+        tool_choice: Literal["forced", "auto"] = "forced",
     ) -> None:
         api_key = os.getenv("ANTHROPIC_API_KEY")
         if not api_key:
@@ -73,6 +78,7 @@ class WriterAgent:
         self.client = anthropic.Anthropic(api_key=api_key)
         self.model = model
         self.max_tokens = max_tokens
+        self.tool_choice = tool_choice
 
     def write(self, writer_input: WriterInput) -> WriterOutput:
         """Generate a reader-focused, evidence-grounded blog post."""
@@ -243,13 +249,13 @@ class WriterAgent:
 
     def _generate_targeted_update(self, draft: WriterOutput, prompt: str) -> WriterOutput:
         """Apply exact-text edits without asking the model to regenerate the complete article."""
-        repair_token_limit = min(self.max_tokens, 4096)
+        repair_token_limit = min(self.max_tokens, 9096)
         with self.client.messages.stream(
             model=self.model,
             max_tokens=repair_token_limit,
             system=self._repair_system_prompt(),
             tools=[_WRITER_PATCH_TOOL],
-            tool_choice={"type": "tool", "name": _WRITER_PATCH_TOOL["name"]},
+            tool_choice=self._tool_choice_for(_WRITER_PATCH_TOOL["name"]),
             messages=[{"role": "user", "content": prompt}],
         ) as stream:
             response = stream.get_final_message()
@@ -259,12 +265,11 @@ class WriterAgent:
                 f"Writer repair was truncated at {repair_token_limit:,} output tokens."
             )
 
-        if response.stop_reason != "tool_use":
-            raise RuntimeError(
-                "Writer repair did not return its required structured response "
-                f"(stop reason: {response.stop_reason or 'unknown'})."
-            )
-        payload = extract_tool_input(response, _WRITER_PATCH_TOOL["name"])
+        payload = self._extract_structured_payload(
+            response,
+            _WRITER_PATCH_TOOL["name"],
+            "Writer repair",
+        )
         metadata = payload.get("metadata", {})
         edits = payload.get("edits", [])
         if not isinstance(metadata, dict) or not isinstance(edits, list):
@@ -652,7 +657,7 @@ class WriterAgent:
             max_tokens=self.max_tokens,
             system=system_prompt or self._system_prompt(),
             tools=[_WRITER_OUTPUT_TOOL],
-            tool_choice={"type": "tool", "name": _WRITER_OUTPUT_TOOL["name"]},
+            tool_choice=self._tool_choice_for(_WRITER_OUTPUT_TOOL["name"]),
             messages=[{"role": "user", "content": user_prompt}],
         ) as stream:
             response = stream.get_final_message()
@@ -664,12 +669,11 @@ class WriterAgent:
                 "Shorten the article requirements or reduce the requested scope."
             )
 
-        if response.stop_reason != "tool_use":
-            raise RuntimeError(
-                "Writer did not return its required structured response "
-                f"(stop reason: {response.stop_reason or 'unknown'})."
-            )
-        payload = extract_tool_input(response, _WRITER_OUTPUT_TOOL["name"])
+        payload = self._extract_structured_payload(
+            response,
+            _WRITER_OUTPUT_TOOL["name"],
+            "Writer",
+        )
         payload, support_status_warnings = self._normalize_claim_support_status(payload)
 
         try:
@@ -685,6 +689,42 @@ class WriterAgent:
                 "sections": sections,
                 "unresolved_items": list(dict.fromkeys([*result.unresolved_items, *support_status_warnings])),
             }
+        )
+
+    def _tool_choice_for(self, tool_name: str) -> dict[str, str]:
+        if getattr(self, "tool_choice", "forced") == "auto":
+            return {"type": "auto"}
+        return {"type": "tool", "name": tool_name}
+
+    @staticmethod
+    def _extract_structured_payload(
+        response: Any,
+        expected_tool_name: str,
+        operation: str,
+    ) -> dict[str, Any]:
+        if response.stop_reason == "tool_use":
+            return extract_tool_input(response, expected_tool_name)
+        if response.stop_reason == "end_turn":
+            content = getattr(response, "content", [])
+            text = "\n".join(
+                block.text
+                for block in content
+                if getattr(block, "type", None) == "text"
+                and isinstance(getattr(block, "text", None), str)
+            )
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f"{operation} returned neither its structured tool response "
+                    "nor valid JSON."
+                ) from exc
+            if isinstance(payload, dict):
+                return payload
+            raise RuntimeError(f"{operation} JSON response must be an object.")
+        raise RuntimeError(
+            f"{operation} did not return its required structured response "
+            f"(stop reason: {response.stop_reason or 'unknown'})."
         )
 
     @staticmethod
@@ -898,6 +938,16 @@ Return only the requested JSON object, with no Markdown fence or planning."""
     @staticmethod
     def _build_user_prompt(data: WriterInput) -> str:
         brief_json = data.model_dump_json(exclude_defaults=True, exclude_none=True)
+        evidence_guidance = ""
+        if any(item.relevance is not None for item in data.evidence):
+            evidence_guidance = """
+EVIDENCE RELEVANCE
+- Prioritize direct evidence for the main topic.
+- Use related evidence only as a clearly identified supporting example.
+- Do not present background evidence as direct support.
+- For General Blog evidence, "verified" means the quote matched the source
+  text; it does not independently establish scientific correctness.
+"""
 
         return f"""
 Write a complete blog post using the writer input below.
@@ -905,6 +955,7 @@ Write a complete blog post using the writer input below.
 <writer_input>
 {brief_json}
 </writer_input>
+{evidence_guidance}
 
 Write as the company's knowledgeable content team, speaking directly to
 prospective customers. Lead with the customer's challenge, then explain

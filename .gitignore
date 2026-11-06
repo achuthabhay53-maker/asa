@@ -14,5 +14,11 @@ build/
 .idea/
 .vscode/
 /outputs/
+/outputs2/
 /scripts/
 /tests/
+!/tests/
+/tests/*
+!/tests/unit/
+/tests/unit/*
+!/tests/unit/test_general_blog.py

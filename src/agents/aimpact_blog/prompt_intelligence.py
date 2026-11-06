@@ -1,4 +1,4 @@
-"""Agent 1: Prompt & Answer Intelligence for AImpact.
+"""ACA Agent 1: Prompt & Answer Intelligence for AImpact.
 
 Understands one user prompt and the AI answers already stored for it:
 intent, topics, concepts, mentioned companies, and whether the customer
