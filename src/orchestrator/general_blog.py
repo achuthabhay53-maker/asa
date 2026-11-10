@@ -89,10 +89,7 @@ class GeneralBlogWorkflow:
         self.company_research_agent = company_research_agent or CompanyWebsiteResearchAgent()
         self.reference_research_agent = reference_research_agent or UserReferenceResearchAgent()
         self.brief_agent = brief_agent or GeneralBlogBriefAgent()
-        self.writer_agent = writer_agent or WriterAgent(
-            max_tokens=GENERAL_BLOG_WRITER_MAX_TOKENS,
-            tool_choice="auto",
-        )
+        self.writer_agent = writer_agent or WriterAgent(max_tokens=GENERAL_BLOG_WRITER_MAX_TOKENS)
         self.reviewer_agent = reviewer_agent or ReviewerAgent()
         self.max_review_cycles = max_review_cycles
         self.progress_callback = progress_callback

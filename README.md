@@ -1,13 +1,13 @@
 # AImpact Content Agent (ACA)
 
-The current interactive application is a Streamlit workflow that reads AImpact prompt evidence, researches sources and company facts, creates a content brief, generates a blog draft, and reviews it. Agent 6 reports issues for a human to assess; it does not revise the draft. Human approval is still required before publication; WordPress publishing and post-publication re-audits are not implemented.
+The interactive application uses an HTML, CSS, and JavaScript frontend served by FastAPI. Python runs the existing research, writing, review, and workflow code behind the API. Agent 6 reports issues for a human to assess; it does not revise the campaign draft. Human approval is still required before publication; WordPress publishing and post-publication re-audits are not implemented.
 
 **Current flow:** Agent 1 → Agent 2 → Agent 3 → Agent 4 → Agent 5 → Agent 6 (Reviewer) → human editing and approval. Reviewer findings with an exact, unique article excerpt appear as severity-colored inline highlights with hover explanations; findings without an unambiguous text anchor remain in the review-decision controls. The human can edit directly or request an evidence-constrained Writer revision. Revisions apply as a new draft version without a separate proposal/diff screen; a changed version requires a fresh review and approval.
 
 ### General Blog Generation
 
-The same Streamlit application also includes **General Blog Generation** as a
-separate page in the sidebar. This workflow does not use AImpact data or Agents
+The application also includes **General Blog Generation** as a separate
+workflow in the sidebar. This workflow does not use AImpact data or Agents
 1–4. New intake, research, and brief agents use the company website and
 user-provided reference URLs (including URLs detected in the prompt). Public
 HTML pages and text-based PDFs are supported. Users can also upload up to five
@@ -19,13 +19,15 @@ matched against their source text before they are passed to the existing Agent 5
 Writer and Agent 6 Reviewer. Blocking review findings trigger a bounded revision
 loop; unresolved blocking findings are surfaced for human review.
 
-The General Blog page uses the existing `ANTHROPIC_API_KEY` and requires
-`EXA_API_KEY` for company-site research. Launch it through the same command:
-`streamlit run app.py`, then select **General Blog** in the Streamlit sidebar.
+The General Blog workflow uses the existing `ANTHROPIC_API_KEY` and requires
+`EXA_API_KEY` for company-site research.
+General Blog results are held in server memory. A server restart clears these
+results. The campaign workflow uses PostgreSQL checkpoints and can be reopened
+with its run ID.
 
 The LangGraph workflow uses a PostgreSQL checkpointer configured by `DATABASE_URL`; each run ID is its checkpoint thread ID. The first run creates or migrates the checkpointer tables. Draft versions, review findings, finding decisions, and approvals are written into the workflow checkpoint and can be restored by entering the run ID under **Resume a saved workflow**. Manual edits and Writer revisions invalidate prior findings and approval; the current version must be reviewed again and explicitly approved.
 
-Claude input and output tokens are recorded for each API call, tagged with the workflow run ID and agent, and saved in the run checkpoint. Expand **Claude token usage** in the Streamlit UI to see run totals and per-call counts, including retries and Writer revisions.
+Claude input and output tokens are recorded for each API call, tagged with the workflow run ID and agent, and saved in the run checkpoint. The web UI shows the run outputs and workflow status.
 
 ---
 
@@ -53,9 +55,8 @@ Supporting docs:
 
 ## Repo layout
 
-The Streamlit entry point is `app.py`; `pages/` contains additional pages in the
-same application. Application logic and presentation helpers are grouped by
-responsibility:
+The FastAPI entry point is `app.py`. Static HTML, CSS, and JavaScript are in
+`web/static/`. Application logic and presentation helpers are grouped by responsibility:
 
 ```
 src/
@@ -66,10 +67,11 @@ src/
 ├── observability/   Claude token usage and telemetry
 ├── orchestrator/    ACA and General Blog workflow coordinators
 ├── tools/           AImpact, web research, and reference retrieval
-├── ui/              Streamlit theme, article rendering, PDF, and review UI
+├── ui/              Article rendering helpers, PDF, and review logic
 ├── utils/           Shared helpers, evidence URLs, and writer lint
 └── workers/         Background worker scaffolding
-pages/               General Blog Streamlit page
+web/
+└── static/           HTML, CSS, and JavaScript frontend
 ```
 
 See [`docs/04-code-architecture.md`](docs/04-code-architecture.md) for module-by-module explanation and the dependency graph.
@@ -80,13 +82,16 @@ See [`docs/04-code-architecture.md`](docs/04-code-architecture.md) for module-by
 
 ```bash
 cp .env.example .env
-# fill in DATABASE_URL, AIMPACT_API_TOKEN, ANTHROPIC_API_KEY
+# Set the required DATABASE_URL, AIMPACT_API_TOKEN, ANTHROPIC_API_KEY, and EXA_API_KEY values
 python -m venv .venv
 # Windows: .venv\\Scripts\\Activate.ps1
 # macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
-streamlit run app.py
+python -m uvicorn app:app --reload
 ```
+
+Open `http://127.0.0.1:8000` in a browser. The FastAPI API documentation is
+available at `http://127.0.0.1:8000/docs`.
 
 Run tests:
 
@@ -104,7 +109,7 @@ Agent 5's tracked claims against Agent 3's evidence quotes. It does not rerun
 the agents. By default, it reads `outputs/agent1_output.json` through
 `outputs/agent5_output.json` and writes `outputs/agent_quality_report.json`.
 
-The Streamlit app (`streamlit run app.py`) refreshes those five agent output
+The campaign workflow refreshes those five agent output
 files in the `outputs` folder for every valid run. It clears the previous run's
 files before starting, then saves each agent's JSON as that agent completes. If a run stops early,
 only the completed agents' files remain, so the evaluator will report missing
@@ -118,7 +123,7 @@ General Blog stage diagnostics are saved per run under
 validated output (or error), token usage, and duration. Repeated writer and
 reviewer stages use numbered filenames.
 
-The Streamlit form defaults Agent 5's target to 800 words; adjust the
+The campaign form defaults Agent 5's target to 800 words; adjust the
 `Blog target word count` field from 500 to 5,000 as needed. The target guides
 the draft but is not a pass/fail limit: the app still displays the article and
 reports its actual word count if Claude writes more or less. Agent 5 streams
@@ -131,7 +136,7 @@ article title instead of failing the blog run.
 Agent 5 also includes at least one useful Markdown table, based only on
 information in the brief and supplied evidence. Unsupported details are
 marked as unspecified rather than guessed.
-The `Read blog` tab offers a formatted PDF download with styled headings,
+The Article view offers a formatted PDF download with styled headings,
 readable tables, FAQ question headings, clickable web links, and page numbers.
 The Markdown source download remains available separately.
 Agent 3 researches the customer website and external sources independently;
@@ -156,15 +161,18 @@ FAQ answers outside the 40–50 word target are also flagged. These checks are
 review aids, not proof of factual accuracy; human review is required before
 publication.
 
-After Agents 1–5 finish, open `Agent 6 · Review` and select
-`Review and revise blog` to run the optional Reviewer. It uses one Claude call,
-checks the draft and approved evidence, then returns the complete revised
-Markdown article, findings, and claims needing verification. Its output limit is
-16,384 tokens. The reviewed
-article view highlights added or changed words in green; unchanged text keeps
-its normal styling. The original draft remains available in `Agent 5 · Draft
-blog`. Agent 6 output is saved separately as `outputs/agent6_output.json`; it does
+After Agents 1–5 finish, open the Review view and select
+`Run Agent 6 review` to run the optional Reviewer. It uses one Claude call,
+checks the draft and approved evidence, and returns findings and claims that
+need verification. The reviewer does not rewrite the article. The Article view
+highlights exact matching passages when possible. Use Edit & revise to change
+the draft or ask Agent 5 for a revision. A changed draft needs a new review.
+Agent 6 output is saved separately as `outputs/agent6_output.json`; it does
 not replace the Agent 5 draft or automatically publish anything.
+
+The local FastAPI server has no user authentication. Run it on localhost for
+development. Do not expose it to a network or deploy it until authentication
+and access controls are in place.
 
 To run Agent 6 separately from saved Agent outputs, use the standalone script.
 It validates Agent 1-5 JSON files and calls only the Reviewer; it does not rerun

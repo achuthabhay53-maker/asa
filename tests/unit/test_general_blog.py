@@ -141,10 +141,17 @@ def test_general_blog_request_normalizes_websites_and_reference_urls():
         company_name=" Example ",
         company_website="example.com",
         prompt="Write about training https://research.example/paper.pdf.",
+        target_keywords=[
+            " VR training ",
+            "medical device training",
+            "vr TRAINING",
+            "",
+        ],
         reference_urls=["research.example/paper.pdf", "https://research.example/paper.pdf"],
     )
 
     assert request.company_website == "https://example.com/"
+    assert request.target_keywords == ["VR training", "medical device training"]
     assert request.reference_urls == ["https://research.example/paper.pdf"]
     with pytest.raises(ValueError, match="HTTP or HTTPS"):
         GeneralBlogRequest(
@@ -161,6 +168,7 @@ def test_intake_agent_collects_reference_urls_in_prompt_and_explicit_field():
         prompt="Discuss training. Reference: https://papers.example/study.pdf.",
         target_audience="Engineers",
         tone="Friendly",
+        target_keywords=["VR training", "medical device training"],
         reference_urls=[
             "https://papers.example/study.pdf",
             "https://example.net/report",
@@ -198,6 +206,8 @@ def test_intake_agent_collects_reference_urls_in_prompt_and_explicit_field():
     ]
     assert plan.target_audience == "Engineers"
     assert plan.tone == "Friendly"
+    assert plan.primary_keyword == "VR training"
+    assert plan.secondary_keywords == ["medical device training"]
     assert calls[0]["tool_choice"] == {
         "type": "tool",
         "name": "submit_general_blog_plan",
@@ -698,11 +708,22 @@ def test_brief_agent_maps_evidence_into_existing_writer_input():
         company_name="Example",
         company_website="example.com",
         prompt="Explain training.",
+        target_keywords=["VR training", "medical device training"],
     )
-    brief, writer_input = agent.build(request, _plan(), evidence)
+    plan = _plan().model_copy(
+        update={
+            "primary_keyword": "VR training",
+            "secondary_keywords": ["medical device training"],
+        }
+    )
+    brief, writer_input = agent.build(request, plan, evidence)
 
     assert brief.title == "Training with Evidence"
+    assert brief.primary_keyword == "VR training"
+    assert brief.secondary_keywords == ["medical device training"]
     assert writer_input.company_name == "Example"
+    assert writer_input.primary_keyword == "VR training"
+    assert writer_input.secondary_keywords == ["medical device training"]
     assert writer_input.sections[0].evidence_ids == ["ev_001"]
     writer_prompt = WriterAgent._build_user_prompt(writer_input)
     assert '"relevance":"related"' in writer_prompt

@@ -37,6 +37,7 @@ class GeneralBlogRequest(BaseModel):
     prompt: str = Field(min_length=3, max_length=12_000)
     target_audience: str | None = Field(default=None, max_length=500)
     tone: str | None = Field(default=None, max_length=300)
+    target_keywords: list[str] = Field(default_factory=list, max_length=20)
     reference_urls: list[str] = Field(default_factory=list, max_length=20)
     target_word_count: int | None = Field(default=None, gt=0, le=10_000)
 
@@ -51,6 +52,24 @@ class GeneralBlogRequest(BaseModel):
     @classmethod
     def normalize_company_website(cls, value: str) -> str:
         return normalize_http_url(value)
+
+    @field_validator("target_keywords", mode="before")
+    @classmethod
+    def normalize_target_keywords(cls, values: list[str]) -> list[str]:
+        if not isinstance(values, list):
+            raise ValueError("Target keywords must be provided as a list.")
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            if not isinstance(value, str):
+                raise ValueError("Each target keyword must be text.")
+            keyword = value.strip()
+            if len(keyword) > 100:
+                raise ValueError("Each target keyword must be 100 characters or fewer.")
+            if keyword and keyword.casefold() not in seen:
+                seen.add(keyword.casefold())
+                normalized.append(keyword)
+        return normalized
 
     @field_validator("reference_urls")
     @classmethod

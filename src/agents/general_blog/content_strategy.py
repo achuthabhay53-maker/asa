@@ -55,6 +55,7 @@ class GeneralBlogIntakeAgent:
             "user_prompt": request.prompt,
             "target_audience": request.target_audience,
             "tone": request.tone,
+            "target_keywords": request.target_keywords,
             "reference_urls": reference_urls,
         }
         data = call_structured_agent(
@@ -64,7 +65,9 @@ class GeneralBlogIntakeAgent:
 Create a focused article objective, reader search intent, title, keyword ideas,
 and up to six web research queries. Use the user's topic as the anchor. Do not
 make claims about company capabilities or invent citations. Incorporate the
-requested audience and tone when provided. Search queries should target the
+requested audience and tone when provided. If target keywords are supplied,
+use the first as the primary keyword and the remaining keywords as secondary
+keywords, without changing their wording. Search queries should target the
 company's website for company-specific information and the topic for needed
 context. Return only the required structured tool response.""",
             payload,
@@ -73,11 +76,19 @@ context. Return only the required structured tool response.""",
             max_tokens=2200,
         )
         plan = GeneralBlogPlan.model_validate(data)
+        updates = {}
         if request.target_audience or request.tone:
+            updates.update(
+                target_audience=request.target_audience or plan.target_audience,
+                tone=request.tone or plan.tone,
+            )
+        if request.target_keywords:
+            updates.update(
+                primary_keyword=request.target_keywords[0],
+                secondary_keywords=request.target_keywords[1:],
+            )
+        if updates:
             plan = plan.model_copy(
-                update={
-                    "target_audience": request.target_audience or plan.target_audience,
-                    "tone": request.tone or plan.tone,
-                }
+                update=updates
             )
         return plan, reference_urls

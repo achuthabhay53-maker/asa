@@ -47,6 +47,9 @@ their population, method, limitations, and wording boundaries. Do not invent
 citations, search metrics, company claims, outcomes, or statistics. General
 education may be included without company-specific evidence, but clearly keep
 it distinct from factual company claims. Use the requested tone and audience.
+When the user supplied target keywords, keep those exact terms as the primary
+and secondary keywords from the research plan. Use them naturally; do not
+force them into unsuitable sentences.
 Prioritize evidence marked direct for the main article claims. Use related
 evidence only as a clearly identified supporting example, without implying it
 proves the main topic. Use background evidence only when the requested article
@@ -67,6 +70,13 @@ Return 3 to 5 FAQs that can be answered from the planned article.""",
             max_tokens=5000,
         )
         brief = GeneralBlogBrief.model_validate(data)
+        if request.target_keywords:
+            brief = brief.model_copy(
+                update={
+                    "primary_keyword": plan.primary_keyword,
+                    "secondary_keywords": plan.secondary_keywords,
+                }
+            )
         allowed_ids = {item.evidence_id for item in evidence}
         unknown_ids = {
             evidence_id

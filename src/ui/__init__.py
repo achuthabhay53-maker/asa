@@ -1,1 +1,1 @@
-"""Streamlit presentation helpers."""
+"""Presentation helpers for generated articles and review results."""

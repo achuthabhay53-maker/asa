@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from typing import Any, Literal
+from typing import Any
 
 import anthropic
 from pydantic import ValidationError
@@ -18,49 +18,55 @@ from src.models.writer import WriterEvidence, WriterInput, WriterOutput, Written
 from src.observability.token_usage import record_claude_response
 from src.utils.evidence import canonicalize_evidence_url
 from src.utils.reviewer_lint import lint_article
-from src.utils.structured_output import extract_tool_input, model_input_schema
+from src.utils.structured_output import model_input_schema
 
 
 _WRITER_OUTPUT_SCHEMA = model_input_schema(WriterOutput)
 _WRITER_OUTPUT_SCHEMA["properties"].pop("sections")
 _WRITER_OUTPUT_SCHEMA["required"].remove("sections")
 
-_WRITER_OUTPUT_TOOL = {
-    "name": "submit_writer_output",
-    "description": "Submit the complete structured blog draft.",
-    "input_schema": _WRITER_OUTPUT_SCHEMA,
-}
-_WRITER_PATCH_TOOL = {
-    "name": "submit_writer_patch",
-    "description": "Submit exact-text edits and optional metadata changes.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "metadata": {
+
+# Anthropic rejects "minimum"; Pydantic still validates the parsed response.
+def _strip_unsupported_json_schema_constraints(schema: Any) -> None:
+    if isinstance(schema, dict):
+        schema.pop("minimum", None)
+        for value in schema.values():
+            _strip_unsupported_json_schema_constraints(value)
+    elif isinstance(schema, list):
+        for value in schema:
+            _strip_unsupported_json_schema_constraints(value)
+
+
+_strip_unsupported_json_schema_constraints(_WRITER_OUTPUT_SCHEMA)
+
+_WRITER_PATCH_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "metadata": {
+            "type": "object",
+            "properties": {
+                "title": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                "seo_title": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                "meta_description": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            },
+            "required": ["title", "seo_title", "meta_description"],
+            "additionalProperties": False,
+        },
+        "edits": {
+            "type": "array",
+            "items": {
                 "type": "object",
                 "properties": {
-                    "title": {"type": "string"},
-                    "seo_title": {"type": "string"},
-                    "meta_description": {"type": "string"},
+                    "old_text": {"type": "string"},
+                    "new_text": {"type": "string"},
                 },
+                "required": ["old_text", "new_text"],
                 "additionalProperties": False,
             },
-            "edits": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "old_text": {"type": "string"},
-                        "new_text": {"type": "string"},
-                    },
-                    "required": ["old_text", "new_text"],
-                    "additionalProperties": False,
-                },
-            },
         },
-        "required": ["metadata", "edits"],
-        "additionalProperties": False,
     },
+    "required": ["metadata", "edits"],
+    "additionalProperties": False,
 }
 
 
@@ -69,7 +75,6 @@ class WriterAgent:
         self,
         model: str = "claude-sonnet-5-5",
         max_tokens: int = 11000,
-        tool_choice: Literal["forced", "auto"] = "forced",
     ) -> None:
         api_key = os.getenv("ANTHROPIC_API_KEY")
         if not api_key:
@@ -78,7 +83,6 @@ class WriterAgent:
         self.client = anthropic.Anthropic(api_key=api_key)
         self.model = model
         self.max_tokens = max_tokens
-        self.tool_choice = tool_choice
 
     def write(self, writer_input: WriterInput) -> WriterOutput:
         """Generate a reader-focused, evidence-grounded blog post."""
@@ -254,8 +258,12 @@ class WriterAgent:
             model=self.model,
             max_tokens=repair_token_limit,
             system=self._repair_system_prompt(),
-            tools=[_WRITER_PATCH_TOOL],
-            tool_choice=self._tool_choice_for(_WRITER_PATCH_TOOL["name"]),
+            output_config={
+                "format": {
+                    "type": "json_schema",
+                    "schema": _WRITER_PATCH_SCHEMA,
+                }
+            },
             messages=[{"role": "user", "content": prompt}],
         ) as stream:
             response = stream.get_final_message()
@@ -265,11 +273,7 @@ class WriterAgent:
                 f"Writer repair was truncated at {repair_token_limit:,} output tokens."
             )
 
-        payload = self._extract_structured_payload(
-            response,
-            _WRITER_PATCH_TOOL["name"],
-            "Writer repair",
-        )
+        payload = self._extract_structured_payload(response, "Writer repair")
         metadata = payload.get("metadata", {})
         edits = payload.get("edits", [])
         if not isinstance(metadata, dict) or not isinstance(edits, list):
@@ -295,6 +299,8 @@ class WriterAgent:
 
         updates = {}
         for key, value in metadata.items():
+            if value is None:
+                continue
             if not isinstance(value, str):
                 raise RuntimeError(f"Writer repair metadata field {key!r} must be a string.")
             if value != getattr(draft, key):
@@ -656,8 +662,12 @@ class WriterAgent:
             model=self.model,
             max_tokens=self.max_tokens,
             system=system_prompt or self._system_prompt(),
-            tools=[_WRITER_OUTPUT_TOOL],
-            tool_choice=self._tool_choice_for(_WRITER_OUTPUT_TOOL["name"]),
+            output_config={
+                "format": {
+                    "type": "json_schema",
+                    "schema": _WRITER_OUTPUT_SCHEMA,
+                }
+            },
             messages=[{"role": "user", "content": user_prompt}],
         ) as stream:
             response = stream.get_final_message()
@@ -669,11 +679,7 @@ class WriterAgent:
                 "Shorten the article requirements or reduce the requested scope."
             )
 
-        payload = self._extract_structured_payload(
-            response,
-            _WRITER_OUTPUT_TOOL["name"],
-            "Writer",
-        )
+        payload = self._extract_structured_payload(response, "Writer")
         payload, support_status_warnings = self._normalize_claim_support_status(payload)
 
         try:
@@ -691,41 +697,32 @@ class WriterAgent:
             }
         )
 
-    def _tool_choice_for(self, tool_name: str) -> dict[str, str]:
-        if getattr(self, "tool_choice", "forced") == "auto":
-            return {"type": "auto"}
-        return {"type": "tool", "name": tool_name}
-
     @staticmethod
     def _extract_structured_payload(
         response: Any,
-        expected_tool_name: str,
         operation: str,
     ) -> dict[str, Any]:
-        if response.stop_reason == "tool_use":
-            return extract_tool_input(response, expected_tool_name)
-        if response.stop_reason == "end_turn":
-            content = getattr(response, "content", [])
-            text = "\n".join(
-                block.text
-                for block in content
-                if getattr(block, "type", None) == "text"
-                and isinstance(getattr(block, "text", None), str)
+        if response.stop_reason != "end_turn":
+            raise RuntimeError(
+                f"{operation} did not complete its structured JSON response "
+                f"(stop reason: {response.stop_reason or 'unknown'})."
             )
-            try:
-                payload = json.loads(text)
-            except json.JSONDecodeError as exc:
-                raise RuntimeError(
-                    f"{operation} returned neither its structured tool response "
-                    "nor valid JSON."
-                ) from exc
-            if isinstance(payload, dict):
-                return payload
-            raise RuntimeError(f"{operation} JSON response must be an object.")
-        raise RuntimeError(
-            f"{operation} did not return its required structured response "
-            f"(stop reason: {response.stop_reason or 'unknown'})."
+
+        text = "\n".join(
+            block.text
+            for block in response.content
+            if getattr(block, "type", None) == "text"
         )
+        if not text:
+            raise RuntimeError(f"{operation} returned no structured JSON text.")
+
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"{operation} returned invalid JSON.") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"{operation} must return a JSON object.")
+        return payload
 
     @staticmethod
     def _normalize_claim_support_status(

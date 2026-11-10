@@ -274,25 +274,6 @@ def _writer_output(
 
 class _FakeMessageStream:
     def __init__(self, response):
-        if response.stop_reason == "end_turn":
-            text_blocks = [
-                block for block in response.content
-                if getattr(block, "type", None) == "text"
-            ]
-            if text_blocks:
-                payload = json.loads("\n".join(block.text for block in text_blocks))
-                is_patch = "metadata" in payload or "edits" in payload
-                response = SimpleNamespace(
-                    stop_reason="tool_use",
-                    content=[
-                        SimpleNamespace(
-                            type="tool_use",
-                            name="submit_writer_patch" if is_patch else "submit_writer_output",
-                            input=payload,
-                        )
-                    ],
-                    usage=getattr(response, "usage", None),
-                )
         self.response = response
 
     def __enter__(self):
@@ -457,7 +438,11 @@ def test_writer_repairs_faq_after_evidence_validation_failure():
         [
             _writer_output(invalid_article).model_dump(mode="json"),
             {
-                "metadata": {},
+                "metadata": {
+                    "title": None,
+                    "seo_title": None,
+                    "meta_description": None,
+                },
                 "edits": [
                     {
                         "old_text": "### What is VR training used for?\n\n",
@@ -845,13 +830,15 @@ def test_writer_uses_one_generation_when_response_fits():
 
     assert result.title == "VR Training for Medical Device Teams"
     assert token_limits == [11000]
-    assert requests[0]["tool_choice"] == {
-        "type": "tool",
-        "name": "submit_writer_output",
-    }
-    assert "sections" not in requests[0]["tools"][0]["input_schema"]["properties"]
-    assert "sections" not in requests[0]["tools"][0]["input_schema"]["required"]
-    assert set(requests[0]["tools"][0]["input_schema"]["required"]) >= {
+    assert "tool_choice" not in requests[0]
+    assert "tools" not in requests[0]
+    output_format = requests[0]["output_config"]["format"]
+    schema = output_format["schema"]
+    assert output_format["type"] == "json_schema"
+    assert '"minimum"' not in json.dumps(schema)
+    assert "sections" not in schema["properties"]
+    assert "sections" not in schema["required"]
+    assert set(schema["required"]) >= {
         "title",
         "article_markdown",
         "word_count",
@@ -865,9 +852,7 @@ def test_writer_uses_one_generation_when_response_fits():
     ]
 
 
-def test_writer_auto_tool_choice_validates_json_text_response():
-    output = _writer_output().model_dump(mode="json")
-    output.pop("sections")
+def test_writer_uses_json_schema_output_instead_of_tool_choice():
     requests = []
 
     class FakeMessages:
@@ -876,12 +861,9 @@ def test_writer_auto_tool_choice_validates_json_text_response():
             requests.append(kwargs)
             response = SimpleNamespace(
                 stop_reason="end_turn",
-                content=[
-                    SimpleNamespace(
-                        type="text",
-                        text=json.dumps(output),
-                    )
-                ],
+                content=[SimpleNamespace(type="text", text=json.dumps(
+                    _writer_output().model_dump(mode="json")
+                ))],
             )
 
             class RawMessageStream:
@@ -900,13 +882,47 @@ def test_writer_auto_tool_choice_validates_json_text_response():
     agent.client = SimpleNamespace(messages=FakeMessages())
     agent.model = "claude-sonnet-5-5"
     agent.max_tokens = 11000
-    agent.tool_choice = "auto"
 
     result = agent._generate_output("Write a blog.")
 
-    assert result.title == output["title"]
-    assert requests[0]["tool_choice"] == {"type": "auto"}
-    assert requests[0]["tools"][0]["name"] == "submit_writer_output"
+    assert result.title == "VR Training for Medical Device Teams"
+    assert "tool_choice" not in requests[0]
+    assert "tools" not in requests[0]
+    assert requests[0]["output_config"]["format"]["type"] == "json_schema"
+    assert "tool_choice" not in requests[0]
+    assert "tools" not in requests[0]
+
+
+@pytest.mark.parametrize(
+    ("stop_reason", "text", "message"),
+    [
+        ("end_turn", "A blog draft", "invalid JSON"),
+        ("end_turn", "[]", "JSON object"),
+        ("tool_use", "{}", "did not complete"),
+    ],
+)
+def test_writer_rejects_responses_that_are_not_structured_json(
+    stop_reason,
+    text,
+    message,
+):
+    class FakeMessages:
+        @staticmethod
+        def stream(**_kwargs):
+            return _FakeMessageStream(
+                SimpleNamespace(
+                    stop_reason=stop_reason,
+                    content=[SimpleNamespace(type="text", text=text)],
+                )
+            )
+
+    agent = WriterAgent.__new__(WriterAgent)
+    agent.client = SimpleNamespace(messages=FakeMessages())
+    agent.model = "claude-sonnet-5-5"
+    agent.max_tokens = 11000
+
+    with pytest.raises(RuntimeError, match=message):
+        agent._generate_output("Write a blog.")
 
 
 def test_writer_targeted_repair_rejects_ambiguous_edit_anchors():
@@ -917,7 +933,11 @@ def test_writer_targeted_repair_rejects_ambiguous_edit_anchors():
                 type="text",
                 text=json.dumps(
                     {
-                        "metadata": {},
+                        "metadata": {
+                            "title": None,
+                            "seo_title": None,
+                            "meta_description": None,
+                        },
                         "edits": [{"old_text": "practice", "new_text": "train"}],
                     }
                 ),
@@ -1165,7 +1185,11 @@ def test_writer_repairs_article_when_table_is_missing():
         [
             _writer_output(article_without_table).model_dump(mode="json"),
             {
-                "metadata": {},
+                "metadata": {
+                    "title": None,
+                    "seo_title": None,
+                    "meta_description": None,
+                },
                 "edits": [
                     {
                         "old_text": "## Frequently Asked Questions",
@@ -1206,6 +1230,15 @@ def test_writer_repairs_article_when_table_is_missing():
     assert result.claims_used[0].evidence_ids == expected_claim.evidence_ids
     assert len(calls) == 2
     assert calls[1]["max_tokens"] == 1000
+    assert "tool_choice" not in calls[1]
+    assert "tools" not in calls[1]
+    patch_format = calls[1]["output_config"]["format"]
+    assert patch_format["type"] == "json_schema"
+    assert patch_format["schema"]["properties"]["metadata"]["required"] == [
+        "title",
+        "seo_title",
+        "meta_description",
+    ]
     assert "at least one useful, valid Markdown table" in calls[1]["messages"][0]["content"]
 
 
@@ -1223,7 +1256,11 @@ def test_writer_combines_seo_and_style_repairs_in_one_retry():
         [
             _writer_output(article_with_issues).model_dump(mode="json"),
             {
-                "metadata": {},
+                "metadata": {
+                    "title": None,
+                    "seo_title": None,
+                    "meta_description": None,
+                },
                 "edits": [
                     {
                         "old_text": "can leverage medical device teams",

@@ -1,4 +1,4 @@
-"""Helpers for presenting generated Markdown articles in the Streamlit UI."""
+"""Helpers for presenting generated Markdown articles."""
 from __future__ import annotations
 
 import re
