@@ -38,17 +38,18 @@ async function api(url, options = {}) {
   return data;
 }
 
-function renderStages(completed = [], activeStage = null) {
+function renderStages(completed = []) {
   const names = stageNames[state.workflow];
   const keys = stageKeys[state.workflow];
   $("#stage-list").innerHTML = names.map((name, index) => {
     const done = Array.isArray(completed) ? completed.includes(keys[index]) : Number(completed) > index;
-    const active = !done && keys[index] === activeStage;
-    return `<li class="stage-item ${done ? "done" : ""} ${active ? "active" : ""}"><span class="stage-node">${done ? "✓" : index + 1}</span><div class="stage-name">${escapeHtml(name)}${active ? "<small>Running now</small>" : ""}</div></li>`;
+    return `<li class="stage-item ${done ? "done" : ""}"><span class="stage-node">${done ? "✓" : index + 1}</span><div class="stage-name">${escapeHtml(name)}</div></li>`;
   }).join("");
 }
 
 function setWorkflow(workflow) {
+  state.working = false;
+  clearTimeout(state.pollTimer);
   state.workflow = workflow;
   state.run = null;
   state.activeTab = "Article";
@@ -147,9 +148,10 @@ function renderArticle() {
   const headings = (markdown.match(/^##\s+.+$/gm) || []).map((heading) => heading.replace(/^##\s+/, ""));
   const articleHtml = state.run.article_html;
   return `<div class="article-layout">
-    <article class="article-content">${articleHtml || parseMarkdown(markdown)}</article>
+    <article class="article-content">${highlightFlags(articleHtml || parseMarkdown(markdown))}</article>
     <aside class="side-panel">
       <h3>Article details</h3>
+      <p><strong>Reading time</strong><br>${Math.max(1, Math.round((output.word_count || 0) / 220))} min</p>
       <p><strong>Words</strong><br>${Number(output.word_count || 0).toLocaleString()}${target ? ` / ${Number(target).toLocaleString()} target` : ""}</p>
       ${primaryKeyword ? `<p><strong>Primary keyword</strong><br>${escapeHtml(primaryKeyword)}</p>` : ""}
       ${seoTitle ? `<p><strong>SEO title</strong><br>${escapeHtml(seoTitle)}</p>` : ""}
@@ -158,6 +160,7 @@ function renderArticle() {
       <p><strong>Approval</strong><br>${approved ? "Approved" : "Draft"}</p>
       ${headings.length ? `<details><summary>Article outline</summary><ul>${headings.map((heading) => `<li>${escapeHtml(heading)}</li>`).join("")}</ul></details>` : ""}
       ${usage.length ? `<details><summary>Claude usage · ${usage.length} call(s)</summary>${usage.map((call) => `<p>${escapeHtml(call.agent_name || "Agent")}<br>${call.input_tokens ?? "?"} input · ${call.output_tokens ?? "?"} output</p>`).join("")}</details>` : ""}
+      <button class="button button-secondary full-width" data-action="copy-md">Copy Markdown</button>
       <button class="button button-secondary full-width" data-action="download-md">Download Markdown</button>
       <button class="button button-secondary full-width" data-action="download-result">Download result JSON</button>
       ${state.workflow === "aimpact" ? `<a class="button button-secondary full-width" href="/api/aimpact/runs/${encodeURIComponent(state.run.run_id)}/article.pdf">Download PDF</a>` : ""}
@@ -306,7 +309,7 @@ async function pollJob(jobId, workflow) {
     try {
       const job = await api(`/api/jobs/${encodeURIComponent(jobId)}`);
       $("#progress-message").textContent = job.message || "Working…";
-      renderStages(job.completed || [], job.active_stage || null);
+      renderStages(job.completed || []);
       if (job.status === "complete") {
         state.working = false;
         if (workflow === "aimpact") applyRun(job.result, workflow);
@@ -386,6 +389,7 @@ async function useAction(action, target) {
   const id = encodeURIComponent(state.run.run_id);
   const prefix = state.workflow === "aimpact" ? `/api/aimpact/runs/${id}` : `/api/general/runs/${id}`;
   let response;
+  if (action === "copy-md") { await navigator.clipboard.writeText(articleMarkdown() || ""); return showNotice("Markdown copied to clipboard."); }
   if (action === "download-md") return downloadText(`${state.workflow}_${state.run.run_id}.md`, articleMarkdown(), "text/markdown");
   if (action === "download-result") return downloadJson(`${state.workflow}_${state.run.run_id}_result.json`, state.run);
   if (action === "download-output") {
@@ -453,3 +457,26 @@ workspace.addEventListener("click", async (event) => {
 });
 setWorkflow("aimpact");
 renderStages([]);
+
+function highlightFlags(html) {
+  return html.replace(/\[VERIFY:([^\]]*)\]/g, '<mark class="flag">[VERIFY:$1]</mark>');
+}
+function showView(view) {
+  const studio = view === "app";
+  $("#landing").hidden = studio;
+  $("#app").hidden = !studio;
+  document.title = studio ? "BlogGen | Studio" : "BlogGen | Evidence-led content studio";
+  history.replaceState(null, "", studio ? "#studio" : location.pathname);
+  window.scrollTo(0, 0);
+}
+document.addEventListener("click", (event) => {
+  const go = event.target.closest("[data-go]");
+  if (!go) return;
+  event.preventDefault();
+  showView(go.dataset.go);
+});
+if ("IntersectionObserver" in window) {
+  const io = new IntersectionObserver((entries) => entries.forEach((e) => { if (e.isIntersecting) { e.target.classList.add("in"); io.unobserve(e.target); } }), { threshold: 0.12 });
+  document.querySelectorAll(".reveal").forEach((el) => io.observe(el));
+} else document.querySelectorAll(".reveal").forEach((el) => el.classList.add("in"));
+showView(location.hash === "#studio" ? "app" : "landing");
