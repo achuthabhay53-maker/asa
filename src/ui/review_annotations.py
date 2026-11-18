@@ -102,6 +102,24 @@ def render_annotated_markdown(
     """Return sanitized article HTML and indexes of findings that could not be anchored."""
     parser = MarkdownIt("default", {"html": False})
     tokens = parser.parse(article)
+    in_references = False
+    reference_number: int | None = None
+    for index, token in enumerate(tokens):
+        if token.type == "heading_open":
+            heading = tokens[index + 1] if index + 1 < len(tokens) else None
+            in_references = bool(
+                heading
+                and heading.type == "inline"
+                and heading.content.strip().casefold() == "references"
+            )
+        elif in_references and token.type == "ordered_list_open":
+            reference_number = int(token.attrGet("start") or 1)
+        elif in_references and reference_number is not None and token.type == "list_item_open":
+            token.attrSet("id", f"reference-{reference_number}")
+            reference_number += 1
+        elif in_references and token.type == "ordered_list_close":
+            reference_number = None
+
     text_tokens: list[Token] = [
         child
         for token in tokens

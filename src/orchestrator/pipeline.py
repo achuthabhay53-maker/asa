@@ -210,6 +210,9 @@ def _build_writer_input(state: PipelineState) -> WriterInput:
                 status=status,
                 evidence_quote=item.quote,
                 source_url=item.url,
+                source_title=item.page_title,
+                source_organization=state.company_name or None,
+                publication_date=item.published.isoformat() if item.published else None,
                 wording_boundary=fact.wording_boundary if fact else None,
             )
         )

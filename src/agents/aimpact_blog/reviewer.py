@@ -92,6 +92,35 @@ class ReviewerAgent:
 
     def review(self, writer_input: WriterInput, draft: WriterOutput) -> ReviewOutput:
         """Review the draft and return findings without changing the article."""
+        cited_evidence_ids = {
+            evidence_id
+            for claim in draft.claims_used
+            for evidence_id in claim.evidence_ids
+        }
+        cited_evidence = [
+            item
+            for item in writer_input.evidence
+            if item.evidence_id in cited_evidence_ids
+        ]
+        evidence_boundaries = {
+            item.wording_boundary
+            for item in cited_evidence
+            if item.wording_boundary
+        }
+        draft_notes = [
+            note
+            for note in draft.unresolved_items
+            if not any(
+                note.endswith(boundary)
+                and note.startswith(
+                    (
+                        "Preserve evidence limitation for claim ",
+                        "Preserve source limitation for numerical claim(s) ",
+                    )
+                )
+                for boundary in evidence_boundaries
+            )
+        ]
         payload = {
             "company_name": writer_input.company_name,
             "company_url": writer_input.company_url,
@@ -120,9 +149,9 @@ class ReviewerAgent:
                     "source_url": item.source_url,
                     "wording_boundary": item.wording_boundary,
                 }
-                for item in writer_input.evidence
+                for item in cited_evidence
             ],
-            "draft_unresolved_items": draft.unresolved_items,
+            "draft_unresolved_items": draft_notes,
             "brief_coverage": draft.brief_coverage,
             "draft": {
                 "title": draft.title,
@@ -430,6 +459,10 @@ industry explanations do not need company evidence.
 Check for generic openings, unsupported vendor claims, repeated paragraph endings,
 awkward headings, and language that conflicts with the writing brief. Treat
 Agent 5's unresolved items as leads for review, not as proof that a claim is wrong.
+Use critical or high severity only for issues that must be fixed before publication.
+Use medium severity for a clear, actionable violation of a stated article requirement.
+Use low severity for optional style preferences or minor improvements. Do not mark
+an item unresolved only because it is a preference or a confirmation request.
 Flag generic openers such as "this guide will explore", inflated wording such as
 "leverage" or "cutting-edge", forbidden filler phrases, more than two em dashes,
 and paragraphs that restate their own point. Do not silently correct any of them.

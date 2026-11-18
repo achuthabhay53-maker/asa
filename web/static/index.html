@@ -1,199 +1,126 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#fbf9f4">
-  <title>BlogGen | Evidence-led content studio</title>
-  <link rel="stylesheet" href="/static/styles.css">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>BlogGen | Evidence-led content studio</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&display=swap">
+<link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
 
-<!-- ============ LANDING ============ -->
-<div id="landing">
-  <header class="l-nav">
-    <a class="brand" href="#" data-go="landing"><span class="brand-mark">B</span><span><strong>BlogGen</strong></span></a>
-    <nav class="l-links"><a href="#how">How it works</a><a href="#features">Features</a><a href="#evidence">Evidence</a></nav>
-    <button class="button button-primary" data-go="app">Open studio <b>→</b></button>
-  </header>
-
+<!-- LANDING -->
+<div id="land">
+  <header class="ln"><button class="brand" onclick="go('land')"><span class="bm">B</span>BlogGen</button>
+    <nav><a href="#how">How it works</a><a href="#feat">Features</a></nav>
+    <div class="r"><button class="btn p" onclick="go('write')">Open studio →</button></div></header>
   <section class="hero">
-    <div class="hero-copy">
-      <span class="pill"><i></i> Evidence-led content studio</span>
-      <h1>Blogs your readers can trust. <em>Every claim sourced.</em></h1>
-      <p>Six AI agents research your topic, build the brief, write the draft and review it. You edit, resolve findings and approve. Nothing ships without you.</p>
-      <div class="hero-cta">
-        <button class="button button-primary big" data-go="app">Start writing <b>→</b></button>
-        <a class="button button-quiet big" href="#how">See how it works</a>
-      </div>
-      <ul class="trust"><li>6 specialised agents</li><li>Source-grounded claims</li><li>Human approval</li><li>PDF &amp; Markdown export</li></ul>
-    </div>
-    <div class="hero-visual" aria-hidden="true">
-      <div class="writer-demo">
-        <div class="writer-head">
-          <span class="writer-avatar">B</span>
-          <span class="writer-identity"><strong>BlogGen writer</strong><small>Evidence-led writing assistant</small></span>
-          <span class="writer-state"><i></i> Example</span>
-        </div>
-        <div class="writer-conversation">
-          <span class="chat-label">YOUR INSTRUCTION</span>
-          <div class="prompt-message">Write a clear, beginner-friendly guide to cell-based assays for biotech teams. Explain what affects reliability and use trustworthy sources.</div>
-          <div class="reply-heading">
-            <span class="writer-avatar reply-avatar">B</span>
-            <strong>Generated answer</strong>
-            <span class="typing-indicator"><i></i><i></i><i></i><small>Writing</small></span>
-            <span class="answer-ready">Ready</span>
-          </div>
-          <article class="answer-card">
-            <h4>How reliable are cell-based assays?</h4>
-            <p>Reliable results start with consistent protocols, healthy cells and suitable controls. Live-cell imaging can add detail over time, while the best method depends on the question being tested <mark class="cite">[1]</mark><mark class="cite">[2]</mark>.</p>
-            <div class="answer-meta"><span>↗ 2 supporting sources</span><span>Draft response</span></div>
-          </article>
-        </div>
-      </div>
-      <div class="float f1">Prompt received</div>
-      <div class="float f2">Answer · sources included</div>
-    </div>
+    <div><span class="pill"><i></i> Evidence-led content studio</span>
+      <h1>Write the prompt. <em>Get a sourced blog.</em></h1>
+      <p class="sub">Tell the agents what you need in plain language. They research, write and review, then hand back a draft with every claim traceable. You approve.</p>
+      <div class="cta"><button class="btn p big" onclick="go('write')">Start writing →</button><button class="btn q big" onclick="document.getElementById('how').scrollIntoView({behavior:'smooth'})">See how it works</button></div></div>
+    <div class="chat"><div class="ct"><i></i><i></i><i></i><b>BlogGen agent</b></div>
+      <div class="cb"><div class="you"><span id="ty"></span><span class="caret" id="cr"></span></div><div class="ags" id="ag"></div>
+        <div class="ans" id="an"><h4>How reliable are cell-based assays?</h4><p id="se"></p><div class="af"><span>812 words · 4 min</span><span class="badge a">1 flag</span><span class="badge g">✓ Reviewed</span></div></div></div></div>
   </section>
-
-  <section class="l-section reveal" id="how">
-    <div class="l-head"><span class="eyebrow">HOW IT WORKS</span><h2>From brief to approved article in six steps</h2></div>
-    <div class="steps">
-      <article><b>01</b><h3>Prompt intelligence</h3><p>Understands the prompt, audience and search intent.</p></article>
-      <article><b>02</b><h3>Source intelligence</h3><p>Finds and reads the most relevant sources.</p></article>
-      <article><b>03</b><h3>Ground truth</h3><p>Extracts verified facts the writer may rely on.</p></article>
-      <article><b>04</b><h3>Content brief</h3><p>Shapes outline, keywords and angle.</p></article>
-      <article><b>05</b><h3>Blog writer</h3><p>Drafts the article using only grounded evidence.</p></article>
-      <article><b>06</b><h3>Reviewer</h3><p>Flags weak claims, gaps and risks by severity.</p></article>
-    </div>
-  </section>
-
-  <section class="l-section reveal" id="features">
-    <div class="l-head"><span class="eyebrow">FEATURES</span><h2>Built for editors, not just prompts</h2></div>
-    <div class="features">
-      <article><span>◎</span><h3>Source-backed claims</h3><p>Every claim traces to evidence you can open and check.</p></article>
-      <article><span>⚑</span><h3>Severity-rated review</h3><p>Findings come as critical, high, medium or low with a clear fix.</p></article>
-      <article><span>✎</span><h3>Edit and revise</h3><p>Edit Markdown yourself or ask the writer agent to revise.</p></article>
-      <article><span>⟲</span><h3>Version history</h3><p>Every change is a new version. Restore any earlier draft.</p></article>
-      <article><span>✓</span><h3>Approval checklist</h3><p>Approve only when the review is current and findings are decided.</p></article>
-      <article><span>⇩</span><h3>Export anywhere</h3><p>Download Markdown, PDF or the full run as JSON.</p></article>
-    </div>
-  </section>
-
-  <section class="l-section split reveal" id="evidence">
-    <div>
-      <span class="eyebrow">EVIDENCE FIRST</span>
-      <h2>See exactly what the AI relied on</h2>
-      <p class="lead">Unverified claims are marked in the text, not hidden. You see the flag, the reviewer's recommendation and the source, then decide.</p>
-      <ul class="ticks"><li>Inline <mark class="cite">[VERIFY]</mark> flags in amber</li><li>Per-agent outputs you can inspect and download</li><li>Token usage per call for cost visibility</li></ul>
-    </div>
-    <div class="mock small">
-      <div class="mock-find"><span class="severity high">high</span><div><strong>Claim has no source</strong><small>"Results improve by 40%" needs evidence.</small></div></div>
-      <div class="mock-find"><span class="severity low">low</span><div><strong>Tone drifts in section 3</strong><small>Match the brief's clear, warm voice.</small></div></div>
-      <div class="mock-foot"><span>Decision</span><span class="ok">Resolved ▾</span></div>
-    </div>
-  </section>
-
-  <section class="cta reveal">
-    <h2>Ready to publish with confidence?</h2>
-    <p>Open the studio and generate your first sourced, reviewed article.</p>
-    <button class="button big cta-btn" data-go="app">Open studio <b>→</b></button>
-  </section>
-  <footer class="l-footer"><span>© BlogGen Content Studio</span><span>Research carefully. Write clearly.</span></footer>
+  <section class="lsec" id="how"><div class="eyebrow">HOW IT WORKS</div><h2>From brief to approved article</h2>
+    <div class="g3"><article><b>1</b><h3>Brief</h3><p>Describe the topic, audience and tone, or pull a campaign prompt from AImpact.</p></article>
+    <article><b>2</b><h3>Research and write</h3><p>Six agents find sources, extract facts, outline and draft the article.</p></article>
+    <article><b>3</b><h3>Review and approve</h3><p>Resolve flagged claims, edit, then approve and export as Markdown or PDF.</p></article></div></section>
+  <section class="lsec" id="feat" style="padding-top:20px"><div class="eyebrow">FEATURES</div><h2>Built for editors, not just prompts</h2>
+    <div class="g3"><article><b>◎</b><h3>Source-backed claims</h3><p>Every claim traces to evidence you can open and check.</p></article>
+    <article><b>⚑</b><h3>Severity-rated review</h3><p>Findings are graded critical to low, each with a suggested fix.</p></article>
+    <article><b>⟲</b><h3>Version history</h3><p>Every edit is a new version. Restore any earlier draft.</p></article></div></section>
+  <section class="band"><h2>Ready to publish with confidence?</h2><p>Create your first sourced, reviewed article in minutes.</p><button class="btn big" style="background:var(--lime);color:var(--bd)" onclick="go('write')">Open studio →</button></section>
+  <footer class="lf"><span>© BlogGen Content Studio</span><span>Research carefully. Write clearly.</span></footer>
 </div>
 
-<!-- ============ STUDIO ============ -->
-<div id="app" hidden>
-  <div class="app-shell">
-    <aside class="sidebar">
-      <a class="brand" href="#" data-go="landing" aria-label="BlogGen home"><span class="brand-mark">B</span><span><strong>BlogGen</strong><small>Content studio</small></span></a>
-      <div class="sidebar-label">WORKSPACE</div>
-      <button class="workflow-link active" data-workflow="aimpact"><span class="nav-icon">✳</span><span><strong>Campaign blog</strong><small>Research to review</small></span></button>
-      <button class="workflow-link" data-workflow="general"><span class="nav-icon">✎</span><span><strong>General blog</strong><small>Start with your brief</small></span></button>
-      <button class="workflow-link home-link" data-go="landing"><span class="nav-icon">⌂</span><span><strong>Back to home</strong><small>Overview</small></span></button>
-      <div class="sidebar-note"><span class="status-dot"></span><span><strong>Evidence-led writing</strong><small>Research, draft, review, approve.</small></span></div>
-    </aside>
+<!-- APP -->
+<div class="shell" id="shell" hidden>
+  <aside class="sb">
+    <button class="brand" data-go="land"><span class="bm">B</span><span>BlogGen</span></button>
+    <button class="nv" data-p="write"><span>✎</span>Write a blog</button>
+    <button class="nv" data-p="runs"><span>☰</span>Saved runs</button>
+    <div class="umw"><button class="me" id="ub" aria-haspopup="true" aria-expanded="false" aria-label="Account menu"><span class="av" id="av-s">A</span></button>
+      <div class="um" id="um" hidden><div class="uh"><b id="um-name">Your account</b><small id="um-mail">Set up your profile</small></div>
+        <button class="mi" data-p="write">✎ Write a blog</button><button class="mi" data-p="runs">☰ Saved runs</button><button class="mi" data-p="profile">◉ Your profile</button><button class="mi" data-p="settings">⚙ Settings</button><button class="mi sep" data-go="land">⌂ Home page</button></div></div>
+  </aside>
+  <main class="mn">
+    <header class="tb" hidden><div><div class="eyebrow" id="eb"></div><h1 id="page-title"></h1><p id="page-subtitle"></p></div></header>
 
-    <main class="main-content">
-      <header class="topbar">
-        <div>
-          <div class="eyebrow">YOUR EDITORIAL WORKSPACE</div>
-          <h1 id="page-title">Campaign blog</h1>
-          <p id="page-subtitle">Turn a campaign prompt into a sourced, reviewed article.</p>
-        </div>
-        <div class="topbar-actions">
-          <span class="connection"><i></i> Connected</span>
-          <button id="new-run" class="button button-quiet" type="button">New brief <span>＋</span></button>
-        </div>
-      </header>
-
-      <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
-      <div id="workspace">
-        <div class="workspace-grid">
-          <section class="form-card">
-            <div class="section-heading">
-              <div><span class="eyebrow">START A WORKFLOW</span><h2 id="form-title">Build a campaign blog</h2></div>
-              <span class="step-tag">01 <span>/</span> 02</span>
-            </div>
-
-            <form id="aimpact-form" class="workflow-form">
-              <label>Campaign ID<input name="campaign_id" type="number" min="1" placeholder="e.g. 81" required></label>
-              <label>Prompt ID<input name="prompt_id" placeholder="e.g. 1409" required></label>
-              <label>Company website<input name="website" type="url" placeholder="https://example.com" required></label>
-              <label>Company name <span class="optional">Optional</span><input name="company_name" placeholder="Leave blank to infer from the prompt"></label>
-              <div class="input-row">
-                <label>Research sources<input name="top_n" type="number" min="1" max="20" value="5" required></label>
-                <label>Target words<input name="target_word_count" type="number" min="500" max="5000" step="100" value="800" required></label>
-              </div>
-              <button class="button button-primary full-width" type="submit"><span>Start research and writing</span><b>→</b></button>
-            </form>
-
-            <details class="resume-box">
-              <summary>Continue a saved campaign run</summary>
-              <div class="resume-row">
-                <input id="resume-id" placeholder="Paste workflow run ID">
-                <button id="resume-button" class="button button-secondary" type="button">Open run</button>
-              </div>
-            </details>
-
-            <form id="general-form" class="workflow-form" hidden>
-              <label>Company name<input name="company_name" placeholder="Example, Inc." required></label>
-              <label>Company website<input name="company_website" type="url" placeholder="https://example.com" required></label>
-              <label>Blog topic or instructions<textarea name="prompt" rows="4" placeholder="What should this article help the reader understand?" required></textarea></label>
-              <label>Target audience <span class="optional">Optional</span><input name="target_audience" placeholder="Who is this article for?"></label>
-              <label>Tone or style <span class="optional">Optional</span><input name="tone" placeholder="Clear, warm, and authoritative"></label>
-              <label>Target keywords <span class="optional">Optional</span><textarea name="target_keywords" rows="2" placeholder="keyword one, keyword two"></textarea><small>Use commas or new lines. The first term is primary.</small></label>
-              <details class="reference-fields">
-                <summary>Add research references <span class="optional">Optional</span></summary>
-                <label>Reference URLs<textarea name="reference_urls" rows="3" placeholder="One URL per line"></textarea></label>
-                <label>Research PDFs <span class="optional">Up to 5 · 15 MB each</span><input name="reference_pdfs" type="file" accept=".pdf,application/pdf" multiple></label>
-              </details>
-              <label>Target words <span class="optional">Optional</span><input name="target_word_count" type="number" min="1" max="10000" placeholder="Let the writer choose"></label>
-              <button class="button button-primary full-width" type="submit"><span>Research and create blog</span><b>→</b></button>
-            </form>
-          </section>
-
-          <section class="result-card">
-            <div class="result-heading">
-              <div><span class="eyebrow">WORKFLOW STATUS</span><h2 id="result-title">Your next story starts here</h2></div>
-              <span id="run-state" class="state-chip idle"><i></i><span>Ready</span></span>
-            </div>
-            <ol id="stage-list" class="stage-list"></ol>
-            <div id="result-content" class="empty-result">
-              <div class="empty-art"><span>✦</span><i></i><b></b></div>
-              <h3>Ready when you are</h3>
-              <p>Complete the form to start a new workflow. Your progress and results will appear here.</p>
-            </div>
-            <div id="result-tabs" class="result-tabs" hidden></div>
-            <div id="result-view" class="result-view" hidden></div>
-          </section>
-        </div>
-        <footer class="footer"><span>BlogGen Content Studio</span><span>Research carefully. Write clearly.</span></footer>
+    <section class="pg" id="pg-write">
+      <div class="grid">
+        <section class="card">
+          <div class="mm"><span class="badge b" id="mode-badge">General mode</span><button type="button" class="lk" data-p="settings">Change mode</button></div>
+          <form class="form" id="general-form" hidden>
+            <div><h2>Build a general blog</h2><p class="hint">Tell us about the company and what the article should cover.</p></div>
+            <label class="f">Company name<input name="company_name" placeholder="Example, Inc." required></label>
+            <label class="f">Company website<input name="company_website" type="url" placeholder="https://example.com" required></label>
+            <label class="f">Blog topic or instructions<textarea name="prompt" rows="4" placeholder="What should this article help the reader understand?" required></textarea></label>
+            <div class="r2"><label class="f">Target audience <span class="opt">Optional</span><input name="target_audience" placeholder="Who is this for?"></label><label class="f">Tone <span class="opt">Optional</span><input name="tone" id="g-tone" placeholder="Clear, warm"></label></div>
+            <label class="f">Target keywords <span class="opt">Optional</span><textarea name="target_keywords" rows="2" placeholder="keyword one, keyword two"></textarea><small>Use commas or new lines. The first term is primary.</small></label>
+            <details><summary>Add research references <span class="opt">Optional</span></summary><label class="f">Reference URLs<textarea name="reference_urls" rows="3" placeholder="One URL per line"></textarea></label><label class="f">Research PDFs <span class="opt">Up to 5 · 15 MB each</span><input name="reference_pdfs" type="file" accept=".pdf,application/pdf" multiple></label></details>
+            <label class="f">Target words <span class="opt">Optional</span><input name="target_word_count" id="g-words" type="number" min="1" max="10000" placeholder="Let the writer choose"></label>
+            <button class="btn p full" type="submit">Research and create blog →</button>
+          </form>
+          <form class="form" id="aimpact-form">
+            <div><h2>Build a campaign blog</h2><p class="hint">Research comes from your AImpact project.</p></div>
+            <div class="r2"><label class="f">Campaign ID<input name="campaign_id" type="number" min="1" placeholder="e.g. 81" required></label><label class="f">Prompt ID<input name="prompt_id" placeholder="e.g. 1409" required></label></div>
+            <label class="f">Company website<input name="website" type="url" placeholder="https://example.com" required></label>
+            <label class="f">Company name <span class="opt">Optional</span><input name="company_name" placeholder="Leave blank to infer from the prompt"></label>
+            <div class="r2"><label class="f">Research sources<input name="top_n" type="number" min="1" max="20" value="5" required></label><label class="f">Target words<input name="target_word_count" id="a-words" type="number" min="500" max="5000" step="100" value="800" required></label></div>
+            <button class="btn p full" type="submit">Start research and writing →</button>
+            <details><summary>Continue a saved campaign run</summary><div class="resume"><input id="resume-id" placeholder="Paste workflow run ID"><button class="btn s" id="resume-button" type="button">Open run</button></div></details>
+          </form>
+        </section>
+        <section class="card">
+          <div class="rh"><div><div class="eyebrow">WORKFLOW STATUS</div><h2 id="result-title">Your next story starts here</h2></div><div class="rh-r"><span id="run-state" class="state-chip idle"><i></i><span>Ready</span></span><button class="btn q" id="new-run" type="button">New brief ＋</button></div></div>
+          <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+          <div class="stg" id="stage-list"></div>
+          <div id="result-content" class="empty"></div>
+          <div id="result-tabs" class="result-tabs" hidden></div>
+          <div id="result-view" class="result-view" hidden></div>
+        </section>
       </div>
-    </main>
-  </div>
+    </section>
+
+    <section class="pg" id="pg-runs" hidden>
+      <div class="card"><h2>Open a saved run</h2><p class="hint">Paste a run ID to reopen its article, review and approval.</p>
+        <div class="resume"><select id="resume-wf" aria-label="Run type"><option value="aimpact">Campaign</option><option value="general">General</option></select><input id="resume-id2" placeholder="Paste workflow run ID"><button class="btn s" id="resume-button2" type="button">Open run</button></div></div>
+      <div class="card" style="margin-top:16px"><h2>Recent runs</h2><p class="hint">Articles you generated in this browser.</p><div id="recent"></div></div>
+    </section>
+
+    <section class="pg" id="pg-profile" hidden>
+      <div class="pf">
+        <div class="card pc"><span class="av xl" id="pf-av">A</span><h2 id="pf-name">Your name</h2><p id="pf-sub">Add your details</p>
+          <div class="kv"><div><span>Saved runs</span><b id="pf-count">0</b></div></div></div>
+        <div class="card"><h2>Personal details</h2><p class="hint">Stored in this browser only.</p>
+          <form class="form" id="profile-form"><div class="r2"><label class="f">First name<input id="pf-first"></label><label class="f">Last name<input id="pf-last"></label></div>
+          <label class="f">Email<input type="email" id="pf-email"></label><div class="r2"><label class="f">Role<input id="pf-role"></label><label class="f">Company<input id="pf-company"></label></div>
+          <label class="f">Bio <span class="opt">Optional</span><textarea rows="3" id="pf-bio" placeholder="A line about you"></textarea></label>
+          <div><button class="btn p" type="submit">Save changes</button></div></form></div>
+      </div>
+    </section>
+
+    <section class="pg" id="pg-settings" hidden>
+      <div class="st">
+        <div class="card"><h2>Writing mode</h2><p class="hint">Choose how the Write page works. You can switch any time.</p>
+          <div class="opts"><button class="opt2 on" id="o-general" data-mode="general"><span class="ic2">✎</span><span><b>General mode</b><small>Fill in a short brief for any topic. No project needed.</small></span><span class="ck2">✓</span></button>
+          <button class="opt2" id="o-campaign" data-mode="aimpact"><span class="ic2">✳</span><span><b>Campaign mode</b><small>Turn an AImpact prompt result into a sourced article.</small></span><span class="ck2">✓</span></button></div></div>
+        <div class="card"><h2>Writing defaults</h2><p class="hint">Pre-filled on new briefs.</p>
+          <div class="row"><div><b>Default length</b><small>Target words per article.</small></div><input type="number" id="set-words" min="100" max="5000" placeholder="800"></div>
+          <div class="row"><div><b>Default tone</b><small>Pre-fills the General blog tone.</small></div><input type="text" id="set-tone" placeholder="Clear, warm"></div></div>
+        <div class="card"><h2>Workflow server</h2><p class="hint">The Python service that runs the agents.</p>
+          <div class="row"><div><b>Status</b><small id="srv-status">Checking…</small></div><button class="btn q" id="srv-check" type="button">Check again</button></div></div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap"><button class="btn p" id="save-settings" type="button">Save settings</button><button class="btn d" id="clear-data" type="button">Clear saved data</button></div>
+      </div>
+    </section>
+  </main>
 </div>
+<div class="toast" id="toast" role="status"></div>
 
 <script src="/static/app.js" defer></script>
 </body>
 </html>
+
+

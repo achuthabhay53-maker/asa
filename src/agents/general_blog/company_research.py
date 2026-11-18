@@ -81,6 +81,7 @@ class CompanyWebsiteResearchAgent:
                     title=page.title or item.title,
                     text=page.text[:MAX_SOURCE_CHARS],
                     publication_date=item.published,
+                    organization=request.company_name,
                 )
                 if len(pages) >= MAX_COMPANY_PAGES:
                     break

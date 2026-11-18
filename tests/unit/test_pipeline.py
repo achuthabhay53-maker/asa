@@ -3,7 +3,7 @@ from contextlib import contextmanager
 from langgraph.checkpoint.memory import MemorySaver
 
 from src.models.content_brief import BriefSection, ContentBrief
-from src.models.ground_truth import ClientInput, GroundTruthGuide
+from src.models.ground_truth import ClientInput, EvidenceItem, GroundTruthGuide
 from src.models.prompt_intelligence import (
     AnswerUnderstanding,
     PromptAnalysis,
@@ -132,7 +132,18 @@ def test_pipeline_passes_brief_seo_research_and_faqs_to_writer():
             answer_understanding=AnswerUnderstanding(summary=""),
             customer_visibility={},
         ),
-        guide=GroundTruthGuide(main_topic="immersive training"),
+        guide=GroundTruthGuide(
+            main_topic="immersive training",
+            evidence=[
+                EvidenceItem(
+                    evidence_id="ev-001",
+                    url="https://example.com/atlas-panel",
+                    quote="The panel quantifies 120 immune-related proteins.",
+                    page_title="Atlas Panel Specifications",
+                    published="2025-01-15",
+                )
+            ],
+        ),
         content_brief=ContentBrief(
             recommended_title="Immersive Training",
             primary_keyword="immersive training",
@@ -179,6 +190,9 @@ def test_pipeline_passes_brief_seo_research_and_faqs_to_writer():
     assert section.evidence_ids == ["ev-001"]
     assert section.guidelines == ["Do not claim measured outcomes without evidence."]
     assert writer_input.target_word_count == 1200
+    assert writer_input.evidence[0].source_title == "Atlas Panel Specifications"
+    assert writer_input.evidence[0].source_url == "https://example.com/atlas-panel"
+    assert writer_input.evidence[0].publication_date == "2025-01-15"
     assert [faq["question"] for faq in writer_input.faqs] == [
         "What is immersive training?",
         "How is procedural simulation used?",

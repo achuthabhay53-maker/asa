@@ -24,6 +24,7 @@ from src.observability.token_usage import (
     take_run_token_usage,
     token_usage_scope,
 )
+from src.utils.general_blog_human import review_passed
 from src.utils.output_storage import save_general_blog_stage_output
 from src.tools.reference_fetcher import MAX_UPLOADED_PDFS
 
@@ -235,10 +236,10 @@ class GeneralBlogWorkflow:
             )
             review_cycles += 1
 
-        quality_passed = not self._needs_revision(review)
+        quality_passed = review_passed(review)
         if not quality_passed:
             warnings.append(
-                "The draft still has blocking review findings after "
+                "The review still has unresolved items or blocking findings after "
                 f"{review_cycles} review cycle(s); human review is required."
             )
             logger.warning(
@@ -292,11 +293,18 @@ class GeneralBlogWorkflow:
         self._notify(stage, label, "running", f"{label} is running", total_stages)
         records: list[ClaudeTokenUsage] = []
         started_at = perf_counter()
+        logger.info(
+            "General Blog stage started (run_id=%s, stage=%s, agent=%s)",
+            self.run_id,
+            stage,
+            agent_name,
+        )
         try:
             with token_usage_scope(self.run_id, agent_name) as records:
                 result = operation()
         except Exception as exc:
             self._token_usage.extend(records)
+            duration_seconds = perf_counter() - started_at
             save_general_blog_stage_output(
                 self.run_id,
                 debug_stage,
@@ -311,13 +319,17 @@ class GeneralBlogWorkflow:
                         "message": str(exc),
                     },
                     "token_usage": records,
-                    "duration_seconds": round(perf_counter() - started_at, 3),
+                    "duration_seconds": round(duration_seconds, 3),
                 },
             )
             logger.exception(
-                "General Blog stage failed (run_id=%s, stage=%s, error_type=%s)",
+                "General Blog stage failed (run_id=%s, stage=%s, agent=%s, "
+                "duration_seconds=%.3f, claude_calls=%d, error_type=%s)",
                 self.run_id,
                 stage,
+                agent_name,
+                duration_seconds,
+                len(records),
                 type(exc).__name__,
             )
             self._notify(
@@ -336,6 +348,7 @@ class GeneralBlogWorkflow:
                 usage,
             ) from exc
         self._token_usage.extend(records)
+        duration_seconds = perf_counter() - started_at
         save_general_blog_stage_output(
             self.run_id,
             debug_stage,
@@ -347,15 +360,22 @@ class GeneralBlogWorkflow:
                 "input": debug_input,
                 "output": result,
                 "token_usage": records,
-                "duration_seconds": round(perf_counter() - started_at, 3),
+                "duration_seconds": round(duration_seconds, 3),
             },
         )
         self._mark_done(stage, label, total_stages)
         logger.info(
-            "General Blog stage complete (run_id=%s, stage=%s, claude_calls=%d)",
+            "General Blog stage complete (run_id=%s, stage=%s, agent=%s, "
+            "duration_seconds=%.3f, claude_calls=%d, input_tokens=%d, output_tokens=%d, "
+            "usage_missing=%d)",
             self.run_id,
             stage,
+            agent_name,
+            duration_seconds,
             len(records),
+            sum(record.input_tokens for record in records if record.usage_available),
+            sum(record.output_tokens for record in records if record.usage_available),
+            sum(not record.usage_available for record in records),
         )
         return result
 
@@ -365,6 +385,12 @@ class GeneralBlogWorkflow:
         debug_input: dict[str, object],
         reason: str,
     ) -> None:
+        logger.info(
+            "General Blog stage skipped (run_id=%s, stage=%s, status=skipped, reason=%s)",
+            self.run_id,
+            debug_stage,
+            reason,
+        )
         save_general_blog_stage_output(
             self.run_id,
             debug_stage,
@@ -397,6 +423,12 @@ class GeneralBlogWorkflow:
         total_stages: int,
     ) -> None:
         self._completed_stages.add(stage)
+        logger.info(
+            "General Blog stage skipped (run_id=%s, stage=%s, message=%s)",
+            self.run_id,
+            stage,
+            message,
+        )
         self._notify(stage, label, "skipped", message, total_stages)
 
     def _notify(
@@ -423,10 +455,8 @@ class GeneralBlogWorkflow:
 
     @staticmethod
     def _needs_revision(review) -> bool:
-        if review.unresolved_items:
-            return True
         return any(
-            finding.severity in {"critical", "high"}
+            finding.severity in {"critical", "high", "medium"}
             or finding.area == "factual_claims"
             for finding in review.findings
         )

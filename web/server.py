@@ -43,6 +43,10 @@ from src.utils.output_storage import (
     save_agent_output,
 )
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
 logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
 STATIC_DIR = ROOT / "web" / "static"

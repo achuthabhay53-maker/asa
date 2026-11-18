@@ -10,6 +10,7 @@ import json
 import os
 import re
 from typing import Any
+from urllib.parse import quote, urlsplit
 
 import anthropic
 from pydantic import ValidationError
@@ -24,6 +25,9 @@ from src.utils.structured_output import model_input_schema
 _WRITER_OUTPUT_SCHEMA = model_input_schema(WriterOutput)
 _WRITER_OUTPUT_SCHEMA["properties"].pop("sections")
 _WRITER_OUTPUT_SCHEMA["required"].remove("sections")
+_claim_schema = _WRITER_OUTPUT_SCHEMA["properties"]["claims_used"]["items"]
+for _field in ("source_urls", "supporting_evidence", "validation_notes"):
+    _claim_schema["properties"].pop(_field, None)
 
 
 # Anthropic rejects "minimum"; Pydantic still validates the parsed response.
@@ -117,7 +121,7 @@ class WriterAgent:
             self._validate_seo_requirements(result, writer_input)
             seo_repaired = True
 
-        # Style lint runs on the model's own text, before code appends [VERIFY] notes.
+        # Style lint runs on the model's prose before code adds reference metadata.
         result, style_notes = self._enforce_style(
             result,
             writer_input,
@@ -131,6 +135,7 @@ class WriterAgent:
             result = result.model_copy(
                 update={"unresolved_items": list(dict.fromkeys([*result.unresolved_items, *style_notes]))}
             )
+        result = self._append_references(result, writer_input.evidence)
         return result
 
     def revise(
@@ -155,7 +160,7 @@ class WriterAgent:
                 "unsupported_claims_to_avoid": writer_input.unsupported_claims_to_avoid,
                 "evidence": [
                     item.model_dump(mode="json", exclude_none=True)
-                    for item in writer_input.evidence
+                    for item in self._evidence_for_draft(writer_input, draft)
                 ],
             },
             "current_draft": {
@@ -194,8 +199,24 @@ class WriterAgent:
             seo_title=result.seo_title,
             meta_description=result.meta_description,
         )
-        issues = seo_issues + [f"Style: {issue}" for issue in style_issues]
-        style_notes = []
+        existing_style_issues = set(
+            lint_article(
+                draft.article_markdown,
+                title=draft.title,
+                seo_title=draft.seo_title,
+                meta_description=draft.meta_description,
+            )
+        )
+        new_style_issues = [
+            issue for issue in style_issues if issue not in existing_style_issues
+        ]
+        actionable_style_issues = self._actionable_style_issues(new_style_issues)
+        issues = seo_issues + [f"Style: {issue}" for issue in actionable_style_issues]
+        style_notes = [
+            f"Style check: {issue}"
+            for issue in new_style_issues
+            if issue not in actionable_style_issues
+        ]
         if issues:
             repair_prompt = self._build_repair_prompt(result, issues)
             result = self._generate_targeted_update(result, repair_prompt)
@@ -208,7 +229,12 @@ class WriterAgent:
                 seo_title=result.seo_title,
                 meta_description=result.meta_description,
             )
-            style_notes = [f"Style check: {issue}" for issue in remaining]
+            style_notes = [
+                f"Style check: {issue}"
+                for issue in [*remaining, *new_style_issues]
+                if issue not in existing_style_issues
+            ]
+            style_notes = list(dict.fromkeys(style_notes))
 
         result = self._attach_supporting_evidence(result, writer_input.evidence)
         result = self._flag_unsupported_numeric_claims(result, writer_input.evidence)
@@ -217,7 +243,234 @@ class WriterAgent:
             result = result.model_copy(
                 update={"unresolved_items": list(dict.fromkeys([*result.unresolved_items, *style_notes]))}
             )
+        result = self._append_references(result, writer_input.evidence)
         return result
+
+    @staticmethod
+    def _evidence_for_draft(
+        writer_input: WriterInput,
+        draft: WriterOutput,
+    ) -> list[WriterEvidence]:
+        """Return evidence that supports claims already present in the draft."""
+        evidence_ids = {
+            evidence_id
+            for claim in draft.claims_used
+            for evidence_id in claim.evidence_ids
+        }
+        if not evidence_ids:
+            evidence_ids = {
+                evidence_id
+                for section in writer_input.sections
+                for evidence_id in section.evidence_ids
+            }
+        if not evidence_ids:
+            return writer_input.evidence
+        return [
+            item for item in writer_input.evidence if item.evidence_id in evidence_ids
+        ]
+
+    @staticmethod
+    def _append_references(
+        result: WriterOutput,
+        evidence: list[WriterEvidence],
+    ) -> WriterOutput:
+        """Convert evidence-ID citations and append linked references after the FAQs."""
+        references_heading = re.compile(r"(?im)^##\s+References\s*$")
+        existing_references = references_heading.search(result.article_markdown)
+        article = (
+            result.article_markdown[:existing_references.start()].rstrip()
+            if existing_references
+            else result.article_markdown.rstrip()
+        )
+        url_link_pattern = re.compile(
+            r"\[(?P<label>[^\]]*)\]\(\s*<?https?://[^)\s>]+>?\s*\)",
+            re.IGNORECASE,
+        )
+        article, linked_url_count = url_link_pattern.subn(
+            lambda match: match.group("label"),
+            article,
+        )
+        bare_url_pattern = re.compile(r"https?://[^\s<>()\]]+", re.IGNORECASE)
+
+        def remove_bare_url(match: re.Match[str]) -> str:
+            url = match.group(0)
+            trailing = ""
+            while url and url[-1] in ".,;:!?":
+                trailing = url[-1] + trailing
+                url = url[:-1]
+            return trailing
+
+        article, bare_url_count = bare_url_pattern.subn(remove_bare_url, article)
+        unresolved = list(result.unresolved_items)
+        if linked_url_count or bare_url_count:
+            warning = (
+                "Writer included source URLs in article text; the URLs were removed. "
+                "Use numbered citations and the References section."
+            )
+            if warning not in unresolved:
+                unresolved.append(warning)
+        citation_pattern = re.compile(
+            r"\[(?P<token>ev[_-][A-Za-z0-9_-]+|\d+(?:\s*,\s*\d+)*)\]"
+        )
+        inline_ids = [
+            evidence_id
+            for match in citation_pattern.finditer(article)
+            for evidence_id in match.group("token").split(",")
+            if evidence_id.startswith(("ev_", "ev-"))
+        ]
+        requested_ids = {
+            evidence_id
+            for claim in result.claims_used
+            for evidence_id in claim.evidence_ids
+        } | set(inline_ids)
+        evidence_by_id = {item.evidence_id: item for item in evidence}
+        ordered_ids = [
+            item.evidence_id
+            for item in evidence
+            if item.evidence_id in requested_ids
+        ]
+        ordered_ids.extend(
+            evidence_id
+            for evidence_id in [*inline_ids, *(id for claim in result.claims_used for id in claim.evidence_ids)]
+            if evidence_id not in evidence_by_id and evidence_id not in ordered_ids
+        )
+
+        reference_numbers: dict[str, int] = {}
+        references: list[str] = []
+        number_by_source: dict[str, int] = {}
+        citation_number = 0
+        for evidence_id in ordered_ids:
+            item = evidence_by_id.get(evidence_id)
+            if item is None:
+                warning = f"Writer cited unknown evidence ID {evidence_id!r}; the citation was removed."
+                if warning not in unresolved:
+                    unresolved.append(warning)
+                continue
+
+            source_url = canonicalize_evidence_url(item.source_url or "")
+            doi = (item.doi or "").strip()
+            doi = re.sub(
+                r"^(?:https?://(?:dx\.)?doi\.org/|doi:\s*)",
+                "",
+                doi,
+                flags=re.IGNORECASE,
+            ).rstrip(".,;")
+            doi_url = (
+                f"https://doi.org/{quote(doi, safe='/-._;()')}"
+                if doi
+                else ""
+            )
+            source_url = source_url or canonicalize_evidence_url(doi_url)
+            source_title = " ".join((item.source_title or "").split())
+            if not source_title and not source_url:
+                warning = (
+                    f"Evidence {evidence_id!r} has no source title or valid URL "
+                    "and cannot be included in References."
+                )
+                if warning not in unresolved:
+                    unresolved.append(warning)
+                continue
+            if not source_url:
+                warning = (
+                    f"Reference {evidence_id!r} has no valid source URL or DOI "
+                    "and cannot be linked."
+                )
+                if warning not in unresolved:
+                    unresolved.append(warning)
+
+            source_key = (
+                doi.casefold()
+                or source_url
+                or f"{source_title.casefold()}|{(item.source_author or item.source_organization or '').casefold()}"
+            )
+            if source_key in number_by_source:
+                number = number_by_source[source_key]
+                reference_numbers[evidence_id] = number
+                continue
+
+            citation_number += 1
+            number_by_source[source_key] = citation_number
+            reference_numbers[evidence_id] = citation_number
+            author = " ".join((item.source_author or "").split())
+            organization = " ".join((item.source_organization or "").split())
+            creator = author or organization
+            journal = " ".join((item.journal or "").split())
+            label_parts = [value for value in (creator, source_title, journal) if value]
+            label = ". ".join(label_parts) or urlsplit(source_url).hostname or "Source"
+            escaped_label = label.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+            if source_url:
+                destination = quote(source_url, safe=":/?#@!$&'*+,;=%-._~")
+                rendered_label = f"[{escaped_label}]({destination})"
+            else:
+                rendered_label = escaped_label
+            year_match = re.search(r"\b(?:19|20)\d{2}\b", item.publication_date or "")
+            year = f" ({year_match.group()})" if year_match else ""
+            doi_label = f" DOI: {doi}." if doi else ""
+            references.append(
+                f"{citation_number}. {rendered_label}{year}.{doi_label}"
+            )
+
+        def render_citation_group(matches: list[re.Match[str]]) -> str:
+            numbers = []
+            for match in matches:
+                for token in match.group("token").split(","):
+                    token = token.strip()
+                    if token.startswith(("ev_", "ev-")):
+                        number = reference_numbers.get(token)
+                        if number is None:
+                            continue
+                    else:
+                        number = int(token)
+                        if number < 1 or number > citation_number:
+                            warning = (
+                                f"Writer used numeric citation [{number}], but only "
+                                f"{citation_number} references were generated; the citation was removed."
+                            )
+                            if warning not in unresolved:
+                                unresolved.append(warning)
+                            continue
+                    if number not in numbers:
+                        numbers.append(number)
+
+            rendered = []
+            for number in numbers:
+                rendered.append(f"[\\[{number}\\]](#reference-{number})")
+            return ", ".join(rendered)
+
+        citation_matches = list(citation_pattern.finditer(article))
+        if citation_matches:
+            parts = []
+            cursor = 0
+            index = 0
+            while index < len(citation_matches):
+                group = [citation_matches[index]]
+                next_index = index + 1
+                while next_index < len(citation_matches):
+                    gap = article[group[-1].end():citation_matches[next_index].start()]
+                    if not re.fullmatch(r"\s*,?\s*", gap):
+                        break
+                    group.append(citation_matches[next_index])
+                    next_index += 1
+                parts.append(article[cursor:group[0].start()])
+                parts.append(render_citation_group(group))
+                cursor = group[-1].end()
+                index = next_index
+            parts.append(article[cursor:])
+            article = "".join(parts)
+        if references:
+            article += "\n\n## References\n\n" + "\n".join(references)
+        return result.model_copy(
+            update={
+                "article_markdown": article,
+                "word_count": len(re.findall(r"\b[\w’'-]+\b", article)),
+                "sections": [
+                    section
+                    for section in result.sections
+                    if section.heading.strip().casefold() != "references"
+                ],
+                "unresolved_items": list(dict.fromkeys(unresolved)),
+            }
+        )
 
     @staticmethod
     def _sections_from_markdown(
@@ -330,12 +583,15 @@ class WriterAgent:
         )
         if not issues:
             return result, []
+        actionable_issues = WriterAgent._actionable_style_issues(issues)
+        if not actionable_issues:
+            return result, [f"Style check: {issue}" for issue in issues]
         if not allow_retry:
             return result, [f"Style check: {issue}" for issue in issues]
 
         retry_prompt = self._build_repair_prompt(
             result,
-            [f"Style: {issue}" for issue in issues],
+            [f"Style: {issue}" for issue in actionable_issues],
         )
         try:
             retried = self._generate_targeted_update(result, retry_prompt)
@@ -355,6 +611,18 @@ class WriterAgent:
             meta_description=retried.meta_description,
         )
         return retried, [f"Style check: {issue}" for issue in remaining]
+
+    @staticmethod
+    def _actionable_style_issues(issues: list[str]) -> list[str]:
+        """Exclude optional word-choice guidance from automatic repair calls."""
+        optional_patterns = (
+            re.compile(r"^'[^']+' appears \d+ times; use it at most \d+\."),
+            re.compile(r"^'Confirm/discuss with the vendor' appears \d+ times;"),
+        )
+        return [
+            issue for issue in issues
+            if not any(pattern.match(issue) for pattern in optional_patterns)
+        ]
 
     @staticmethod
     def _build_repair_prompt(result: WriterOutput, issues: list[str]) -> str:
@@ -399,7 +667,8 @@ class WriterAgent:
         result: WriterOutput,
         evidence: list[WriterEvidence],
     ) -> WriterOutput:
-        """Mark numerical statements unless a cited verified quote supports them."""
+        """Record numerical claim concerns as review notes, not article text."""
+        verify_pattern = re.compile(r"\[VERIFY:[^\]]*\]")
         number_pattern = re.compile(
             r"(?<![\w])(?:[$€£]\s*)?(\d[\d,]*(?:\.\d+)?)"
             r"\s*\+?\s*(%|percent\b|employees?\b|users?\b|weeks?\b|months?\b|"
@@ -451,15 +720,22 @@ class WriterAgent:
         }
         lines = result.article_markdown.splitlines()
         unresolved = list(result.unresolved_items)
-        flagged_lines = []
-        for line in lines:
+        clean_lines = []
+        for original_line in lines:
+            for marker in verify_pattern.finditer(original_line):
+                note = marker.group()[8:-1].strip()
+                if note:
+                    warning = f"Writer verification note: {note}"
+                    if warning not in unresolved:
+                        unresolved.append(warning)
+            line = verify_pattern.sub("", original_line).rstrip()
             scan_line = re.sub(r"^\s*\d+[.)]\s+", "", line)
             if scan_line.lstrip().startswith("### "):
-                flagged_lines.append(line)
+                clean_lines.append(line)
                 continue
             numbers = number_keys(scan_line)
             if not numbers:
-                flagged_lines.append(line)
+                clean_lines.append(line)
                 continue
 
             tokens = {
@@ -514,18 +790,9 @@ class WriterAgent:
                 )
                 if warning not in unresolved:
                     unresolved.append(warning)
-            review_notes = []
-            if unsupported:
-                review_notes.append(
-                    "add a verified source and context for numerical claim(s) " f"{', '.join(unsupported)}"
-                )
-            if limitations:
-                review_notes.append("preserve source limitation: " + "; ".join(dict.fromkeys(limitations)))
-            if review_notes and "[VERIFY:" not in line:
-                line += f" [VERIFY: {'; '.join(review_notes)}]"
-            flagged_lines.append(line)
+            clean_lines.append(line)
 
-        article = "\n".join(flagged_lines)
+        article = "\n".join(clean_lines)
         word_count = len(re.findall(r"\b[\w’'-]+\b", article))
         return result.model_copy(
             update={
@@ -934,7 +1201,19 @@ Return only the requested JSON object, with no Markdown fence or planning."""
 
     @staticmethod
     def _build_user_prompt(data: WriterInput) -> str:
-        brief_json = data.model_dump_json(exclude_defaults=True, exclude_none=True)
+        payload = data.model_dump(mode="json", exclude_defaults=True, exclude_none=True)
+        section_evidence_ids = {
+            evidence_id
+            for section in payload.get("sections", [])
+            for evidence_id in section.get("evidence_ids", [])
+        }
+        if section_evidence_ids:
+            payload["evidence"] = [
+                item
+                for item in payload.get("evidence", [])
+                if item["evidence_id"] in section_evidence_ids
+            ]
+        brief_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         evidence_guidance = ""
         if any(item.relevance is not None for item in data.evidence):
             evidence_guidance = """
@@ -990,6 +1269,14 @@ ARTICLE STRUCTURE
 - Introduce the company's verified capabilities where they help address the
   customer's challenge, without turning the article into a company profile.
 - Include concrete, evidence-supported details where available.
+- Cite factual and research-statistic claims inline using the exact supplied
+  evidence ID in square brackets, for example [ev_001]. Never create numeric
+  citations or bare reference numbers such as 1, [1], or [22]. Use only IDs
+  present in the evidence list and include those IDs in claims_used. The app
+  converts these markers to bracketed numbered citations that link to the
+  matching entry in References.
+- Do not print raw URLs in the article. The app adds References entries with
+  clickable source titles and links each in-text citation to its matching entry.
 - Explain supported practical benefits confidently without inventing outcomes.
 - End with a concise conclusion and a clear, relevant call to action.
 - Include exactly one H2 titled "Frequently Asked Questions" with 3 to 5
@@ -1007,8 +1294,17 @@ ARTICLE STRUCTURE
   is fine.
 - Place the conclusion before the FAQ section. Keep the conclusion's final
   ~60 words focused on the takeaway and one relevant call to action.
+- Do not write a References section; the app adds one after the FAQs from
+  the evidence IDs actually used.
 - Follow all required brief topics. Do not add sections merely
   to increase length.
+- For claims_used, include only distinct material factual claims. Keep each
+  claim concise and combine claims that use the same evidence where accurate.
+  The app adds source URLs, evidence details, and validation notes.
+- Keep unresolved_items concise. Report only distinct, material evidence gaps
+  or risks. Keep each item focused. Combine related gaps only when they share
+  the same cause. Do not repeat limitations that the article already handles
+  correctly, and do not omit a material warning about evidence or claims.
 - Avoid a generic opening such as "{data.company_name} is a leading company"
   unless the brief specifically requires that approach and the claim is
   supported by evidence.
@@ -1026,11 +1322,10 @@ Return compact JSON with these fields:
 - meta_description: string
 - article_markdown: string
 - word_count: integer (approximate; it will be recalculated)
-- claims_used: array of objects with claim, evidence_ids, source_urls,
+- claims_used: array of objects with claim, evidence_ids,
   claim_scope="company_specific|industry_context|general_education",
   citation_status="not_checked",
-  support_status="supported|partially_supported|unsupported|contradicted|inconclusive|not_assessed",
-  validation_notes=[]
+  support_status="supported|partially_supported|unsupported|contradicted|inconclusive|not_assessed"
 - unresolved_items: array of strings
 - brief_coverage: array of strings
 
@@ -1049,8 +1344,9 @@ evidence status. Use:
 - not_assessed: there is not enough supplied information to assess it.
 A citation URL/ID mismatch is a citation_status issue, not evidence that a
 claim is unsupported or contradicted. This assessment is an AI judgment,
-not independent verification. Validation code resolves citation links
-separately. Mark claims about the named
+not independent verification. The app creates source_urls, supporting_evidence,
+and validation_notes from the supplied evidence; do not return those fields.
+Validation code resolves citation links separately. Mark claims about the named
 customer, its products, services, capabilities, processes, or results as
 company_specific. Mark broad industry observations as industry_context and
 plain explanations as general_education. Do not turn generic context into

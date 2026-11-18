@@ -12,7 +12,6 @@ const tabs = {
 };
 const state = { workflow: "aimpact", run: null, activeTab: "Article", pollTimer: null, working: false };
 const $ = (selector) => document.querySelector(selector);
-const workspace = $("#workspace");
 
 function escapeHtml(value = "") {
   return String(value).replace(/[&<>"']/g, (char) => ({
@@ -41,9 +40,12 @@ async function api(url, options = {}) {
 function renderStages(completed = []) {
   const names = stageNames[state.workflow];
   const keys = stageKeys[state.workflow];
+  let running = state.working;
   $("#stage-list").innerHTML = names.map((name, index) => {
     const done = Array.isArray(completed) ? completed.includes(keys[index]) : Number(completed) > index;
-    return `<li class="stage-item ${done ? "done" : ""}"><span class="stage-node">${done ? "✓" : index + 1}</span><div class="stage-name">${escapeHtml(name)}</div></li>`;
+    const cls = done ? "ok" : running ? "run" : "";
+    if (!done) running = false;
+    return `<span class="ag ${cls}">${escapeHtml(name)}</span>`;
   }).join("");
 }
 
@@ -53,15 +55,12 @@ function setWorkflow(workflow) {
   state.workflow = workflow;
   state.run = null;
   state.activeTab = "Article";
-  document.querySelectorAll(".workflow-link").forEach((button) => {
-    button.classList.toggle("active", button.dataset.workflow === workflow);
-  });
   const isGeneral = workflow === "general";
-  $("#page-title").textContent = isGeneral ? "General blog" : "Campaign blog";
-  $("#page-subtitle").textContent = isGeneral
-    ? "Bring your topic and keywords. Build a clear, evidence-led article."
-    : "Turn a campaign prompt into a sourced, reviewed article.";
-  $("#form-title").textContent = isGeneral ? "Build a general blog" : "Build a campaign blog";
+  $("#o-general").classList.toggle("on", isGeneral);
+  $("#o-campaign").classList.toggle("on", !isGeneral);
+  const badge = $("#mode-badge");
+  badge.className = `badge ${isGeneral ? "b" : "l"}`;
+  badge.textContent = isGeneral ? "✎ General mode" : "✳ Campaign mode";
   $("#aimpact-form").hidden = isGeneral;
   $("#general-form").hidden = !isGeneral;
   $("#run-state").className = "state-chip idle";
@@ -70,7 +69,7 @@ function setWorkflow(workflow) {
   $("#result-content").hidden = false;
   $("#result-tabs").hidden = true;
   $("#result-view").hidden = true;
-  $("#result-content").innerHTML = '<div class="empty-art"><span>✦</span><i></i><b></b></div><h3>Ready when you are</h3><p>Complete the form to start a new workflow. Your progress and results will appear here.</p>';
+  $("#result-content").innerHTML = '<div><b>Ready when you are</b>Fill in the brief on the left, then press the button.<br>Progress and the draft appear here.</div>';
   renderStages([]);
   showNotice("");
 }
@@ -160,10 +159,10 @@ function renderArticle() {
       <p><strong>Approval</strong><br>${approved ? "Approved" : "Draft"}</p>
       ${headings.length ? `<details><summary>Article outline</summary><ul>${headings.map((heading) => `<li>${escapeHtml(heading)}</li>`).join("")}</ul></details>` : ""}
       ${usage.length ? `<details><summary>Claude usage · ${usage.length} call(s)</summary>${usage.map((call) => `<p>${escapeHtml(call.agent_name || "Agent")}<br>${call.input_tokens ?? "?"} input · ${call.output_tokens ?? "?"} output</p>`).join("")}</details>` : ""}
-      <button class="button button-secondary full-width" data-action="copy-md">Copy Markdown</button>
-      <button class="button button-secondary full-width" data-action="download-md">Download Markdown</button>
-      <button class="button button-secondary full-width" data-action="download-result">Download result JSON</button>
-      ${state.workflow === "aimpact" ? `<a class="button button-secondary full-width" href="/api/aimpact/runs/${encodeURIComponent(state.run.run_id)}/article.pdf">Download PDF</a>` : ""}
+      <button class="btn s full" data-action="copy-md">Copy Markdown</button>
+      <button class="btn s full" data-action="download-md">Download Markdown</button>
+      <button class="btn s full" data-action="download-result">Download result JSON</button>
+      ${state.workflow === "aimpact" ? `<a class="btn s full" href="/api/aimpact/runs/${encodeURIComponent(state.run.run_id)}/article.pdf">Download PDF</a>` : ""}
     </aside>
   </div>`;
 }
@@ -176,11 +175,11 @@ function renderEdit() {
     <div class="panel-grid">
       <section><label class="eyebrow" for="article-editor">ARTICLE MARKDOWN</label>
         <textarea id="article-editor" class="editor">${escapeHtml(output.article_markdown || "")}</textarea>
-        <button class="button button-primary" data-action="save-edit">Save edits as a new version</button>
+        <button class="btn p" data-action="save-edit">Save edits as a new version</button>
       </section>
       <section><label class="eyebrow" for="revision-instructions">WRITER REVISION</label>
         <textarea id="revision-instructions" class="editor" style="min-height:120px" placeholder="Describe the changes you want."></textarea>
-        <button class="button button-secondary" data-action="revise">Ask Agent 5 to revise</button>
+        <button class="btn s" data-action="revise">Ask Agent 5 to revise</button>
         ${state.workflow === "aimpact" ? renderVersions() : ""}
       </section>
     </div>`;
@@ -189,14 +188,14 @@ function renderEdit() {
 function renderVersions() {
   const versions = state.run?.draft_versions || [];
   if (!versions.length) return "";
-  return `<div class="soft-panel" style="margin-top:16px"><h3>Version history</h3>${versions.map((version) => `<div class="decision-card"><span>v${version.version} · ${escapeHtml(version.source || "Version")}</span>${version.version !== state.run.draft_version ? `<button class="button button-secondary" data-action="restore-version" data-version="${version.version}">Restore</button>` : '<span class="optional">Current</span>'}</div>`).join("")}</div>`;
+  return `<div class="soft-panel" style="margin-top:16px"><h3>Version history</h3>${versions.map((version) => `<div class="decision-card"><span>v${version.version} · ${escapeHtml(version.source || "Version")}</span>${version.version !== state.run.draft_version ? `<button class="btn s" data-action="restore-version" data-version="${version.version}">Restore</button>` : '<span class="optional">Current</span>'}</div>`).join("")}</div>`;
 }
 
 function renderReview() {
   const review = currentReview();
   const isCurrent = state.workflow === "aimpact" ? state.run.review_current : state.run.review_current;
   if (!isCurrent) {
-    return `<div class="soft-panel"><h3>Review the current version</h3><p>The draft has not been reviewed, or it changed after the last review.</p><button class="button button-primary" data-action="review">Run Agent 6 review</button></div>`;
+    return `<div class="soft-panel"><h3>Review the current version</h3><p>The draft has not been reviewed, or it changed after the last review.</p><button class="btn p" data-action="review">Run Agent 6 review</button></div>`;
   }
   const findings = review?.findings || [];
   const statuses = state.run.finding_statuses || {};
@@ -214,7 +213,7 @@ function renderReview() {
   return `<div class="result-heading"><div><h3 class="view-title">Agent 6 · Review</h3><p>${escapeHtml(review?.summary || "Review complete.")}</p></div></div>
     ${cards || '<div class="empty-inline">No review findings were returned.</div>'}
     ${unresolved.length ? `<div class="soft-panel"><h3>Items to check before approval</h3><ul>${unresolved.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul></div>` : ""}
-    ${state.workflow === "aimpact" && state.run.findings?.length ? '<button class="button button-primary" data-action="save-decisions">Save review decisions</button>' : ""}`;
+    ${state.workflow === "aimpact" && state.run.findings?.length ? '<button class="btn p" data-action="save-decisions">Save review decisions</button>' : ""}`;
 }
 
 function renderApprove() {
@@ -230,7 +229,7 @@ function renderApprove() {
     <p>${state.run.review_current ? "✓ The current version has been reviewed." : "○ Review this exact version first."}</p>
     <p>${state.run.review_current && openCount === 0 ? "✓ All findings have a decision." : `○ ${openCount} finding(s) are open.`}</p>
     <p>${(output.article_markdown.match(/\[VERIFY:/g) || []).length ? "⚠ This draft has source flags. Check them before approval." : "✓ No [VERIFY] markers found."}</p>
-    ${state.run.approved ? `<p class="approved-message">Approved for export.</p>` : ready ? `<label class="decision-card"><input id="approval-ack" type="checkbox"> I reviewed this version and accept responsibility for remaining evidence flags.</label><button class="button button-primary" data-action="approve">Approve final draft</button>` : '<button class="button button-secondary" data-action="review">Review this version</button>'}
+    ${state.run.approved ? `<p class="approved-message">Approved for export.</p>` : ready ? `<label class="decision-card"><input id="approval-ack" type="checkbox"> I reviewed this version and accept responsibility for remaining evidence flags.</label><button class="btn p" data-action="approve">Approve final draft</button>` : '<button class="btn s" data-action="review">Review this version</button>'}
   </div>`;
 }
 
@@ -254,7 +253,7 @@ function renderOutputs() {
     writer: state.run.draft, reviewer: state.run.review,
   };
   if (!outputs) return '<div class="empty-inline">Agent outputs are not available.</div>';
-  return Object.entries(outputs).map(([name, value]) => `<details class="output-card"><summary>${escapeHtml(name.replaceAll("_", " "))}</summary><button class="button button-secondary" data-action="download-output" data-name="${escapeHtml(name)}">Download JSON</button><pre class="json-output">${escapeHtml(JSON.stringify(value, null, 2))}</pre></details>`).join("");
+  return Object.entries(outputs).map(([name, value]) => `<details class="output-card"><summary>${escapeHtml(name.replaceAll("_", " "))}</summary><button class="btn s" data-action="download-output" data-name="${escapeHtml(name)}">Download JSON</button><pre class="json-output">${escapeHtml(JSON.stringify(value, null, 2))}</pre></details>`).join("");
 }
 
 function renderRun() {
@@ -280,6 +279,7 @@ function applyRun(run, workflow = state.workflow) {
   state.workflow = workflow;
   state.run = run;
   const id = run.run_id || "";
+  saveRecent(run, workflow);
   $("#result-title").textContent = currentOutput()?.title || (id ? `Run ${id.slice(0, 8)}` : "Workflow results");
   const chip = $("#run-state");
   const approved = workflow === "aimpact" && run.approved;
@@ -296,6 +296,7 @@ function applyRun(run, workflow = state.workflow) {
 
 async function pollJob(jobId, workflow) {
   state.working = true;
+  renderStages([]);
   const chip = $("#run-state");
   chip.className = "state-chip running";
   chip.innerHTML = "<i></i><span>In progress</span>";
@@ -303,7 +304,7 @@ async function pollJob(jobId, workflow) {
   $("#result-content").hidden = false;
   $("#result-tabs").hidden = true;
   $("#result-view").hidden = true;
-  $("#result-content").innerHTML = '<div class="empty-art"><span>✦</span><i></i><b></b></div><h3>Good work takes research</h3><p id="progress-message">Preparing your workflow…</p>';
+  $("#result-content").innerHTML = '<div><b>Good work takes research</b><span id="progress-message">Preparing your workflow…</span></div>';
   const timer = async () => {
     if (!state.working) return;
     try {
@@ -436,18 +437,9 @@ async function useAction(action, target) {
 
 $("#aimpact-form").addEventListener("submit", submitAimpact);
 $("#general-form").addEventListener("submit", submitGeneral);
-document.querySelectorAll(".workflow-link").forEach((button) => button.addEventListener("click", () => setWorkflow(button.dataset.workflow)));
 $("#new-run").addEventListener("click", () => setWorkflow(state.workflow));
-$("#resume-button").addEventListener("click", async () => {
-  const runId = $("#resume-id").value.trim();
-  if (!runId) return showNotice("Enter a workflow run ID.", true);
-  try {
-    const run = await api(`/api/aimpact/runs/${encodeURIComponent(runId)}`);
-    applyRun(run, "aimpact");
-    showNotice(`Loaded saved run ${runId}.`);
-  } catch (error) { showNotice(error.message, true); }
-});
-workspace.addEventListener("click", async (event) => {
+$("#resume-button").addEventListener("click", () => openRun("aimpact", $("#resume-id").value.trim()));
+document.addEventListener("click", async (event) => {
   const tab = event.target.closest("[data-tab]");
   if (tab) return switchTab(tab.dataset.tab);
   const button = event.target.closest("[data-action]");
@@ -455,28 +447,162 @@ workspace.addEventListener("click", async (event) => {
   try { await useAction(button.dataset.action, button.dataset.version || button.dataset.name); }
   catch (error) { showNotice(error.message, true); }
 });
-setWorkflow("aimpact");
-renderStages([]);
 
+
+/* ================= landing demo ================= */
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+const AG=["Prompt","Sources","Facts","Brief","Writer","Review"];
+const SE=['Assay variability drops sharply once protocols are standardised <span class="cite">[1]</span>. ','Live-cell imaging adds kinetic detail that endpoint reads miss <span class="cite">[2]</span>. ','For lab managers, the practical win is fewer repeat runs and faster go/no-go calls. ','Teams report cutting repeat screens by around a third <span class="flag">[VERIFY: sample size]</span>.'];
+const chips=(el,s)=>el.innerHTML=AG.map((a,i)=>`<span class="ag ${s[i]||''}">${a}</span>`).join('');
+const SE2=['Cell-based assays are now the first checkpoint in most early screening pipelines, but their value depends on how consistently they run. ','Assay variability drops sharply once protocols are standardised <span class="cite">[1]</span>. ','Live-cell imaging adds kinetic detail that endpoint reads miss <span class="cite">[2]</span>. ','¶For lab managers, the practical win is fewer repeat runs and faster go/no-go calls. ','Plate layout, passage number and reagent lots are the three variables most often behind a failed run. ','Tracking them in one place makes drift visible before it costs a week of work. ','¶Teams report cutting repeat screens by around a third <span class="flag">[VERIFY: sample size]</span>. ','Even so, the safest approach is to pilot on one assay, measure the change, then roll it out. ','A short checklist, reviewed monthly, keeps the gains from fading.'];
+const sents=(el,a=SE)=>{el.innerHTML=a.map(h=>`<span class="s${h[0]==='¶'?' pb':''}">${h.replace('¶','')}</span>`).join('');return[...el.children]};
+let tok=0;
+async function demo(){const my=++tok,t=$('#ty');t.textContent='';$('#cr').hidden=false;$('#an').classList.remove('show');chips($('#ag'),[]);sents($('#se'));
+ for(const c of"Write an 800-word blog on how reliable cell-based assays are for early drug screening. Audience: lab managers."){if(my!==tok)return;t.textContent+=c;await wait(18)}
+ $('#cr').hidden=true;const st=[];for(let i=0;i<6;i++){if(my!==tok)return;st[i]='run';chips($('#ag'),st);await wait(480);st[i]='ok';chips($('#ag'),st)}
+ $('#an').classList.add('show');for(const s of sents($('#se'))){if(my!==tok)return;await wait(420);s.classList.add('in')}}
+if ('IntersectionObserver' in window) { new IntersectionObserver((es) => es.forEach((e) => { if (e.isIntersecting) demo(); else tok++; }), { threshold: .35 }).observe($('.chat')); } else demo();
+
+/* ================= shared helpers ================= */
 function highlightFlags(html) {
   return html.replace(/\[VERIFY:([^\]]*)\]/g, '<mark class="flag">[VERIFY:$1]</mark>');
 }
-function showView(view) {
-  const studio = view === "app";
-  $("#landing").hidden = studio;
-  $("#app").hidden = !studio;
-  document.title = studio ? "BlogGen | Studio" : "BlogGen | Evidence-led content studio";
-  history.replaceState(null, "", studio ? "#studio" : location.pathname);
-  window.scrollTo(0, 0);
+const store = {
+  get(key, fallback) { try { const v = JSON.parse(localStorage.getItem("bloggen." + key)); return v ?? fallback; } catch { return fallback; } },
+  set(key, value) { try { localStorage.setItem("bloggen." + key, JSON.stringify(value)); } catch { /* storage unavailable */ } },
+};
+let toastTimer;
+function toast(message) {
+  const el = $("#toast");
+  el.textContent = message;
+  el.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove("show"), 2200);
 }
-document.addEventListener("click", (event) => {
-  const go = event.target.closest("[data-go]");
-  if (!go) return;
-  event.preventDefault();
-  showView(go.dataset.go);
+
+/* ================= navigation ================= */
+const pageInfo = {
+  write: ["WORKSPACE", "Write a blog", ""],
+  runs: ["WORKSPACE", "Saved runs", "Reopen anything you generated in this browser."],
+  profile: ["ACCOUNT", "Profile", "Your details stay in this browser."],
+  settings: ["ACCOUNT", "Settings", "Writing mode, defaults and server status."],
+};
+function go(page) {
+  const land = page === "land";
+  $("#land").hidden = !land;
+  $("#shell").hidden = land;
+  tok++;
+  window.scrollTo(0, 0);
+  history.replaceState(null, "", land ? location.pathname : "#" + page);
+  if (land) return;
+  document.querySelectorAll(".pg").forEach((el) => { el.hidden = el.id !== "pg-" + page; });
+  document.querySelectorAll(".nv[data-p]").forEach((el) => el.classList.toggle("on", el.dataset.p === page));
+  [$("#eb").textContent, $("#page-title").textContent, $("#page-subtitle").textContent] = pageInfo[page];
+  $(".tb").hidden = page === "write";
+  if (page === "runs") renderRecent();
+  if (page === "settings") checkServer();
+}
+function menu(open) {
+  const m = $("#um");
+  m.hidden = open === undefined ? !m.hidden : !open;
+  $("#ub").setAttribute("aria-expanded", String(!m.hidden));
+}
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") menu(false); });
+document.addEventListener("click", (e) => {
+  const page = e.target.closest("[data-p]");
+  if (page) { go(page.dataset.p); menu(false); return; }
+  const home = e.target.closest("[data-go]");
+  if (home) { e.preventDefault(); go(home.dataset.go); menu(false); return; }
+  const mode = e.target.closest("[data-mode]");
+  if (mode) { setMode(mode.dataset.mode); return; }
+  const open = e.target.closest("[data-open]");
+  if (open) { const [workflow, ...rest] = open.dataset.open.split(":"); openRun(workflow, rest.join(":")); return; }
+  if (e.target.closest("#ub")) { menu(); return; }
+  if (!e.target.closest(".umw")) menu(false);
 });
-if ("IntersectionObserver" in window) {
-  const io = new IntersectionObserver((entries) => entries.forEach((e) => { if (e.isIntersecting) { e.target.classList.add("in"); io.unobserve(e.target); } }), { threshold: 0.12 });
-  document.querySelectorAll(".reveal").forEach((el) => io.observe(el));
-} else document.querySelectorAll(".reveal").forEach((el) => el.classList.add("in"));
-showView(location.hash === "#studio" ? "app" : "landing");
+
+/* ================= modes, runs, profile, settings ================= */
+function setMode(workflow) {
+  store.set("mode", workflow);
+  setWorkflow(workflow);
+  toast(workflow === "aimpact" ? "Campaign mode on" : "General mode on");
+}
+async function openRun(workflow, id) {
+  if (!id) return showNotice("Enter a workflow run ID.", true);
+  go("write");
+  setWorkflow(workflow);
+  store.set("mode", workflow);
+  try {
+    const url = workflow === "aimpact" ? `/api/aimpact/runs/${encodeURIComponent(id)}` : `/api/general/runs/${encodeURIComponent(id)}`;
+    applyRun(await api(url), workflow);
+    showNotice(`Loaded saved run ${id}.`);
+  } catch (error) { showNotice(error.message, true); }
+}
+function saveRecent(run, workflow) {
+  const id = run.run_id;
+  if (!id) return;
+  const list = store.get("recent", []).filter((r) => !(r.id === id && r.workflow === workflow));
+  list.unshift({ id, workflow, title: currentOutput()?.title || `Run ${id.slice(0, 8)}`, at: Date.now() });
+  store.set("recent", list.slice(0, 30));
+}
+function renderRecent() {
+  const list = store.get("recent", []);
+  $("#recent").innerHTML = list.map((r) => `<div class="row"><div><b>${escapeHtml(r.title)}</b><small>${r.workflow === "aimpact" ? "Campaign" : "General"} · ${new Date(r.at).toLocaleString()}</small></div><button class="btn q" data-open="${escapeHtml(r.workflow)}:${escapeHtml(r.id)}">Open</button></div>`).join("") || '<div class="empty-inline">No runs yet. Articles you generate will be listed here.</div>';
+  $("#pf-count").textContent = list.length;
+}
+const profileFields = { first: "pf-first", last: "pf-last", email: "pf-email", role: "pf-role", company: "pf-company", bio: "pf-bio" };
+function paintProfile(p) {
+  const name = [p.first, p.last].filter(Boolean).join(" ");
+  const initial = (name || p.email || "A")[0].toUpperCase();
+  $("#av-s").textContent = initial;
+  $("#pf-av").textContent = initial;
+  $("#pf-name").textContent = name || "Your name";
+  $("#pf-sub").textContent = [p.role, p.company].filter(Boolean).join(" · ") || "Add your details";
+  $("#um-name").textContent = name || "Your account";
+  $("#um-mail").textContent = p.email || "Set up your profile";
+}
+function applyDefaults(settings) {
+  if (settings.words) { $("#a-words").value = settings.words; $("#g-words").value = settings.words; }
+  if (settings.tone) $("#g-tone").value = settings.tone;
+}
+function loadPrefs() {
+  const profile = store.get("profile", {});
+  const settings = store.get("settings", {});
+  for (const [key, id] of Object.entries(profileFields)) $("#" + id).value = profile[key] || "";
+  $("#set-words").value = settings.words || "";
+  $("#set-tone").value = settings.tone || "";
+  applyDefaults(settings);
+  paintProfile(profile);
+}
+$("#profile-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const profile = Object.fromEntries(Object.entries(profileFields).map(([key, id]) => [key, $("#" + id).value.trim()]));
+  store.set("profile", profile);
+  paintProfile(profile);
+  toast("Profile saved");
+});
+$("#save-settings").addEventListener("click", () => {
+  const settings = { words: Number($("#set-words").value) || null, tone: $("#set-tone").value.trim() };
+  store.set("settings", settings);
+  applyDefaults(settings);
+  toast("Settings saved");
+});
+$("#clear-data").addEventListener("click", () => {
+  try { Object.keys(localStorage).filter((k) => k.startsWith("bloggen.")).forEach((k) => localStorage.removeItem(k)); } catch { /* ignore */ }
+  loadPrefs(); renderRecent(); setWorkflow("general");
+  toast("Saved data cleared");
+});
+$("#resume-button2").addEventListener("click", () => openRun($("#resume-wf").value, $("#resume-id2").value.trim()));
+async function checkServer() {
+  const el = $("#srv-status");
+  el.textContent = "Checking…";
+  try { await api("/api/health"); el.textContent = "Connected"; } catch { el.textContent = "Not reachable. Is the Python server running?"; }
+}
+$("#srv-check").addEventListener("click", checkServer);
+
+/* ================= start ================= */
+loadPrefs();
+renderRecent();
+setWorkflow(store.get("mode", "general"));
+const startPage = location.hash.slice(1);
+if (pageInfo[startPage]) go(startPage);

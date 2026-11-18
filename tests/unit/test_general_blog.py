@@ -1,3 +1,4 @@
+import logging
 from io import BytesIO
 from types import SimpleNamespace
 
@@ -60,6 +61,7 @@ def _evidence(evidence_id="ev_001", source_type="company_website", relevance="di
         evidence_quote="This exact source quote describes the company's capability in detail.",
         source_url="https://example.com/capability",
         source_title="Capability",
+        publication_date="2025-03-04",
         source_type=source_type,
     )
 
@@ -134,6 +136,42 @@ def test_human_review_gate_matches_automatic_blocking_findings():
             unresolved_items=["Claim is not assessed."],
         )
     )
+
+
+def test_general_blog_stage_logs_start_completion_timing_and_tokens(monkeypatch, caplog):
+    workflow = GeneralBlogWorkflow.__new__(GeneralBlogWorkflow)
+    workflow.run_id = "debug-run"
+    workflow._token_usage = []
+    workflow._completed_stages = set()
+    workflow.progress_callback = None
+    monkeypatch.setattr(
+        "src.orchestrator.general_blog.save_general_blog_stage_output",
+        lambda *_args, **_kwargs: None,
+    )
+    caplog.set_level(logging.INFO, logger="src.orchestrator.general_blog")
+
+    def operation():
+        record_claude_response(
+            SimpleNamespace(usage=SimpleNamespace(input_tokens=12, output_tokens=7)),
+            "test-model",
+        )
+        return "ok"
+
+    result = workflow._run_stage(
+        "intake",
+        "Input & research plan",
+        "general_blog_intake",
+        7,
+        operation,
+        debug_stage="intake",
+        debug_input={},
+    )
+
+    assert result == "ok"
+    assert "General Blog stage started (run_id=debug-run, stage=intake, agent=general_blog_intake)" in caplog.text
+    assert "General Blog stage complete" in caplog.text
+    assert "duration_seconds=" in caplog.text
+    assert "claude_calls=1, input_tokens=12, output_tokens=7" in caplog.text
 
 
 def test_general_blog_request_normalizes_websites_and_reference_urls():
@@ -216,7 +254,11 @@ def test_intake_agent_collects_reference_urls_in_prompt_and_explicit_field():
 
 def test_fetch_reference_extracts_html_title_published_date_and_visible_text(monkeypatch):
     html = b"""<html><head><title>Research Paper</title>
-    <meta property="article:published_time" content="2025-03-04"></head>
+    <meta property="article:published_time" content="2025-03-04">
+    <meta name="citation_author" content="A. Researcher">
+    <meta name="citation_publisher" content="Research Group">
+    <meta name="citation_journal_title" content="Journal of Training">
+    <meta name="citation_doi" content="https://doi.org/10.1234/vr.2025"></head>
     <body><script>hidden secret</script><h1>Findings</h1>
     <p>The study describes training outcomes in the tested group.</p></body></html>"""
     monkeypatch.setattr(
@@ -228,6 +270,10 @@ def test_fetch_reference_extracts_html_title_published_date_and_visible_text(mon
 
     assert source.title == "Research Paper"
     assert source.publication_date == "2025-03-04"
+    assert source.author == "A. Researcher"
+    assert source.organization == "Research Group"
+    assert source.journal == "Journal of Training"
+    assert source.doi == "10.1234/vr.2025"
     assert "The study describes training outcomes" in source.text
     assert "hidden secret" not in source.text
 
@@ -247,6 +293,7 @@ def test_fetch_reference_extracts_pdf_text_and_metadata(monkeypatch):
     source = fetch_reference("https://papers.example/report.pdf")
 
     assert source.title == "Research Report"
+    assert source.publication_date is None
     assert "Research paper evidence about the tested population." in source.text
 
 
@@ -726,7 +773,7 @@ def test_brief_agent_maps_evidence_into_existing_writer_input():
     assert writer_input.secondary_keywords == ["medical device training"]
     assert writer_input.sections[0].evidence_ids == ["ev_001"]
     writer_prompt = WriterAgent._build_user_prompt(writer_input)
-    assert '"relevance":"related"' in writer_prompt
+    assert '"relevance":"direct"' in writer_prompt
     assert "Do not present background evidence as direct support." in writer_prompt
     assert "does not independently establish scientific correctness" in writer_prompt
     assert writer_input.evidence == [
@@ -737,6 +784,8 @@ def test_brief_agent_maps_evidence_into_existing_writer_input():
             relevance="direct",
             evidence_quote=evidence[0].evidence_quote,
             source_url=evidence[0].source_url,
+            source_title=evidence[0].source_title,
+            publication_date=evidence[0].publication_date,
             wording_boundary=evidence[0].wording_boundary,
         ),
         WriterEvidence(
@@ -746,6 +795,8 @@ def test_brief_agent_maps_evidence_into_existing_writer_input():
             relevance="related",
             evidence_quote=evidence[1].evidence_quote,
             source_url=evidence[1].source_url,
+            source_title=evidence[1].source_title,
+            publication_date=evidence[1].publication_date,
             wording_boundary=evidence[1].wording_boundary,
         ),
     ]
@@ -947,6 +998,35 @@ def test_general_blog_workflow_revises_blocking_findings_then_passes():
         event.stage == "revision" and event.status == "done"
         for event in progress_events
     )
+
+
+def test_general_blog_revision_ignores_low_priority_notes_but_keeps_medium_findings():
+    low_note = ReviewOutput(
+        summary="Minor style note.",
+        findings=[
+            ReviewFinding(
+                area="grammar",
+                severity="low",
+                issue="A sentence could be shorter.",
+                recommendation="Consider shortening it.",
+            )
+        ],
+        unresolved_items=["Confirm whether the optional example is useful."],
+    )
+    medium_issue = ReviewOutput(
+        summary="A stated requirement needs correction.",
+        findings=[
+            ReviewFinding(
+                area="content",
+                severity="medium",
+                issue="An FAQ answer exceeds the required word limit.",
+                recommendation="Shorten the answer to meet the limit.",
+            )
+        ],
+    )
+
+    assert GeneralBlogWorkflow._needs_revision(low_note) is False
+    assert GeneralBlogWorkflow._needs_revision(medium_issue) is True
 
 
 def test_general_blog_workflow_reports_stage_error_with_tokens_and_run_id():

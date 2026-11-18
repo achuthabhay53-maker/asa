@@ -126,6 +126,12 @@ Return 3 to 5 FAQs that can be answered from the planned article.""",
                     relevance=item.relevance,
                     evidence_quote=item.evidence_quote,
                     source_url=item.source_url,
+                    source_title=item.source_title,
+                    source_author=item.source_author,
+                    source_organization=item.source_organization,
+                    journal=item.journal,
+                    doi=item.doi,
+                    publication_date=item.publication_date,
                     wording_boundary=item.wording_boundary,
                 )
                 for item in evidence_by_id.values()

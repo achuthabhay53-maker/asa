@@ -22,6 +22,12 @@ class WriterEvidence(BaseModel):
     relevance: Literal["direct", "related", "background"] | None = None
     evidence_quote: str | None = None
     source_url: str | None = None
+    source_title: str | None = None
+    source_author: str | None = None
+    source_organization: str | None = None
+    journal: str | None = None
+    doi: str | None = None
+    publication_date: str | None = None
     wording_boundary: str | None = None
 
 

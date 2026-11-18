@@ -155,6 +155,10 @@ class GeneralBlogEvidence(BaseModel):
     source_url: str | None = None
     wording_boundary: str | None = None
     source_title: str | None = None
+    source_author: str | None = None
+    source_organization: str | None = None
+    journal: str | None = None
+    doi: str | None = None
     publication_date: str | None = None
     source_type: Literal["company_website", "user_reference"]
 

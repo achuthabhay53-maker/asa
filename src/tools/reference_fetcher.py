@@ -28,6 +28,10 @@ class RetrievedSource:
     title: str | None
     text: str
     publication_date: str | None = None
+    author: str | None = None
+    organization: str | None = None
+    journal: str | None = None
+    doi: str | None = None
 
 
 class SourceFetchError(RuntimeError):
@@ -45,6 +49,7 @@ class _ReferenceHTMLParser(HTMLParser):
         self.text: list[str] = []
         self.title: list[str] = []
         self.meta: dict[str, str] = {}
+        self.meta_authors: list[str] = []
         self._ignored = 0
         self._in_title = False
 
@@ -68,6 +73,8 @@ class _ReferenceHTMLParser(HTMLParser):
             content = attributes.get("content")
             if key and content:
                 self.meta[key] = content.strip()
+                if key in {"author", "citation_author", "dc.creator"}:
+                    self.meta_authors.append(content.strip())
         if tag in self._BLOCK_TAGS:
             self.text.append("\n")
 
@@ -179,6 +186,15 @@ def fetch_reference(url: str) -> RetrievedSource:
             or parser.meta.get("citation_publication_date")
             or parser.meta.get("date")
         )
+        authors = list(dict.fromkeys(author for author in parser.meta_authors if author))
+        doi = parser.meta.get("citation_doi") or parser.meta.get("dc.identifier")
+        if doi:
+            doi = re.sub(
+                r"^(?:https?://(?:dx\.)?doi\.org/|doi:\s*)",
+                "",
+                doi,
+                flags=re.IGNORECASE,
+            ).rstrip(".,;")
         text = " ".join(" ".join(parser.text).split())
         if not text:
             raise SourceFetchError("The reference page contains no extractable text.")
@@ -187,6 +203,14 @@ def fetch_reference(url: str) -> RetrievedSource:
             title=title,
             text=text[:MAX_SOURCE_CHARS],
             publication_date=published,
+            author="; ".join(authors) or None,
+            organization=(
+                parser.meta.get("citation_publisher")
+                or parser.meta.get("publisher")
+                or parser.meta.get("og:site_name")
+            ),
+            journal=parser.meta.get("citation_journal_title"),
+            doi=doi,
         )
     text = decoded[:MAX_SOURCE_CHARS].strip()
     if not text:
@@ -230,13 +254,11 @@ def _extract_pdf_source(
         )
     metadata = reader.metadata
     title = str(metadata.title).strip() if metadata and metadata.title else fallback_title
-    date_value = str(metadata.creation_date) if metadata and metadata.creation_date else None
-    if date_value:
-        date_match = re.search(r"\d{4}", date_value)
-        date_value = date_match.group(0) if date_match else None
+    doi_match = re.search(r"\b10\.\d{4,9}/[-._;()/:A-Z0-9]+\b", text, re.I)
     return RetrievedSource(
         url=source_url,
         title=title,
         text=text[:MAX_SOURCE_CHARS],
-        publication_date=date_value,
+        author=str(metadata.author).strip() if metadata and metadata.author else None,
+        doi=doi_match.group(0).rstrip(".,;:") if doi_match else None,
     )

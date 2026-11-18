@@ -13,8 +13,10 @@ from src.models.writer import (
     WriterEvidence,
     WriterInput,
     WriterOutput,
+    WriterSectionInput,
     WrittenSection,
 )
+from src.ui.review_annotations import render_annotated_markdown
 
 
 _ARTICLE = """# VR Training for Medical Device Teams
@@ -128,6 +130,15 @@ def test_reviewer_removes_unapproved_source_urls_and_flags_claims():
 
 def test_reviewer_returns_findings_without_rewriting_the_draft():
     draft = _writer_output()
+    boundary = "The result applies only to the reported pilot."
+    draft = draft.model_copy(
+        update={
+            "unresolved_items": [
+                f"Preserve evidence limitation for claim {draft.claims_used[0].claim!r}: {boundary}",
+                "A separate note needs human review.",
+            ]
+        }
+    )
     finding = {
         "area": "grammar",
         "severity": "medium",
@@ -160,7 +171,21 @@ def test_reviewer_returns_findings_without_rewriting_the_draft():
     reviewer.max_tokens = 4096
     reviewer.client = SimpleNamespace(messages=SimpleNamespace(create=create))
 
-    result = reviewer.review(_writer_input(), draft)
+    writer_input = _writer_input().model_copy(
+        update={
+            "evidence": [
+                _writer_input().evidence[0].model_copy(update={"wording_boundary": boundary}),
+                WriterEvidence(
+                    evidence_id="ev_002",
+                    claim="Uncited background source",
+                    status="verified",
+                    evidence_quote="This source is not cited by the draft.",
+                    source_url="https://example.com/background",
+                ),
+            ]
+        }
+    )
+    result = reviewer.review(writer_input, draft)
 
     assert result.summary == "One writing issue needs human review."
     assert [item.model_dump() for item in result.findings] == [{**finding, "target_text": None}]
@@ -178,6 +203,8 @@ def test_reviewer_returns_findings_without_rewriting_the_draft():
     request = json.loads(calls[0]["messages"][0]["content"])
     assert "article_markdown" in request["draft"]
     assert "sections" in request
+    assert [item["evidence_id"] for item in request["approved_evidence"]] == ["ev_001"]
+    assert request["draft_unresolved_items"] == ["A separate note needs human review."]
     assert set(request["draft"]["claims_used"][0]) == {
         "claim",
         "claim_scope",
@@ -344,7 +371,7 @@ def test_writer_flags_numerical_claim_without_verified_evidence():
 
     audited = WriterAgent._flag_unsupported_numeric_claims(result, _writer_input().evidence)
 
-    assert "[VERIFY:" in audited.article_markdown
+    assert "[VERIFY:" not in audited.article_markdown
     assert any("80%" in item for item in audited.unresolved_items)
 
 
@@ -395,8 +422,266 @@ def test_writer_marks_supported_metric_with_source_limitation():
 
     audited = WriterAgent._flag_unsupported_numeric_claims(result, [evidence])
 
-    assert "preserve source limitation" in audited.article_markdown
+    assert "[VERIFY:" not in audited.article_markdown
+    assert "The pilot reported an 80% cost reduction." in audited.article_markdown
     assert any("not independently verified" in item for item in audited.unresolved_items)
+
+
+def test_writer_adds_linked_references_after_faq_and_converts_evidence_ids():
+    evidence = [
+        WriterEvidence(
+            evidence_id="ev_001",
+            claim="Nineteen of 21 studies showed increased competency.",
+            status="verified",
+            evidence_quote="19 of 21 studies showed increased competency.",
+            source_url="https://papers.example/review",
+            source_title="A Review of Training Outcomes",
+            source_author="A. Researcher",
+            journal="Journal of Training",
+            doi="10.1234/vr.2024",
+            publication_date="2024-06-01",
+        )
+    ]
+    article = _writer_output(
+        _ARTICLE.replace(
+            "The supplied evidence describes virtual training",
+            "[ev_001] The supplied evidence describes virtual training",
+        )
+    ).model_copy(
+        update={
+            "claims_used": [
+                WriterClaim(
+                    claim="Nineteen of 21 studies showed increased competency.",
+                    evidence_ids=["ev_001"],
+                )
+            ]
+        }
+    )
+
+    referenced = WriterAgent._append_references(article, evidence)
+
+    assert "[ev_001]" not in referenced.article_markdown
+    assert (
+        "[\\[1\\]](#reference-1) The supplied evidence"
+        in referenced.article_markdown
+    )
+    assert referenced.article_markdown.index("## Frequently Asked Questions") < (
+        referenced.article_markdown.index("## References")
+    )
+    assert (
+        "1. [A. Researcher. A Review of Training Outcomes. Journal of Training](https://papers.example/review) (2024). DOI: 10.1234/vr.2024."
+        in referenced.article_markdown
+    )
+    rendered, _ = render_annotated_markdown(referenced.article_markdown, [])
+    assert '<a href="#reference-1">[1]</a>' in rendered
+    assert '<li id="reference-1">' in rendered
+    assert '<a href="https://papers.example/review">A. Researcher. A Review of Training Outcomes. Journal of Training</a>' in rendered
+    assert "10.1234/vr.2024" in referenced.article_markdown
+
+
+def test_writer_deduplicates_sources_and_strips_old_references_before_rebuilding():
+    evidence = [
+        WriterEvidence(
+            evidence_id="ev_001",
+            claim="First claim",
+            status="verified",
+            source_url="https://papers.example/review#section",
+            source_title="Research review",
+        ),
+        WriterEvidence(
+            evidence_id="ev_002",
+            claim="Second claim",
+            status="verified",
+            source_url="https://papers.example/review",
+            source_title="Research review",
+        ),
+    ]
+    article = _writer_output(
+        "# Results\n\n[ev_001] First claim. [ev_002] Second claim.\n\n"
+        "## Frequently Asked Questions\n\nQuestion answer.\n\n"
+        "## References\n\nOld, stale reference."
+    ).model_copy(
+        update={
+            "claims_used": [
+                WriterClaim(claim="First claim", evidence_ids=["ev_001", "ev_002"])
+            ]
+        }
+    )
+
+    referenced = WriterAgent._append_references(article, evidence)
+
+    assert referenced.article_markdown.count("1. [Research review]") == 1
+    assert (
+        "[\\[1\\]](#reference-1) First claim. "
+        "[\\[1\\]](#reference-1) Second claim."
+    ) in referenced.article_markdown
+    assert "Old, stale reference" not in referenced.article_markdown
+
+
+def test_writer_normalizes_numeric_citations_to_generated_reference_numbers():
+    evidence = [
+        WriterEvidence(
+            evidence_id="ev_001",
+            claim="First research finding",
+            status="verified",
+            source_url="https://papers.example/first",
+            source_title="First Research Paper",
+        ),
+        WriterEvidence(
+            evidence_id="ev_002",
+            claim="Second research finding",
+            status="verified",
+            source_url="https://papers.example/second",
+            source_title="Second Research Paper",
+        ),
+    ]
+    article = _writer_output(
+        "# Results\n\nThe findings were reported [22][2][1][2]."
+    ).model_copy(
+        update={
+            "claims_used": [
+                WriterClaim(
+                    claim="Research findings",
+                    evidence_ids=["ev_001", "ev_002"],
+                )
+            ]
+        }
+    )
+
+    referenced = WriterAgent._append_references(article, evidence)
+
+    assert (
+        "The findings were reported [\\[2\\]](#reference-2), "
+        "[\\[1\\]](#reference-1)."
+    ) in referenced.article_markdown
+    assert "22" not in referenced.article_markdown
+    assert "1. [First Research Paper]" in referenced.article_markdown
+    assert "2. [Second Research Paper]" in referenced.article_markdown
+    assert any("numeric citation [22]" in item for item in referenced.unresolved_items)
+
+
+def test_writer_removes_raw_urls_from_body_and_keeps_one_clean_reference_link():
+    evidence = [
+        WriterEvidence(
+            evidence_id="ev_001",
+            claim="Training finding",
+            status="verified",
+            source_url="https://papers.example/training",
+            source_title="Training Paper",
+            source_organization="Research Group",
+            publication_date="2025",
+        )
+    ]
+    article = _writer_output(
+        "# Results\n\nSee [the company page](https://company.example/page) "
+        "and https://papers.example/other for details. [ev_001] The finding."
+    ).model_copy(
+        update={
+            "claims_used": [
+                WriterClaim(claim="Training finding", evidence_ids=["ev_001"])
+            ]
+        }
+    )
+
+    referenced = WriterAgent._append_references(article, evidence)
+    body, references = referenced.article_markdown.split("## References", 1)
+
+    rendered_body, _ = render_annotated_markdown(body, [])
+    assert ">https://" not in rendered_body
+    assert "the company page" in body
+    assert "[\\[1\\]](#reference-1)" in body
+    assert (
+        "1. [Research Group. Training Paper](https://papers.example/training) (2025)."
+        in references
+    )
+    assert references.count("https://papers.example/training") == 1
+    assert any("source URLs in article text" in item for item in referenced.unresolved_items)
+
+
+def test_writer_uses_doi_link_when_source_url_is_unavailable():
+    evidence = [
+        WriterEvidence(
+            evidence_id="ev_001",
+            claim="Research finding",
+            status="verified",
+            source_title="Research Paper",
+            doi="https://doi.org/10.1234/vr.2025",
+        )
+    ]
+    article = _writer_output(
+        "# Results\n\n[ev_001] The research finding."
+    ).model_copy(
+        update={
+            "claims_used": [
+                WriterClaim(claim="Research finding", evidence_ids=["ev_001"])
+            ]
+        }
+    )
+
+    referenced = WriterAgent._append_references(article, evidence)
+
+    assert "[\\[1\\]](#reference-1)" in referenced.article_markdown
+    assert (
+        "1. [Research Paper](https://doi.org/10.1234/vr.2025). "
+        "DOI: 10.1234/vr.2025."
+    ) in referenced.article_markdown
+
+
+def test_writer_reports_reference_without_a_source_link():
+    evidence = [
+        WriterEvidence(
+            evidence_id="ev_001",
+            claim="Research finding",
+            status="verified",
+            source_title="Research Paper",
+        )
+    ]
+    article = _writer_output(
+        "# Results\n\n[ev_001] The research finding."
+    ).model_copy(
+        update={
+            "claims_used": [
+                WriterClaim(claim="Research finding", evidence_ids=["ev_001"])
+            ]
+        }
+    )
+
+    referenced = WriterAgent._append_references(article, evidence)
+
+    assert "1. Research Paper." in referenced.article_markdown
+    assert any("has no valid source URL or DOI" in item for item in referenced.unresolved_items)
+
+
+def test_writer_does_not_add_references_for_unused_evidence():
+    evidence = [
+        WriterEvidence(
+            evidence_id="ev_001",
+            claim="Unused fact",
+            status="verified",
+            source_url="https://papers.example/unused",
+            source_title="Unused study",
+        )
+    ]
+
+    referenced = WriterAgent._append_references(
+        _writer_output().model_copy(update={"claims_used": []}),
+        evidence,
+    )
+
+    assert "## References" not in referenced.article_markdown
+
+
+def test_writer_removes_legacy_verification_markers_from_article_text():
+    result = _writer_output(
+        "# Results\n\nThe pilot reported an 80% cost reduction. "
+        "[VERIFY: preserve source limitation: only measured in one pilot.]"
+    )
+
+    audited = WriterAgent._flag_unsupported_numeric_claims(result, _writer_input().evidence)
+
+    assert "[VERIFY:" not in audited.article_markdown
+    assert "only measured in one pilot" not in audited.article_markdown
+    assert any("only measured in one pilot" in item for item in audited.unresolved_items)
 
 
 def test_writer_flags_faq_answers_outside_word_count_target():
@@ -505,6 +790,20 @@ def test_writer_revision_uses_human_instructions_and_returns_a_proposal():
     proposed = draft.model_copy(update={"article_markdown": draft.article_markdown + "\n\nA clearer next step."})
     prompts = []
     agent = WriterAgent.__new__(WriterAgent)
+    writer_input = _writer_input().model_copy(
+        update={
+            "evidence": [
+                *_writer_input().evidence,
+                WriterEvidence(
+                    evidence_id="ev_002",
+                    claim="Uncited background source",
+                    status="verified",
+                    evidence_quote="This source is not cited by the draft.",
+                    source_url="https://example.com/background",
+                ),
+            ]
+        }
+    )
 
     def generate(draft, prompt):
         prompts.append(prompt)
@@ -512,9 +811,12 @@ def test_writer_revision_uses_human_instructions_and_returns_a_proposal():
 
     agent._generate_targeted_update = generate
 
-    result = agent.revise(_writer_input(), draft, "Make the conclusion more direct.")
+    result = agent.revise(writer_input, draft, "Make the conclusion more direct.")
 
-    assert result.article_markdown.endswith("A clearer next step.")
+    assert "A clearer next step." in result.article_markdown
+    assert result.article_markdown.endswith(
+        "## References\n\n1. [example.com](https://example.com/training)."
+    )
     assert draft.article_markdown == _writer_output().article_markdown
     assert draft.article_markdown != result.article_markdown
     assert "Make the conclusion more direct." in prompts[0]
@@ -522,9 +824,48 @@ def test_writer_revision_uses_human_instructions_and_returns_a_proposal():
     request = json.loads(prompts[0].split("<revision_request>\n", 1)[1].split("\n</revision_request>", 1)[0])
     assert "revision_context" in request
     assert request["revision_context"]["evidence"][0]["evidence_id"] == "ev_001"
+    assert len(request["revision_context"]["evidence"]) == 1
     assert "sections" not in request["current_draft"]
     assert "claims_used" not in request["current_draft"]
     assert len(prompts) == 1
+
+
+def test_writer_revision_does_not_retry_for_a_preexisting_style_note():
+    article = _ARTICLE + (
+        "\n\nImmersive simulations support immersive practice and immersive learning."
+    )
+    draft = _writer_output(article)
+    proposed = draft.model_copy(
+        update={"article_markdown": article + "\n\nA clearer next step."}
+    )
+    prompts = []
+    agent = WriterAgent.__new__(WriterAgent)
+
+    def generate(_draft, prompt):
+        prompts.append(prompt)
+        return proposed
+
+    agent._generate_targeted_update = generate
+
+    agent.revise(_writer_input(), draft, "Make the conclusion more direct.")
+
+    assert len(prompts) == 1
+
+
+def test_writer_keeps_optional_word_choice_lint_as_a_note():
+    article = _ARTICLE + (
+        "\n\nImmersive simulations support immersive practice and immersive learning."
+    )
+    result = _writer_output(article)
+    agent = WriterAgent.__new__(WriterAgent)
+    agent._generate_targeted_update = lambda *_args, **_kwargs: pytest.fail(
+        "Optional word-choice guidance must not start a repair call."
+    )
+
+    checked, notes = agent._enforce_style(result, _writer_input())
+
+    assert checked.article_markdown == article
+    assert any("immersive" in note for note in notes)
 
 
 def test_writer_revision_rejects_empty_instructions():
@@ -697,7 +1038,10 @@ def test_writer_returns_blog_when_generated_claim_has_unlinked_url():
 
     result = agent.write(_writer_input())
 
-    assert result.article_markdown == _ARTICLE.strip()
+    assert result.article_markdown.startswith(_ARTICLE.strip())
+    assert result.article_markdown.endswith(
+        "## References\n\n1. [example.com](https://example.com/training)."
+    )
     assert "https://www.ethosh.com/" not in result.claims_used[0].source_urls
     assert any("https://www.ethosh.com/" in item for item in result.unresolved_items)
 
@@ -1082,6 +1426,42 @@ def test_writer_user_prompt_reinforces_company_voice_and_evidence_limits():
     assert "Never invent customer outcomes" in prompt
     assert "Present limitations and unknowns constructively" in prompt
     assert "clear, relevant call to action" in prompt
+    assert "exact supplied" in prompt
+    assert "bracketed numbered citations" in prompt
+    assert "matching entry in References" in prompt
+
+
+def test_writer_prompt_sends_only_evidence_mapped_to_brief_sections():
+    writer_input = _writer_input().model_copy(
+        update={
+            "sections": [
+                WriterSectionInput(heading="Evidence", evidence_ids=["ev_001"])
+            ],
+            "evidence": [
+                *_writer_input().evidence,
+                WriterEvidence(
+                    evidence_id="ev_002",
+                    claim="Unmapped background source",
+                    status="verified",
+                    evidence_quote="This source is not mapped to a brief section.",
+                    source_url="https://example.com/background",
+                ),
+            ],
+        }
+    )
+
+    prompt = WriterAgent._build_user_prompt(writer_input)
+    payload = json.loads(prompt.split("<writer_input>\n", 1)[1].split("\n</writer_input>", 1)[0])
+
+    assert [item["evidence_id"] for item in payload["evidence"]] == ["ev_001"]
+
+
+def test_writer_response_schema_omits_fields_built_by_application():
+    from src.agents.aimpact_blog.writer import _WRITER_OUTPUT_SCHEMA
+
+    claim_properties = _WRITER_OUTPUT_SCHEMA["properties"]["claims_used"]["items"]["properties"]
+
+    assert not {"source_urls", "supporting_evidence", "validation_notes"} & set(claim_properties)
 
 
 def test_reviewer_prompt_reports_issues_without_rewriting():
@@ -1091,6 +1471,7 @@ def test_reviewer_prompt_reports_issues_without_rewriting():
     assert "for a human to review" in prompt
     assert '"article_markdown"' not in prompt
     assert "grammar and spelling errors" in prompt
+    assert "Use low severity for optional style preferences" in prompt
 
 
 def test_reviewer_requires_exactly_one_submit_review_tool_call():
