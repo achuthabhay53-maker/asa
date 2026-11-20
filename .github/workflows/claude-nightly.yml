@@ -1,0 +1,116 @@
+# File: .github/workflows/claude-nightly.yml
+# Automation mode: Claude runs on a schedule with nobody watching.
+# This file MUST be on the default branch (main) for the cron to fire.
+#
+# Before the first run:
+#   1. Create a label named: claude-nightly
+#   2. Create a pinned issue named "Nightly report" and put its number in
+#      NIGHTLY_REPORT_ISSUE below.
+#   3. Settings > Actions > General > turn on
+#      "Allow GitHub Actions to create and approve pull requests".
+#   4. Add the secret ANTHROPIC_API_KEY.
+#   5. Test with the manual button (Run workflow) before you trust the cron.
+
+name: Claude Nightly
+
+on:
+  schedule:
+    - cron: "30 8 * * *"    # 08:30 UTC = 2:00 PM IST, every day
+  workflow_dispatch:               # manual button, for testing
+    inputs:
+      task:
+        description: "Task to run"
+        type: choice
+        options: [tests, deps, triage, docs]
+        default: tests
+
+concurrency:
+  group: claude-nightly-${{ github.event.inputs.task || 'scheduled' }}
+  cancel-in-progress: false
+
+jobs:
+  nightly:
+    strategy:
+      fail-fast: false
+      max-parallel: 1              # one task at a time, no conflicting branches
+      matrix:
+        # Scheduled runs do only "tests" at first.
+        # After the manual tests pass, change '["tests"]' to '["tests","deps","triage"]'.
+        task: ${{ fromJSON(github.event_name == 'workflow_dispatch' && format('["{0}"]', github.event.inputs.task) || '["tests"]') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60            # hard time cap for each task
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      NIGHTLY_REPORT_ISSUE: "1"    # <-- CHANGE THIS to your "Nightly report" issue number
+      BRANCH: claude/nightly-${{ matrix.task }}-${{ github.run_number }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest ruff mypy pip-audit
+
+      - name: Create isolated branch
+        run: git checkout -b "$BRANCH"
+
+      - name: Baseline test run (failures here already existed)
+        run: python -m pytest tests/unit -q > /tmp/baseline.txt 2>&1 || true
+
+      - name: Run Claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            You are running unattended overnight. Follow CLAUDE.md strictly.
+            Task: ${{ matrix.task }}.
+            You are on branch ${{ env.BRANCH }} (already created). Do not switch branches.
+            Baseline test output is in /tmp/baseline.txt. Failures listed there already existed.
+
+            Task definitions:
+            - tests: Find the 3 least-tested modules in src/ (look at src/tools/, src/workers/,
+              src/db/, src/utils/ first). Add unit tests in tests/unit/.
+              No network calls. No real API keys. Do not change application code.
+            - deps: Run `pip-audit -r requirements.txt`. Report all findings.
+              Bump only patch versions that fix a vulnerability AND keep tests passing.
+            - triage: Review open issues updated in the last 7 days.
+              Suggest labels and duplicates in the report. Do not close issues.
+            - docs: Compare README.md with the code. Fix only factual errors.
+
+            Rules:
+            - Keep the diff under about 400 changed lines. If the task needs more, stop and report.
+            - After your changes, run `python -m pytest tests/unit -q` and
+              `python -m ruff check src tests`.
+              Never say tests passed unless you ran them. Paste the pytest summary line.
+            - If an open PR with the label claude-nightly already exists for this task,
+              do not open another PR. Update the report instead.
+            - If you changed files AND there are no new test failures compared with the baseline:
+                commit, run `git push origin HEAD`, then run
+                `gh pr create --draft --base main --label claude-nightly
+                 --title "nightly(${{ matrix.task }}): <summary>" --body "<what/why/tests/risks>"`.
+            - If tests fail after your change, do NOT open a PR.
+              Describe the failure in the report.
+            - If there is nothing worth doing, change nothing and write "nothing to do".
+            - At the end, always post a report with:
+                gh issue comment ${{ env.NIGHTLY_REPORT_ISSUE }} --body "..."
+              The report must include: task, outcome, PR link (if any), test results,
+              findings, and items that need a human decision.
+          claude_args: |
+            --max-turns 60
+            --allowedTools "Read,Edit,Write,Glob,Grep,Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git add:*),Bash(git commit:*),Bash(git push origin HEAD),Bash(python -m pytest:*),Bash(python -m ruff:*),Bash(python -m mypy:*),Bash(pip-audit:*),Bash(gh pr create:*),Bash(gh pr list:*),Bash(gh issue list:*),Bash(gh issue view:*),Bash(gh issue comment:*),Bash(gh issue edit:*)"
+            --disallowedTools "Bash(git push --force:*),Bash(git push -f:*),Bash(git checkout:*),Bash(git reset:*),Bash(gh pr merge:*),Bash(rm -rf:*)"
