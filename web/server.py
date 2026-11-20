@@ -11,17 +11,30 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
 
 from src.agents.aimpact_blog.source_intelligence import TOP_N_SOURCES
 from src.agents.aimpact_blog.writer import WriterAgent
 from src.agents.aimpact_blog.reviewer import ReviewerAgent
+from src.auth.dependencies import get_current_user
+from src.auth.routes import router as auth_router
+from src.db.database import get_db, get_session_factory
+from src.db.models import BlogRun, BlogVersion, User
+from src.db.repository import (
+    append_run_version,
+    create_blog_run,
+    get_owned_run,
+    save_run_snapshot,
+    update_run_progress,
+)
 from src.models.general_blog import GeneralBlogRequest, GeneralBlogResult
 from src.models.writer import WriterOutput, WrittenSection
 from src.observability.token_usage import merge_token_usage, token_usage_scope
@@ -53,7 +66,6 @@ STATIC_DIR = ROOT / "web" / "static"
 EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="aca-workflow")
 LOCK = threading.RLock()
 JOBS: dict[str, dict[str, Any]] = {}
-GENERAL_RESULTS: dict[str, GeneralBlogResult] = {}
 MAIN_STAGES = (
     ("prompt_analysis", "Agent 1 · Prompt Intelligence", 1),
     ("source_analysis", "Agent 2 · Source Intelligence", 2),
@@ -62,13 +74,11 @@ MAIN_STAGES = (
     ("written_article", "Agent 5 · Blog Writer", 5),
     ("review_output", "Agent 6 · Reviewer", 6),
 )
-MAIN_STAGE_BY_NODE = {
-    f"agent{index}": (key, label)
-    for key, label, index in MAIN_STAGES
-}
+MAIN_STAGE_BY_NODE = {f"agent{index}": (key, label) for key, label, index in MAIN_STAGES}
 
 app = FastAPI(title="AImpact Content Agent", version="1.0.0")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+app.include_router(auth_router)
 
 
 class AImpactRunRequest(BaseModel):
@@ -146,21 +156,13 @@ def _save_main_state(run_id: str, values: dict[str, Any]) -> PipelineState:
 def _main_run_payload(state: PipelineState) -> dict[str, Any]:
     article = state.written_article
     fingerprint = _fingerprint(article) if article else None
-    review_current = bool(
-        article
-        and state.review_output
-        and state.reviewed_draft_fingerprint == fingerprint
-    )
+    review_current = bool(article and state.review_output and state.reviewed_draft_fingerprint == fingerprint)
     findings = state.review_output.findings if state.review_output and review_current else []
     decisions = state.finding_statuses or {}
     findings_with_ids = [
-        {"id": _fingerprint(finding)[:12], "finding": _json_value(finding)}
-        for finding in findings
+        {"id": _fingerprint(finding)[:12], "finding": _json_value(finding)} for finding in findings
     ]
-    open_count = sum(
-        1 for finding in findings
-        if decisions.get(_fingerprint(finding)[:12], "Open") == "Open"
-    )
+    open_count = sum(1 for finding in findings if decisions.get(_fingerprint(finding)[:12], "Open") == "Open")
     approved = bool(
         state.draft_approval
         and article
@@ -210,6 +212,85 @@ def _general_result_payload(result: GeneralBlogResult, run_id: str | None = None
         findings,
     )[0]
     return payload
+
+
+def _run_uuid(run_id: str) -> UUID:
+    try:
+        return UUID(run_id)
+    except (ValueError, AttributeError) as exc:
+        raise HTTPException(status_code=404, detail="Saved run was not found.") from exc
+
+
+def _require_run_owner(
+    db: Session,
+    user: User,
+    run_id: str,
+    workflow: str | None = None,
+) -> BlogRun:
+    try:
+        return get_owned_run(db, _run_uuid(run_id), user.id, workflow)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Saved run was not found.") from exc
+
+
+def _persist_run_version(
+    run_id: str,
+    owner_id: UUID,
+    snapshot: dict[str, Any],
+    source: str,
+    *,
+    title: str | None = None,
+    status: str | None = None,
+) -> None:
+    with get_session_factory()() as db:
+        append_run_version(
+            db,
+            run_id=_run_uuid(run_id),
+            owner_id=owner_id,
+            snapshot=snapshot,
+            source=source,
+            title=title,
+            status=status,
+        )
+
+
+def _persist_run_snapshot(
+    run_id: str,
+    owner_id: UUID,
+    snapshot: dict[str, Any],
+    *,
+    title: str | None = None,
+    status: str | None = None,
+) -> None:
+    with get_session_factory()() as db:
+        save_run_snapshot(
+            db,
+            run_id=_run_uuid(run_id),
+            owner_id=owner_id,
+            snapshot=snapshot,
+            title=title,
+            status=status,
+        )
+
+
+def _persist_job(job_id: str, job: dict[str, Any]) -> None:
+    run_id = job.get("run_id")
+    if not run_id:
+        return
+    progress_keys = ("message", "completed", "active_stage", "stage", "total")
+    progress = {key: job[key] for key in progress_keys if key in job}
+    try:
+        with get_session_factory()() as db:
+            update_run_progress(
+                db,
+                job_id=job_id,
+                status=job.get("status"),
+                progress_data=progress,
+                error_message=job.get("message") if job.get("status") == "failed" else None,
+            )
+    except LookupError:
+        logger.exception("Could not find saved run for job %s", job_id)
+        raise
 
 
 def _new_version(
@@ -289,6 +370,13 @@ def _update_job(job_id: str, **updates: Any) -> None:
     with LOCK:
         if job_id in JOBS:
             JOBS[job_id].update(updates)
+            job = dict(JOBS[job_id])
+        else:
+            return
+    _persist_job(job_id, job)
+    if job.get("status") in {"complete", "failed"}:
+        with LOCK:
+            JOBS.pop(job_id, None)
 
 
 def _report_aimpact_stage_start(job_id: str, event: dict[str, Any]) -> None:
@@ -306,8 +394,14 @@ def _report_aimpact_stage_start(job_id: str, event: dict[str, Any]) -> None:
     )
 
 
-def _run_aimpact(job_id: str, request: AImpactRunRequest) -> None:
+def _run_aimpact(
+    job_id: str,
+    run_id: str,
+    owner_id: UUID,
+    request: AImpactRunRequest,
+) -> None:
     state = PipelineState(
+        run_id=run_id,
         campaign_id=request.campaign_id,
         prompt_id=request.prompt_id.strip(),
         website=request.website.strip(),
@@ -317,14 +411,14 @@ def _run_aimpact(job_id: str, request: AImpactRunRequest) -> None:
         target_word_count=request.target_word_count,
         review_requested=True,
     )
-    _update_job(
-        job_id,
-        run_id=state.run_id,
-        status="running",
-        active_stage=None,
-        message="Connecting to the workflow database",
-    )
     try:
+        _update_job(
+            job_id,
+            run_id=state.run_id,
+            status="running",
+            active_stage=None,
+            message="Connecting to the workflow database",
+        )
         clear_agent_outputs(DEFAULT_OUTPUT_DIR)
         with postgres_checkpointer() as checkpointer:
             workflow = build_pipeline(checkpointer)
@@ -386,16 +480,24 @@ def _run_aimpact(job_id: str, request: AImpactRunRequest) -> None:
                         "finding_statuses": {},
                     },
                 )
-                final_state = _state_from_values(
-                    workflow.get_state(thread_config(state.run_id)).values
-                )
+                final_state = _state_from_values(workflow.get_state(thread_config(state.run_id)).values)
+        final_status = "failed" if final_state.errors else "complete"
+        result_payload = _main_run_payload(final_state)
+        if final_state.written_article is not None:
+            _persist_run_version(
+                state.run_id,
+                owner_id,
+                result_payload,
+                "Initial campaign draft",
+                title=final_state.written_article.title,
+                status=final_status,
+            )
         _update_job(
             job_id,
-            status="failed" if final_state.errors else "complete",
+            status=final_status,
             completed=[key for key, _, _ in MAIN_STAGES if getattr(final_state, key) is not None],
             active_stage=None,
             message="Workflow complete" if not final_state.errors else "Workflow stopped with errors",
-            result=_main_run_payload(final_state),
             errors=final_state.errors,
         )
     except Exception as exc:
@@ -408,7 +510,16 @@ def _run_aimpact(job_id: str, request: AImpactRunRequest) -> None:
         try:
             if state.run_id:
                 partial_state = _load_main_state(state.run_id)
-                failure["result"] = _main_run_payload(partial_state)
+                partial_result = _main_run_payload(partial_state)
+                if partial_state.written_article is not None:
+                    _persist_run_version(
+                        state.run_id,
+                        owner_id,
+                        partial_result,
+                        "Partial campaign draft",
+                        title=partial_state.written_article.title,
+                        status="failed",
+                    )
         except HTTPException as load_error:
             logger.warning("Could not load partial workflow state: %s", load_error.detail)
         _update_job(job_id, **failure)
@@ -416,17 +527,14 @@ def _run_aimpact(job_id: str, request: AImpactRunRequest) -> None:
 
 def _run_general(
     job_id: str,
+    run_id: str,
+    owner_id: UUID,
     request: GeneralBlogRequest,
     pdfs: list[tuple[str, bytes]],
 ) -> None:
-    run_id = job_id
-
     def report(event: GeneralBlogProgress) -> None:
-        nonlocal run_id
-        run_id = event.run_id
         _update_job(
             job_id,
-            run_id=event.run_id,
             completed=event.completed_stages,
             total=event.total_stages,
             stage=event.label,
@@ -434,24 +542,32 @@ def _run_general(
         )
 
     try:
-        result = GeneralBlogWorkflow(progress_callback=report).run(request, uploaded_reference_pdfs=pdfs)
-        with LOCK:
-            GENERAL_RESULTS[run_id] = result
-            GENERAL_RESULTS[job_id] = result
+        _update_job(job_id, status="running", message="Starting General Blog workflow")
+        result = GeneralBlogWorkflow(progress_callback=report).run(
+            request,
+            uploaded_reference_pdfs=pdfs,
+            run_id=run_id,
+        )
+        _persist_run_version(
+            run_id,
+            owner_id,
+            result.model_dump(mode="json"),
+            "Initial general blog",
+            title=result.draft.title,
+            status="complete",
+        )
         _update_job(
             job_id,
-            run_id=run_id,
             status="complete",
             message="Workflow complete",
-            result=_general_result_payload(result, run_id),
         )
     except GeneralBlogWorkflowError as exc:
+        message = str(exc.cause)
         _update_job(
             job_id,
-            run_id=exc.run_id,
             status="failed",
             stage=exc.label,
-            message=str(exc.cause),
+            message=message,
             error_type=type(exc.cause).__name__,
             token_usage=[_json_value(item) for item in exc.token_usage],
         )
@@ -470,46 +586,184 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/api/me/runs")
+def list_my_runs(
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    filters = BlogRun.owner_id == user.id
+    total = db.scalar(select(func.count()).select_from(BlogRun).where(filters)) or 0
+    runs = db.scalars(
+        select(BlogRun)
+        .where(filters)
+        .order_by(BlogRun.created_at.desc(), BlogRun.id.desc())
+        .limit(limit)
+        .offset(offset)
+    ).all()
+    return {
+        "items": [
+            {
+                "run_id": str(run.id),
+                "job_id": run.job_id,
+                "workflow": run.workflow,
+                "title": run.title,
+                "status": run.status,
+                "version": run.current_version,
+                "created_at": run.created_at,
+                "updated_at": run.updated_at,
+            }
+            for run in runs
+        ],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@app.get("/api/me/runs/{run_id}/versions")
+def list_run_versions(
+    run_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    run = _require_run_owner(db, user, run_id)
+    versions = db.scalars(
+        select(BlogVersion).where(BlogVersion.run_id == run.id).order_by(BlogVersion.version_number.desc())
+    ).all()
+    items = []
+    for version in versions:
+        snapshot = version.snapshot
+        if run.workflow == "aimpact":
+            output = snapshot.get("agent_outputs", {}).get("written_article", {})
+        else:
+            output = snapshot.get("draft", {})
+        items.append(
+            {
+                "version": version.version_number,
+                "source": version.source,
+                "title": output.get("title", run.title),
+                "article_markdown": output.get("article_markdown", ""),
+                "created_at": version.created_at,
+            }
+        )
+    return {"run_id": str(run.id), "items": items}
+
+
 @app.post("/api/aimpact/runs", status_code=202)
-def start_aimpact_run(request: AImpactRunRequest) -> dict[str, str]:
+def start_aimpact_run(
+    request: AImpactRunRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, str]:
+    run_id = str(uuid4())
     job_id = uuid4().hex
+    create_blog_run(
+        db,
+        run_id=UUID(run_id),
+        job_id=job_id,
+        owner_id=user.id,
+        workflow="aimpact",
+        request_data=request.model_dump(mode="json"),
+        title=f"Campaign {request.campaign_id} · {request.prompt_id.strip()}",
+    )
     with LOCK:
         JOBS[job_id] = {
             "id": job_id,
             "kind": "aimpact",
+            "run_id": run_id,
             "status": "queued",
             "message": "Workflow queued",
             "completed": [],
         }
-    EXECUTOR.submit(_run_aimpact, job_id, request)
-    return {"job_id": job_id}
+    try:
+        EXECUTOR.submit(_run_aimpact, job_id, run_id, user.id, request)
+    except RuntimeError as exc:
+        _update_job(job_id, status="failed", message="The workflow could not be queued.")
+        logger.exception("Could not queue campaign workflow (job_id=%s)", job_id)
+        raise HTTPException(status_code=503, detail="The workflow could not be queued.") from exc
+    return {"job_id": job_id, "run_id": run_id}
 
 
 @app.get("/api/jobs/{job_id}")
-def get_job(job_id: str) -> dict[str, Any]:
+def get_job(
+    job_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    run = db.scalar(select(BlogRun).where(BlogRun.job_id == job_id, BlogRun.owner_id == user.id))
+    if run is None:
+        raise HTTPException(status_code=404, detail="No workflow job was found.")
     with LOCK:
-        job = JOBS.get(job_id)
-        if job is None:
-            raise HTTPException(status_code=404, detail="No active job was found.")
-        return jsonable_encoder(job)
+        active_in_process = job_id in JOBS
+    if run.status in {"queued", "running"} and not active_in_process:
+        run = update_run_progress(
+            db,
+            job_id=job_id,
+            status="failed",
+            progress_data={
+                **run.progress_data,
+                "message": "The server restarted before this workflow finished.",
+            },
+            error_message="The server restarted before this workflow finished.",
+        )
+    payload: dict[str, Any] = {
+        "id": job_id,
+        "kind": run.workflow,
+        "run_id": str(run.id),
+        "job_id": job_id,
+        "status": run.status,
+        **run.progress_data,
+    }
+    if run.error_message:
+        payload["message"] = run.error_message
+    if run.latest_snapshot is not None and run.workflow == "aimpact":
+        payload["result"] = run.latest_snapshot
+    return jsonable_encoder(payload)
 
 
 @app.get("/api/aimpact/runs/{run_id}")
-def get_aimpact_run(run_id: str) -> dict[str, Any]:
+def get_aimpact_run(
+    run_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    _require_run_owner(db, user, run_id, "aimpact")
     return _main_run_payload(_load_main_state(run_id))
 
 
 @app.post("/api/aimpact/runs/{run_id}/edit")
-def edit_aimpact_article(run_id: str, edit: ArticleEdit) -> dict[str, Any]:
+def edit_aimpact_article(
+    run_id: str,
+    edit: ArticleEdit,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    run = _require_run_owner(db, user, run_id, "aimpact")
     state = _load_main_state(run_id)
     if state.written_article is None:
         raise HTTPException(status_code=409, detail="This workflow has no article to edit.")
     updated = _new_version(state, _edited_output(state.written_article, edit.article_markdown), "Human edit")
-    return _main_run_payload(updated)
+    payload = _main_run_payload(updated)
+    _persist_run_version(
+        run_id,
+        user.id,
+        payload,
+        "Human edit",
+        title=updated.written_article.title if updated.written_article else run.title,
+    )
+    return payload
 
 
 @app.post("/api/aimpact/runs/{run_id}/revise")
-def revise_aimpact_article(run_id: str, body: RevisionRequest) -> dict[str, Any]:
+def revise_aimpact_article(
+    run_id: str,
+    body: RevisionRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    run = _require_run_owner(db, user, run_id, "aimpact")
     state = _load_main_state(run_id)
     if state.written_article is None:
         raise HTTPException(status_code=409, detail="This workflow has no article to revise.")
@@ -526,14 +780,27 @@ def revise_aimpact_article(run_id: str, body: RevisionRequest) -> dict[str, Any]
                 "token_usage": merge_token_usage(state.token_usage, records),
             },
         )
+        payload = _main_run_payload(updated)
+        _persist_run_version(
+            run_id,
+            user.id,
+            payload,
+            "Writer revision",
+            title=updated.written_article.title if updated.written_article else run.title,
+        )
     except Exception as exc:
         logger.exception("Writer revision failed for run %s", run_id)
         raise HTTPException(status_code=502, detail=f"Writer revision failed: {exc}") from exc
-    return _main_run_payload(updated)
+    return payload
 
 
 @app.post("/api/aimpact/runs/{run_id}/review")
-def review_aimpact_article(run_id: str) -> dict[str, Any]:
+def review_aimpact_article(
+    run_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    run = _require_run_owner(db, user, run_id, "aimpact")
     state = _load_main_state(run_id)
     if state.written_article is None:
         raise HTTPException(status_code=409, detail="This workflow has no article to review.")
@@ -553,14 +820,22 @@ def review_aimpact_article(run_id: str) -> dict[str, Any]:
             },
         )
         save_agent_output(6, _json_value(reviewed.review_output), DEFAULT_OUTPUT_DIR, run_id=run_id)
+        payload = _main_run_payload(reviewed)
+        _persist_run_snapshot(run_id, user.id, payload, title=run.title)
     except Exception as exc:
         logger.exception("Review failed for run %s", run_id)
         raise HTTPException(status_code=502, detail=f"Review failed: {exc}") from exc
-    return _main_run_payload(reviewed)
+    return payload
 
 
 @app.put("/api/aimpact/runs/{run_id}/findings")
-def save_finding_decisions(run_id: str, body: FindingDecisions) -> dict[str, Any]:
+def save_finding_decisions(
+    run_id: str,
+    body: FindingDecisions,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    run = _require_run_owner(db, user, run_id, "aimpact")
     state = _load_main_state(run_id)
     allowed = {"Open", "Resolved", "Dismissed"}
     if any(value not in allowed for value in body.statuses.values()):
@@ -574,11 +849,19 @@ def save_finding_decisions(run_id: str, body: FindingDecisions) -> dict[str, Any
     if any(status == "Open" for status in body.statuses.values()):
         values["draft_approval"] = None
     updated = _save_main_state(run_id, values)
-    return _main_run_payload(updated)
+    payload = _main_run_payload(updated)
+    _persist_run_snapshot(run_id, user.id, payload, title=run.title)
+    return payload
 
 
 @app.post("/api/aimpact/runs/{run_id}/approve")
-def approve_aimpact_article(run_id: str, body: ApprovalRequest) -> dict[str, Any]:
+def approve_aimpact_article(
+    run_id: str,
+    body: ApprovalRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    run = _require_run_owner(db, user, run_id, "aimpact")
     state = _load_main_state(run_id)
     if not body.acknowledged:
         raise HTTPException(status_code=422, detail="Confirm that you reviewed this version.")
@@ -599,11 +882,19 @@ def approve_aimpact_article(run_id: str, body: ApprovalRequest) -> dict[str, Any
         "fingerprint": fingerprint,
         "approved_at": datetime.now().astimezone().isoformat(timespec="seconds"),
     }
-    return _main_run_payload(_save_main_state(run_id, {"draft_approval": record}))
+    updated = _save_main_state(run_id, {"draft_approval": record})
+    payload = _main_run_payload(updated)
+    _persist_run_snapshot(run_id, user.id, payload, title=run.title)
+    return payload
 
 
 @app.get("/api/aimpact/runs/{run_id}/article.pdf")
-def download_aimpact_pdf(run_id: str) -> FileResponse:
+def download_aimpact_pdf(
+    run_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Response:
+    _require_run_owner(db, user, run_id, "aimpact")
     state = _load_main_state(run_id)
     if state.written_article is None:
         raise HTTPException(status_code=404, detail="This workflow has no article.")
@@ -619,6 +910,8 @@ def download_aimpact_pdf(run_id: str) -> FileResponse:
 async def start_general_run(
     request_json: str = Form(...),
     reference_pdfs: list[UploadFile] = File(default=[]),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ) -> dict[str, str]:
     try:
         request = GeneralBlogRequest.model_validate_json(request_json)
@@ -632,47 +925,120 @@ async def start_general_run(
         if len(contents) > MAX_REFERENCE_BYTES:
             raise HTTPException(status_code=413, detail=f"{item.filename} exceeds the 15 MB per-file limit.")
         pdfs.append((item.filename or "reference.pdf", contents))
+    run_id = str(uuid4())
     job_id = uuid4().hex
+    create_blog_run(
+        db,
+        run_id=UUID(run_id),
+        job_id=job_id,
+        owner_id=user.id,
+        workflow="general",
+        request_data=request.model_dump(mode="json"),
+        title=request.prompt[:500],
+    )
     with LOCK:
         JOBS[job_id] = {
             "id": job_id,
             "kind": "general",
+            "run_id": run_id,
             "status": "queued",
             "message": "Workflow queued",
             "completed": 0,
             "total": 7,
         }
-    EXECUTOR.submit(_run_general, job_id, request, pdfs)
-    return {"job_id": job_id}
+    try:
+        EXECUTOR.submit(_run_general, job_id, run_id, user.id, request, pdfs)
+    except RuntimeError as exc:
+        _update_job(job_id, status="failed", message="The workflow could not be queued.")
+        logger.exception("Could not queue General Blog workflow (job_id=%s)", job_id)
+        raise HTTPException(status_code=503, detail="The workflow could not be queued.") from exc
+    return {"job_id": job_id, "run_id": run_id}
+
+
+def _load_general_result(
+    db: Session,
+    user: User,
+    run_id: str,
+) -> tuple[BlogRun, GeneralBlogResult]:
+    run = _require_run_owner(db, user, run_id, "general")
+    snapshot = run.latest_snapshot
+    if snapshot is None:
+        latest = db.scalar(
+            select(BlogVersion)
+            .where(BlogVersion.run_id == run.id)
+            .order_by(BlogVersion.version_number.desc())
+            .limit(1)
+        )
+        snapshot = latest.snapshot if latest is not None else None
+    if snapshot is None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"This General Blog run is {run.status} and has no saved article yet.",
+        )
+    return run, GeneralBlogResult.model_validate(snapshot)
+
+
+def _general_result_with_history(
+    db: Session,
+    run: BlogRun,
+    result: GeneralBlogResult,
+) -> dict[str, Any]:
+    versions = db.scalars(
+        select(BlogVersion).where(BlogVersion.run_id == run.id).order_by(BlogVersion.version_number)
+    ).all()
+    payload = _general_result_payload(result, str(run.id))
+    payload["draft_version"] = run.current_version
+    payload["draft_versions"] = [
+        {
+            "version": version.version_number,
+            "source": version.source,
+            "created_at": version.created_at.isoformat(),
+            "output": version.snapshot.get("draft", {}),
+        }
+        for version in versions
+    ]
+    return payload
 
 
 @app.get("/api/general/runs/{run_id}")
-def get_general_run(run_id: str) -> dict[str, Any]:
-    with LOCK:
-        result = GENERAL_RESULTS.get(run_id)
-    if result is None:
-        raise HTTPException(status_code=404, detail="This General Blog run is not available in this server session.")
-    return _general_result_payload(result, run_id)
+def get_general_run(
+    run_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    run, result = _load_general_result(db, user, run_id)
+    return _general_result_with_history(db, run, result)
 
 
 @app.post("/api/general/runs/{run_id}/edit")
-def edit_general_article(run_id: str, edit: ArticleEdit) -> dict[str, Any]:
-    with LOCK:
-        result = GENERAL_RESULTS.get(run_id)
-    if result is None:
-        raise HTTPException(status_code=404, detail="This General Blog run is not available.")
+def edit_general_article(
+    run_id: str,
+    edit: ArticleEdit,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    run, result = _load_general_result(db, user, run_id)
     updated = result_after_draft_change(result, _edited_output(result.draft, edit.article_markdown))
-    with LOCK:
-        GENERAL_RESULTS[run_id] = updated
-    return _general_result_payload(updated, run_id)
+    _persist_run_version(
+        run_id,
+        user.id,
+        updated.model_dump(mode="json"),
+        "Human edit",
+        title=updated.draft.title,
+    )
+    db.expire_all()
+    run = _require_run_owner(db, user, run_id, "general")
+    return _general_result_with_history(db, run, updated)
 
 
 @app.post("/api/general/runs/{run_id}/revise")
-def revise_general_article(run_id: str, body: RevisionRequest) -> dict[str, Any]:
-    with LOCK:
-        result = GENERAL_RESULTS.get(run_id)
-    if result is None:
-        raise HTTPException(status_code=404, detail="This General Blog run is not available.")
+def revise_general_article(
+    run_id: str,
+    body: RevisionRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    run, result = _load_general_result(db, user, run_id)
     try:
         usage_run_id = next((record.run_id for record in result.token_usage if record.run_id), run_id)
         with token_usage_scope(usage_run_id, "agent5_human_revision") as records:
@@ -680,20 +1046,28 @@ def revise_general_article(run_id: str, body: RevisionRequest) -> dict[str, Any]
         updated = result_after_draft_change(result, revised).model_copy(
             update={"token_usage": merge_token_usage(result.token_usage, records)}
         )
+        _persist_run_version(
+            run_id,
+            user.id,
+            updated.model_dump(mode="json"),
+            "Writer revision",
+            title=updated.draft.title,
+        )
     except Exception as exc:
         logger.exception("General Blog revision failed for run %s", run_id)
         raise HTTPException(status_code=502, detail=f"Writer revision failed: {exc}") from exc
-    with LOCK:
-        GENERAL_RESULTS[run_id] = updated
-    return _general_result_payload(updated, run_id)
+    db.expire_all()
+    run = _require_run_owner(db, user, run_id, "general")
+    return _general_result_with_history(db, run, updated)
 
 
 @app.post("/api/general/runs/{run_id}/review")
-def review_general_article(run_id: str) -> dict[str, Any]:
-    with LOCK:
-        result = GENERAL_RESULTS.get(run_id)
-    if result is None:
-        raise HTTPException(status_code=404, detail="This General Blog run is not available.")
+def review_general_article(
+    run_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    run, result = _load_general_result(db, user, run_id)
     try:
         usage_run_id = next((record.run_id for record in result.token_usage if record.run_id), run_id)
         with token_usage_scope(usage_run_id, "agent6_human_review") as records:
@@ -707,14 +1081,25 @@ def review_general_article(run_id: str) -> dict[str, Any]:
                 "token_usage": merge_token_usage(result.token_usage, records),
             }
         )
+        _persist_run_snapshot(
+            run_id,
+            user.id,
+            updated.model_dump(mode="json"),
+            title=updated.draft.title,
+        )
     except Exception as exc:
         logger.exception("General Blog review failed for run %s", run_id)
         raise HTTPException(status_code=502, detail=f"Review failed: {exc}") from exc
-    with LOCK:
-        GENERAL_RESULTS[run_id] = updated
-    return _general_result_payload(updated, run_id)
+    db.expire_all()
+    run = _require_run_owner(db, user, run_id, "general")
+    return _general_result_with_history(db, run, updated)
 
 
 @app.get("/api/general/runs/{run_id}/result.json")
-def download_general_result(run_id: str) -> dict[str, Any]:
-    return get_general_run(run_id)
+def download_general_result(
+    run_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    run, result = _load_general_result(db, user, run_id)
+    return _general_result_with_history(db, run, result)

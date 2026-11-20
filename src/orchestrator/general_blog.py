@@ -63,10 +63,7 @@ class GeneralBlogWorkflowError(RuntimeError):
         self.label = label
         self.cause = cause
         self.token_usage = token_usage
-        super().__init__(
-            f"{label} failed ({type(cause).__name__}). "
-            f"Run ID: {run_id}. Details: {cause}"
-        )
+        super().__init__(f"{label} failed ({type(cause).__name__}). " f"Run ID: {run_id}. Details: {cause}")
 
 
 class GeneralBlogWorkflow:
@@ -102,8 +99,9 @@ class GeneralBlogWorkflow:
         self,
         request: GeneralBlogRequest,
         uploaded_reference_pdfs: list[tuple[str, bytes]] | None = None,
+        run_id: str | None = None,
     ) -> GeneralBlogResult:
-        self.run_id = uuid4().hex
+        self.run_id = run_id or str(uuid4())
         self._completed_stages = set()
         self._token_usage = []
         uploaded_reference_pdfs = uploaded_reference_pdfs or []
@@ -456,8 +454,7 @@ class GeneralBlogWorkflow:
     @staticmethod
     def _needs_revision(review) -> bool:
         return any(
-            finding.severity in {"critical", "high", "medium"}
-            or finding.area == "factual_claims"
+            finding.severity in {"critical", "high", "medium"} or finding.area == "factual_claims"
             for finding in review.findings
         )
 
@@ -473,6 +470,5 @@ class GeneralBlogWorkflow:
         return (
             "Address the review findings below using only the supplied brief and "
             "evidence. Preserve accurate source qualifications and citations. "
-            "Do not add unsupported factual claims.\n"
-            + "\n".join([*findings, *unresolved])
+            "Do not add unsupported factual claims.\n" + "\n".join([*findings, *unresolved])
         )

@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 
 
 class PipelineState(BaseModel):
-    run_id: str = Field(default_factory=lambda: uuid4().hex)
+    run_id: str = Field(default_factory=lambda: str(uuid4()))
     campaign_id: int
     prompt_id: str
     website: str

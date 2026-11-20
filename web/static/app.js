@@ -11,6 +11,11 @@ const tabs = {
   general: ["Article", "Edit & revise", "Review", "Sources", "Agent outputs"],
 };
 const state = { workflow: "aimpact", run: null, activeTab: "Article", pollTimer: null, working: false };
+let currentUser = null;
+let requestedPage = "write";
+let runHistoryItems = [];
+let runHistoryOffset = 0;
+let runHistoryTotal = 0;
 const $ = (selector) => document.querySelector(selector);
 
 function escapeHtml(value = "") {
@@ -180,7 +185,7 @@ function renderEdit() {
       <section><label class="eyebrow" for="revision-instructions">WRITER REVISION</label>
         <textarea id="revision-instructions" class="editor" style="min-height:120px" placeholder="Describe the changes you want."></textarea>
         <button class="btn s" data-action="revise">Ask Agent 5 to revise</button>
-        ${state.workflow === "aimpact" ? renderVersions() : ""}
+        ${renderVersions()}
       </section>
     </div>`;
 }
@@ -279,7 +284,6 @@ function applyRun(run, workflow = state.workflow) {
   state.workflow = workflow;
   state.run = run;
   const id = run.run_id || "";
-  saveRecent(run, workflow);
   $("#result-title").textContent = currentOutput()?.title || (id ? `Run ${id.slice(0, 8)}` : "Workflow results");
   const chip = $("#run-state");
   const approved = workflow === "aimpact" && run.approved;
@@ -483,12 +487,36 @@ function toast(message) {
 /* ================= navigation ================= */
 const pageInfo = {
   write: ["WORKSPACE", "Write a blog", ""],
-  runs: ["WORKSPACE", "Saved runs", "Reopen anything you generated in this browser."],
-  profile: ["ACCOUNT", "Profile", "Your details stay in this browser."],
+  runs: ["WORKSPACE", "Saved runs", "Reopen blogs saved to your account."],
+  profile: ["ACCOUNT", "Profile", "Your profile details are stored in this browser."],
   settings: ["ACCOUNT", "Settings", "Writing mode, defaults and server status."],
 };
+function showAuth(mode = "login", message = "") {
+  requestedPage = requestedPage || "write";
+  $("#land").hidden = true;
+  $("#shell").hidden = true;
+  $("#auth").hidden = false;
+  const signingUp = mode === "signup";
+  $("#signin-form").hidden = signingUp;
+  $("#signup-form").hidden = !signingUp;
+  $("#auth-title").textContent = signingUp ? "Create your account" : "Sign in";
+  $("#auth-copy").textContent = signingUp
+    ? "Create an account to save and reopen your blogs."
+    : "Sign in to open your workspace and saved blogs.";
+  $("#auth-switch-copy").textContent = signingUp ? "Already have an account?" : "New here?";
+  $("#auth-switch").textContent = signingUp ? "Sign in" : "Create an account";
+  $("#auth-switch").dataset.authMode = signingUp ? "login" : "signup";
+  $("#auth-notice").textContent = message;
+  $("#auth-notice").hidden = !message;
+}
 function go(page) {
   const land = page === "land";
+  if (!land && !currentUser) {
+    requestedPage = page;
+    showAuth();
+    return;
+  }
+  $("#auth").hidden = true;
   $("#land").hidden = !land;
   $("#shell").hidden = land;
   tok++;
@@ -499,7 +527,7 @@ function go(page) {
   document.querySelectorAll(".nv[data-p]").forEach((el) => el.classList.toggle("on", el.dataset.p === page));
   [$("#eb").textContent, $("#page-title").textContent, $("#page-subtitle").textContent] = pageInfo[page];
   $(".tb").hidden = page === "write";
-  if (page === "runs") renderRecent();
+  if (page === "runs") void renderRecent();
   if (page === "settings") checkServer();
 }
 function menu(open) {
@@ -509,6 +537,18 @@ function menu(open) {
 }
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") menu(false); });
 document.addEventListener("click", (e) => {
+  const passwordToggle = e.target.closest("[data-password-toggle]");
+  if (passwordToggle) {
+    const input = document.getElementById(passwordToggle.getAttribute("aria-controls"));
+    const visible = input.type === "password";
+    input.type = visible ? "text" : "password";
+    passwordToggle.setAttribute("aria-pressed", String(visible));
+    passwordToggle.setAttribute("aria-label", visible ? "Hide password" : "Show password");
+    passwordToggle.title = visible ? "Hide password" : "Show password";
+    return;
+  }
+  const authMode = e.target.closest("[data-auth-mode]");
+  if (authMode) { showAuth(authMode.dataset.authMode); return; }
   const page = e.target.closest("[data-p]");
   if (page) { go(page.dataset.p); menu(false); return; }
   const home = e.target.closest("[data-go]");
@@ -517,6 +557,18 @@ document.addEventListener("click", (e) => {
   if (mode) { setMode(mode.dataset.mode); return; }
   const open = e.target.closest("[data-open]");
   if (open) { const [workflow, ...rest] = open.dataset.open.split(":"); openRun(workflow, rest.join(":")); return; }
+  const job = e.target.closest("[data-job]");
+  if (job) {
+    const workflow = job.dataset.workflow;
+    go("write");
+    setWorkflow(workflow);
+    void pollJob(job.dataset.job, workflow);
+    return;
+  }
+  if (e.target.closest("[data-more-runs]")) {
+    void renderRecent(false);
+    return;
+  }
   if (e.target.closest("#ub")) { menu(); return; }
   if (!e.target.closest(".umw")) menu(false);
 });
@@ -538,19 +590,41 @@ async function openRun(workflow, id) {
     showNotice(`Loaded saved run ${id}.`);
   } catch (error) { showNotice(error.message, true); }
 }
-function saveRecent(run, workflow) {
-  const id = run.run_id;
-  if (!id) return;
-  const list = store.get("recent", []).filter((r) => !(r.id === id && r.workflow === workflow));
-  list.unshift({ id, workflow, title: currentOutput()?.title || `Run ${id.slice(0, 8)}`, at: Date.now() });
-  store.set("recent", list.slice(0, 30));
+async function renderRecent(reset = true) {
+  const container = $("#recent");
+  if (reset) {
+    runHistoryItems = [];
+    runHistoryOffset = 0;
+    container.innerHTML = '<div class="empty-inline">Loading your saved blogs…</div>';
+  }
+  try {
+    const response = await api(`/api/me/runs?limit=50&offset=${runHistoryOffset}`);
+    const items = response.items || [];
+    runHistoryItems = runHistoryItems.concat(items);
+    runHistoryOffset += items.length;
+    runHistoryTotal = response.total || 0;
+    container.innerHTML = runHistoryItems.map((run) => {
+      const date = run.created_at ? new Date(run.created_at).toLocaleString() : "";
+      const kind = run.workflow === "aimpact" ? "Campaign" : "General";
+      const running = run.status === "running" || run.status === "queued";
+      const action = running
+        ? `data-job="${escapeHtml(run.job_id)}" data-workflow="${escapeHtml(run.workflow)}"`
+        : `data-open="${escapeHtml(run.workflow)}:${escapeHtml(run.run_id)}"`;
+      return `<div class="row"><div><b>${escapeHtml(run.title || "Untitled blog")}</b><small>${kind} · ${escapeHtml(run.status)} · ${escapeHtml(date)}</small></div><button class="btn q" ${action}>${running ? "View progress" : "Open"}</button></div>`;
+    }).join("") || '<div class="empty-inline">No saved blogs yet. Your completed runs will appear here.</div>';
+    if (runHistoryOffset < runHistoryTotal) {
+      container.insertAdjacentHTML("beforeend", '<button class="btn q" data-more-runs>Load more</button>');
+    }
+    $("#pf-count").textContent = String(runHistoryTotal);
+  } catch (error) {
+    container.innerHTML = `<div class="empty-inline">${escapeHtml(error.message)}</div>`;
+    $("#pf-count").textContent = "0";
+  }
 }
-function renderRecent() {
-  const list = store.get("recent", []);
-  $("#recent").innerHTML = list.map((r) => `<div class="row"><div><b>${escapeHtml(r.title)}</b><small>${r.workflow === "aimpact" ? "Campaign" : "General"} · ${new Date(r.at).toLocaleString()}</small></div><button class="btn q" data-open="${escapeHtml(r.workflow)}:${escapeHtml(r.id)}">Open</button></div>`).join("") || '<div class="empty-inline">No runs yet. Articles you generate will be listed here.</div>';
-  $("#pf-count").textContent = list.length;
+const profileFields = { first: "pf-first", last: "pf-last", role: "pf-role", company: "pf-company", bio: "pf-bio" };
+function profileKey() {
+  return currentUser ? `profile.${currentUser.id}` : "profile";
 }
-const profileFields = { first: "pf-first", last: "pf-last", email: "pf-email", role: "pf-role", company: "pf-company", bio: "pf-bio" };
 function paintProfile(p) {
   const name = [p.first, p.last].filter(Boolean).join(" ");
   const initial = (name || p.email || "A")[0].toUpperCase();
@@ -566,9 +640,10 @@ function applyDefaults(settings) {
   if (settings.tone) $("#g-tone").value = settings.tone;
 }
 function loadPrefs() {
-  const profile = store.get("profile", {});
+  const profile = store.get(profileKey(), {});
   const settings = store.get("settings", {});
   for (const [key, id] of Object.entries(profileFields)) $("#" + id).value = profile[key] || "";
+  $("#pf-email").value = currentUser?.email || "";
   $("#set-words").value = settings.words || "";
   $("#set-tone").value = settings.tone || "";
   applyDefaults(settings);
@@ -577,8 +652,8 @@ function loadPrefs() {
 $("#profile-form").addEventListener("submit", (event) => {
   event.preventDefault();
   const profile = Object.fromEntries(Object.entries(profileFields).map(([key, id]) => [key, $("#" + id).value.trim()]));
-  store.set("profile", profile);
-  paintProfile(profile);
+  store.set(profileKey(), profile);
+  paintProfile({ ...profile, email: currentUser?.email || "" });
   toast("Profile saved");
 });
 $("#save-settings").addEventListener("click", () => {
@@ -588,11 +663,55 @@ $("#save-settings").addEventListener("click", () => {
   toast("Settings saved");
 });
 $("#clear-data").addEventListener("click", () => {
-  try { Object.keys(localStorage).filter((k) => k.startsWith("bloggen.")).forEach((k) => localStorage.removeItem(k)); } catch { /* ignore */ }
-  loadPrefs(); renderRecent(); setWorkflow("general");
-  toast("Saved data cleared");
+  try {
+    localStorage.removeItem("bloggen.settings");
+    if (currentUser) localStorage.removeItem(`bloggen.profile.${currentUser.id}`);
+  } catch { /* ignore */ }
+  loadPrefs(); void renderRecent(); setWorkflow("general");
+  toast("Local preferences cleared");
 });
 $("#resume-button2").addEventListener("click", () => openRun($("#resume-wf").value, $("#resume-id2").value.trim()));
+async function submitAuth(event, mode) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const credentials = Object.fromEntries(new FormData(form).entries());
+  const button = form.querySelector('button[type="submit"]');
+  button.disabled = true;
+  try {
+    const user = await api(`/api/auth/${mode}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(credentials),
+    });
+    currentUser = user;
+    requestedPage = requestedPage || "write";
+    loadPrefs();
+    paintProfile({ ...store.get(profileKey(), {}), email: user.email });
+    $("#auth").hidden = true;
+    go(requestedPage);
+  } catch (error) {
+    showAuth(mode === "signup" ? "signup" : "login", error.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+$("#signin-form").addEventListener("submit", (event) => { void submitAuth(event, "login"); });
+$("#signup-form").addEventListener("submit", (event) => { void submitAuth(event, "signup"); });
+$("#signout-button").addEventListener("click", async () => {
+  try {
+    await api("/api/auth/logout", { method: "POST" });
+    currentUser = null;
+    state.run = null;
+    state.working = false;
+    clearTimeout(state.pollTimer);
+    menu(false);
+    loadPrefs();
+    go("land");
+    toast("You are signed out");
+  } catch (error) {
+    showNotice(error.message, true);
+  }
+});
 async function checkServer() {
   const el = $("#srv-status");
   el.textContent = "Checking…";
@@ -602,7 +721,14 @@ $("#srv-check").addEventListener("click", checkServer);
 
 /* ================= start ================= */
 loadPrefs();
-renderRecent();
 setWorkflow(store.get("mode", "general"));
 const startPage = location.hash.slice(1);
-if (pageInfo[startPage]) go(startPage);
+requestedPage = pageInfo[startPage] ? startPage : "write";
+api("/api/auth/me").then((user) => {
+  currentUser = user;
+  loadPrefs();
+  paintProfile({ ...store.get(profileKey(), {}), email: user.email });
+  if (pageInfo[startPage]) go(startPage);
+}).catch(() => {
+  if (pageInfo[startPage]) showAuth();
+});

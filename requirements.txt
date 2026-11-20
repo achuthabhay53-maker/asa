@@ -15,6 +15,8 @@ python-dotenv==1.2.*
 # Database
 SQLAlchemy==2.0.*
 psycopg[binary]==3.2.*
+alembic>=1.13,<2
+pwdlib[argon2]>=0.2,<1
 
 # Agents and orchestration
 langgraph==0.5.*

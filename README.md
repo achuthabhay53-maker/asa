@@ -21,11 +21,26 @@ loop; unresolved blocking findings are surfaced for human review.
 
 The General Blog workflow uses the existing `ANTHROPIC_API_KEY` and requires
 `EXA_API_KEY` for company-site research.
-General Blog results are held in server memory. A server restart clears these
-results. The campaign workflow uses PostgreSQL checkpoints and can be reopened
-with its run ID.
+Users can sign up, sign in, and sign out. PostgreSQL stores account records,
+hashed login-session tokens, user-owned blog runs, and immutable blog versions.
+The Saved Runs page loads the signed-in user's history from the backend.
 
-The LangGraph workflow uses a PostgreSQL checkpointer configured by `DATABASE_URL`; each run ID is its checkpoint thread ID. The first run creates or migrates the checkpointer tables. Draft versions, review findings, finding decisions, and approvals are written into the workflow checkpoint and can be restored by entering the run ID under **Resume a saved workflow**. Manual edits and Writer revisions invalidate prior findings and approval; the current version must be reviewed again and explicitly approved.
+`ACA_DATABASE_URL` is the database URL for accounts and blog history.
+`LANGGRAPH_CHECKPOINT_DATABASE_URL` is the PostgreSQL URL for LangGraph
+checkpoints. These URLs can point to separate databases or to separate
+databases on the same PostgreSQL service. `DATABASE_URL` remains the URL for
+the temporary, read-only AImpact development reader.
+
+The LangGraph checkpointer stores campaign workflow state. Each campaign run
+also has an owner record in the ACA database. Draft versions, review findings,
+finding decisions, and approvals remain in the workflow checkpoint. Human
+edits and Writer revisions create new saved blog versions. A changed draft
+still requires a new review and approval.
+
+Runs created before user accounts were added do not have owner records. The
+app does not assign those runs to a user automatically. General Blog results
+from an earlier server process were held in memory and cannot be recovered
+after that process stopped.
 
 Claude input and output tokens are recorded for each API call, tagged with the workflow run ID and agent, and saved in the run checkpoint. The web UI shows the run outputs and workflow status.
 
@@ -82,11 +97,14 @@ See [`docs/04-code-architecture.md`](docs/04-code-architecture.md) for module-by
 
 ```bash
 cp .env.example .env
-# Set the required DATABASE_URL, AIMPACT_API_TOKEN, ANTHROPIC_API_KEY, and EXA_API_KEY values
+# Set ACA_DATABASE_URL, LANGGRAPH_CHECKPOINT_DATABASE_URL, and the required API keys.
+# Set ACA_COOKIE_SECURE=true when the app is served over HTTPS.
+# Set DATABASE_URL only when the temporary AImpact PostgreSQL reader is needed.
 python -m venv .venv
 # Windows: .venv\\Scripts\\Activate.ps1
 # macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
+python -m alembic upgrade head
 python -m uvicorn app:app --reload
 ```
 
@@ -170,9 +188,10 @@ the draft or ask Agent 5 for a revision. A changed draft needs a new review.
 Agent 6 output is saved separately as `outputs/agent6_output.json`; it does
 not replace the Agent 5 draft or automatically publish anything.
 
-The local FastAPI server has no user authentication. Run it on localhost for
-development. Do not expose it to a network or deploy it until authentication
-and access controls are in place.
+The app requires sign-in for workflow and history APIs. Set
+`ACA_COOKIE_SECURE=true` when serving it over HTTPS. Before public launch, add
+rate limits, email verification, password reset, and a production security
+review. Keep the app on localhost until those controls are in place.
 
 To run Agent 6 separately from saved Agent outputs, use the standalone script.
 It validates Agent 1-5 JSON files and calls only the Reviewer; it does not rerun
